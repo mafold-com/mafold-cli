@@ -80,6 +80,39 @@ impl Client {
         Ok(())
     }
 
+    // ── developer card registry ──
+    /// Publish a compiled card bundle. `meta` carries tag/version/displayName.
+    pub async fn publish_card(&self, meta: &Value, bundle: Vec<u8>) -> Result<Value> {
+        let form = reqwest::multipart::Form::new()
+            .text("meta", serde_json::to_string(meta)?)
+            .part(
+                "bundle",
+                reqwest::multipart::Part::bytes(bundle)
+                    .file_name("card.js")
+                    .mime_str("application/javascript")?,
+            );
+        let v: Value = self
+            .http
+            .post(format!("{}/api/publishCard", self.base))
+            .bearer_auth(&self.token)
+            .multipart(form)
+            .send()
+            .await
+            .context("publishCard request failed")?
+            .json()
+            .await
+            .context("publishCard returned non-JSON")?;
+        if v.get("ok").and_then(Value::as_bool) == Some(false) {
+            anyhow::bail!("publishCard: {}", v["description"].as_str().unwrap_or("error"));
+        }
+        Ok(v["result"].clone())
+    }
+
+    /// The caller's own cards plus global cards.
+    pub async fn list_cards(&self) -> Result<Value> {
+        self.post("listCards", json!({})).await
+    }
+
     pub fn ws_url(&self) -> String {
         let ws = self.base.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
         format!("{ws}/api/ws?token={}", self.token)
