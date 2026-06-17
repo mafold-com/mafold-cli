@@ -7,8 +7,11 @@
 //! Auth is a bot token (`mb_…`) via --token or $MAFOLD_BOT_TOKEN.
 
 mod agent;
+mod cards;
 mod client;
+mod commands;
 mod daemon;
+mod discover;
 mod update;
 
 use anyhow::{Context, Result};
@@ -55,6 +58,11 @@ enum Cmd {
         #[arg(trailing_var_arg = true, required = true)]
         text: Vec<String>,
     },
+    /// Author, preview, and publish developer cards.
+    Cards {
+        #[command(subcommand)]
+        cmd: cards::CardsCmd,
+    },
 }
 
 #[tokio::main]
@@ -72,6 +80,11 @@ async fn main() -> Result<()> {
             Err(e) => { eprintln!("update failed: {e}"); std::process::exit(1); }
         }
         return Ok(());
+    }
+    // Cards: init/dev need no token; publish/list check for one themselves.
+    if matches!(cli.cmd, Cmd::Cards { .. }) {
+        let Cmd::Cards { cmd } = cli.cmd else { unreachable!() };
+        return cards::run(cmd, cli.base, cli.token).await;
     }
 
     let token = cli
@@ -99,7 +112,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Chats => chats(&Client::new(cli.base, token)).await?,
         Cmd::Send { chat, text } => send(&Client::new(cli.base, token), &chat, &text.join(" ")).await?,
-        Cmd::Stop | Cmd::Status | Cmd::Update => unreachable!(),
+        Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Cards { .. } => unreachable!(),
     }
     Ok(())
 }
