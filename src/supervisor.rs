@@ -129,6 +129,21 @@ fn kill_supervisor_process() {
     }
 }
 
+/// The PATH the supervised service must run with: the installing shell's PATH
+/// (which found `claude` etc.) plus the usual user bins. A service manager
+/// (launchd/systemd) otherwise hands out a minimal PATH (`/usr/bin:/bin:…`) that
+/// lacks them — which is exactly what breaks `claude` under launchd.
+fn service_path() -> String {
+    let base = std::env::var("PATH").unwrap_or_default();
+    let extra = format!("{}/.local/bin:/opt/homebrew/bin", home().display());
+    if base.is_empty() { extra } else { format!("{extra}:{base}") }
+}
+
+#[cfg(target_os = "macos")]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 #[cfg(target_os = "macos")]
 fn launchagent_path() -> PathBuf {
     home().join("Library/LaunchAgents").join(format!("{SERVICE_LABEL}.plist"))
@@ -148,10 +163,11 @@ fn ensure_autostart(base: &str) -> Result<()> {
   <key>Label</key><string>{label}</string>\n\
   <key>ProgramArguments</key>\n\
   <array>\n    <string>{exe}</string>\n    <string>--base</string><string>{base}</string>\n    <string>supervise</string>\n  </array>\n\
+  <key>EnvironmentVariables</key>\n  <dict>\n    <key>PATH</key><string>{path}</string>\n  </dict>\n\
   <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>ProcessType</key><string>Background</string>\n\
   <key>StandardOutPath</key><string>{log}</string>\n  <key>StandardErrorPath</key><string>{log}</string>\n\
 </dict></plist>\n",
-        label = SERVICE_LABEL, exe = exe.display(), base = base, log = log.display(),
+        label = SERVICE_LABEL, exe = exe.display(), base = base, log = log.display(), path = xml_escape(&service_path()),
     );
     fs::write(&plist, xml)?;
     let domain = format!("gui/{}", unsafe { libc::getuid() });
@@ -191,9 +207,9 @@ fn ensure_autostart(base: &str) -> Result<()> {
     fs::create_dir_all(home().join(".config/systemd/user"))?;
     let unit = format!(
         "[Unit]\nDescription=Mafold bot supervisor\nAfter=network-online.target\n\n\
-[Service]\nExecStart={exe} --base {base} supervise\nRestart=always\nRestartSec=3\n\n\
+[Service]\nEnvironment=PATH={path}\nExecStart={exe} --base {base} supervise\nRestart=always\nRestartSec=3\n\n\
 [Install]\nWantedBy=default.target\n",
-        exe = exe.display(), base = base,
+        exe = exe.display(), base = base, path = service_path(),
     );
     fs::write(systemd_unit_path(), unit)?;
     let _ = Command::new("systemctl").args(["--user", "daemon-reload"]).output();

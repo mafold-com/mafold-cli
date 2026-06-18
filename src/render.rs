@@ -60,7 +60,48 @@ fn tool_use_tag(name: &str, input: &Value) -> String {
             let args = input["args"].as_str().or_else(|| input["arguments"].as_str()).unwrap_or("");
             format!("\n{{% skill name=\"{}\" args=\"{}\" /%}}\n", attr_esc(sname), attr_esc(args))
         }
+        "askuserquestion" => ask_tag(input),
         _ => format!("\n{{% tool name=\"{}\" detail=\"{}\" /%}}\n", attr_esc(name), attr_esc(&tool_detail(name, input))),
+    }
+}
+
+/// AskUserQuestion → an interactive `ask` card. The body is line-encoded (mirrors
+/// the `stats` card): one `q|<header>|<multi 0/1>|<question>` per question, each
+/// followed by its `o|<label>|<description>` options. The web/iOS renderer turns
+/// every option into a tappable button and posts the chosen label(s) back as the
+/// user's next message — which `--resume` feeds straight into the same session.
+fn ask_tag(input: &Value) -> String {
+    let mut body = String::new();
+    if let Some(questions) = input["questions"].as_array() {
+        for q in questions {
+            let header = cell_esc(q["header"].as_str().unwrap_or(""));
+            let multi = if q["multiSelect"].as_bool().unwrap_or(false) { 1 } else { 0 };
+            let question = cell_esc(q["question"].as_str().unwrap_or(""));
+            body.push_str(&format!("q|{header}|{multi}|{question}\n"));
+            if let Some(opts) = q["options"].as_array() {
+                for o in opts {
+                    let label = cell_esc(o["label"].as_str().unwrap_or(""));
+                    let desc = cell_esc(o["description"].as_str().unwrap_or(""));
+                    body.push_str(&format!("o|{label}|{desc}\n"));
+                }
+            }
+        }
+    }
+    format!("\n{{% ask %}}\n{}{{% /ask %}}\n", block_esc(&body))
+}
+
+/// One pipe-delimited cell: newlines/tabs/pipes collapse to spaces (the `|`
+/// delimiter must stay unambiguous), trimmed and length-capped.
+fn cell_esc(s: &str) -> String {
+    let one: String = s
+        .chars()
+        .map(|c| match c { '\n' | '\r' | '\t' | '|' => ' ', _ => c })
+        .collect();
+    let one = one.trim();
+    if one.chars().count() > 200 {
+        format!("{}…", one.chars().take(200).collect::<String>())
+    } else {
+        one.to_string()
     }
 }
 
