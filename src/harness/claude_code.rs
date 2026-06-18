@@ -27,7 +27,7 @@ impl Harness for ClaudeCode {
     }
 
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
-        let Turn { prompt, workdir, session, model, cancel } = turn;
+        let Turn { prompt, workdir, session, model, cancel, system } = turn;
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");
         }
@@ -39,6 +39,10 @@ impl Harness for ClaudeCode {
             .arg("--dangerously-skip-permissions");
         if let Some(m) = &model {
             cmd.arg("--model").arg(m);
+        }
+        // mafold awareness: who the bot is, the conversation, embeddable cards.
+        if let Some(sys) = &system {
+            cmd.arg("--append-system-prompt").arg(sys);
         }
         cmd.kill_on_drop(true);
         if let Some(sid) = &session {
