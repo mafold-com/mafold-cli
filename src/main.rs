@@ -12,6 +12,9 @@ mod client;
 mod commands;
 mod daemon;
 mod discover;
+mod harness;
+mod render;
+mod supervisor;
 mod update;
 
 use anyhow::{Context, Result};
@@ -34,11 +37,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run Claude Code as your bot (daemon): receive messages, reply with the
-    /// local `claude` in the working directory.
+    /// Run an agent harness as your bot (daemon): receive messages, reply with
+    /// the local agent CLI in the working directory.
     Agent {
         #[arg(long, env = "MAFOLD_WORKDIR", default_value = ".")]
         workdir: String,
+        /// Which agent harness to drive: claude-code (default), opencode, codex,
+        /// openclaw. (Others land as they're implemented.)
+        #[arg(long, env = "MAFOLD_HARNESS", default_value = "claude-code")]
+        harness: String,
         /// Run in the background (detached from the terminal) so it keeps
         /// running after you close the shell. Logs to ~/.mafold/agent.log.
         #[arg(long, short)]
@@ -63,6 +70,31 @@ enum Cmd {
         #[command(subcommand)]
         cmd: cards::CardsCmd,
     },
+
+    // ── multi-daemon supervisor: one daemon per bot ──
+    /// Add a bot daemon to the local config (token from --token).
+    Add {
+        /// The bot username (also the daemon's pid/log name).
+        name: String,
+        #[arg(long, env = "MAFOLD_WORKDIR")]
+        workdir: String,
+        /// Local harness hint; the server (getMe) is authoritative at runtime.
+        #[arg(long)]
+        harness: Option<String>,
+    },
+    /// Remove a bot daemon from the local config (stops it too).
+    Rm { name: String },
+    /// Start the supervisor — keeps all configured daemons running + owns updates.
+    Up,
+    /// Stop the supervisor + all daemons (or one daemon by name).
+    Down { name: Option<String> },
+    /// Show the last lines of a bot daemon's log.
+    Logs { name: String },
+    /// Roll back to the previous binary (after a bad update).
+    Rollback,
+    /// (internal) The long-lived supervisor loop — started by `up`.
+    #[command(hide = true)]
+    Supervise,
 }
 
 #[tokio::main]
@@ -71,7 +103,20 @@ async fn main() -> Result<()> {
 
     // Daemon control + self-update need no auth.
     if matches!(cli.cmd, Cmd::Stop) { return daemon::stop(); }
-    if matches!(cli.cmd, Cmd::Status) { return daemon::status(); }
+    if matches!(cli.cmd, Cmd::Status) {
+        let _ = daemon::status(); // legacy single `agent --detach`
+        supervisor::status();     // multi-daemon config
+        return Ok(());
+    }
+    match &cli.cmd {
+        Cmd::Up => return supervisor::up(&cli.base),
+        Cmd::Down { name } => return supervisor::down(name.as_deref()),
+        Cmd::Logs { name } => return supervisor::logs(name),
+        Cmd::Rm { name } => return supervisor::rm(name),
+        Cmd::Rollback => return update::rollback(),
+        Cmd::Supervise => { supervisor::supervise(cli.base).await; return Ok(()); }
+        _ => {}
+    }
     if matches!(cli.cmd, Cmd::Update) {
         let http = reqwest::Client::new();
         match update::update_to_latest(&http).await {
@@ -92,7 +137,7 @@ async fn main() -> Result<()> {
         .context("set --token or $MAFOLD_BOT_TOKEN (your bot's mb_ token — create a bot in the Mafold app)")?;
 
     match cli.cmd {
-        Cmd::Agent { workdir, detach } => {
+        Cmd::Agent { workdir, harness, detach } => {
             // Resolve to an absolute path (default "." = the current folder), so
             // the agent — and the detached child, which has a different cwd —
             // both operate on the same real directory. No fake placeholders.
@@ -100,19 +145,22 @@ async fn main() -> Result<()> {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or(workdir);
             if detach {
-                let pid = daemon::start_detached(&cli.base, &token, &workdir)?;
+                let pid = daemon::start_detached(&cli.base, &token, &workdir, &harness)?;
                 println!("  workdir: {workdir}");
                 println!("✓ agent running in background (pid {pid})");
                 println!("  logs:   ~/.mafold/agent.log");
                 println!("  status: mafold status");
                 println!("  stop:   mafold stop");
             } else {
-                agent::run(Client::new(cli.base, token), workdir, !cli.no_auto_update).await?;
+                agent::run(Client::new(cli.base, token), workdir, harness, !cli.no_auto_update).await?;
             }
         }
+        Cmd::Add { name, workdir, harness } => supervisor::add(name, token, workdir, harness)?,
         Cmd::Chats => chats(&Client::new(cli.base, token)).await?,
         Cmd::Send { chat, text } => send(&Client::new(cli.base, token), &chat, &text.join(" ")).await?,
-        Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Cards { .. } => unreachable!(),
+        Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Cards { .. }
+        | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
+        | Cmd::Rollback | Cmd::Supervise => unreachable!(),
     }
     Ok(())
 }
