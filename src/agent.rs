@@ -223,6 +223,10 @@ async fn connect_and_run(
         }
     });
 
+    // Cards this bot can embed in replies — fetched once per connection, folded
+    // into the mafold preamble each turn.
+    let card_tags = available_card_tags(client).await;
+
     while let Some(frame) = read.next().await {
         let frame = match frame { Ok(f) => f, Err(e) => { eprintln!("ws error: {e}"); break; } };
         let text = match frame.into_text() { Ok(t) => t, Err(_) => continue };
@@ -281,6 +285,8 @@ async fn connect_and_run(
         let chat_id = m.conversation_id.clone();
         let content = m.content.clone();
         let model = chat_states.lock().await.get(&chat_id).and_then(|s| s.model.clone());
+        // mafold awareness for this turn: identity + peer + embeddable cards.
+        let system = Some(mafold_preamble(my_username, &m.sender.username, &card_tags));
         tokio::spawn(async move {
             // Harness-emulated slash commands (config dumps, /logout, mocks);
             // anything not emulated falls through to the harness as a prompt.
@@ -295,7 +301,7 @@ async fn connect_and_run(
                     crate::harness::CommandOutcome::Forward => {}
                 }
             }
-            if let Err(e) = handle(&client, &workdir, &chat_id, &content, &attachments, &sessions, &exec_lock, &chat_states, &harness, model).await {
+            if let Err(e) = handle(&client, &workdir, &chat_id, &content, &attachments, &sessions, &exec_lock, &chat_states, &harness, model, system).await {
                 eprintln!("handle error: {e}");
             }
         });
@@ -571,6 +577,43 @@ fn noop_open_dir() -> PathBuf {
     dir
 }
 
+/// Card tags this bot can embed in replies (its family-scope + global published
+/// cards). Best-effort — an empty list just omits the card menu.
+async fn available_card_tags(client: &Client) -> Vec<String> {
+    match client.list_cards().await {
+        Ok(v) => v["items"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|c| c["tag"].as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The mafold-awareness system prompt appended each turn (`--append-system-prompt`):
+/// who the bot is, the conversation it's replying in, and that it can embed cards
+/// inline — so a "pure" coding agent knows it's acting as a Mafold bot.
+fn mafold_preamble(bot: &str, peer: &str, cards: &[String]) -> String {
+    let mut s = format!(
+        "You are an AI agent running as a Mafold bot — your Mafold username is @{bot}. \
+You are replying inside a Mafold conversation with @{peer}; your output this turn is \
+delivered to that conversation as a chat message from you. Write a chat reply \
+(conversational), not terminal output.\n\n\
+You can embed CARDS in your reply: write a Markdoc tag inline and Mafold renders it as a \
+native card. Write the tag directly — do NOT wrap it in a code fence or escape it:\n  \
+{{% cardname attribute=\"value\" /%}}\n"
+    );
+    if cards.is_empty() {
+        s.push_str("(No custom cards are published for you yet — plain text/Markdown is fine.)");
+    } else {
+        s.push_str("Cards available to embed here (each takes its own attributes):\n");
+        for tag in cards {
+            s.push_str(&format!("  • {{% {tag} … /%}}\n"));
+        }
+        s.push_str("Use a card when it communicates better than prose; otherwise reply normally.");
+    }
+    s
+}
+
 /// Open a draft, run claude (resuming this conversation's session), ALWAYS
 /// finalize (surfacing any error).
 #[allow(clippy::too_many_arguments)]
@@ -585,6 +628,7 @@ async fn handle(
     chat_states: &ChatStates,
     harness: &Arc<dyn Harness>,
     model: Option<String>,
+    system: Option<String>,
 ) -> Result<()> {
     let msg_id = client.create_draft(chat_id).await?;
 
@@ -630,6 +674,7 @@ async fn handle(
         session: prior.clone(),
         model,
         cancel: cancel.clone(),
+        system,
     };
 
     // Renderer task: drain the harness's normalized events → batched, ordered

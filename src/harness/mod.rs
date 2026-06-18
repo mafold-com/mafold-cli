@@ -49,6 +49,10 @@ pub struct Turn {
     pub model: Option<String>,
     /// Fires when `/stop` is invoked — the harness must kill its child and stop.
     pub cancel: Arc<Notify>,
+    /// Extra system-prompt context (the daemon's mafold preamble: identity, the
+    /// current conversation, embeddable cards). Appended to the agent's own
+    /// system prompt; None = a pure, mafold-unaware agent.
+    pub system: Option<String>,
 }
 
 /// Outcome of a turn.
