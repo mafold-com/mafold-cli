@@ -125,31 +125,19 @@ pub async fn run(client: Client, workdir: String, harness_id: String, auto_updat
     // waits because we open the draft before taking the lock.
     let exec_lock = Arc::new(Mutex::new(()));
 
-    // Hourly auto-update: check; if a newer release exists, apply + re-exec —
-    // but only when IDLE (try_lock succeeds → no claude running/queued) so we
-    // never kill an in-flight reply. Busy → retry next hour.
+    // Auto-update: poll every 10 minutes; if a newer release exists, apply +
+    // re-exec — but only when IDLE (try_lock → no claude running/queued) so an
+    // update never kills an in-flight reply. We ALSO check on every reconnect
+    // (below), so a new release lands within minutes, not an hour.
     if auto_update {
         let client = client.clone();
         let exec_lock = exec_lock.clone();
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(3600));
+            let mut tick = tokio::time::interval(Duration::from_secs(600));
             tick.tick().await; // consume the immediate first tick
             loop {
                 tick.tick().await;
-                match crate::update::check(&client.http).await {
-                    Ok(Some(r)) => {
-                        if let Ok(_g) = exec_lock.try_lock() {
-                            println!("↻ updating to v{} — restarting…", r.version);
-                            if crate::update::apply(&client.http, &r.url, &r.version, r.sha256.as_deref()).await.is_ok() {
-                                let _ = crate::update::reexec();
-                            }
-                        } else {
-                            println!("update v{} available — will apply when idle", r.version);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => eprintln!("auto-update check failed: {e}"),
-                }
+                maybe_update(&client.http, &exec_lock).await;
             }
         });
     }
@@ -157,13 +145,43 @@ pub async fn run(client: Client, workdir: String, harness_id: String, auto_updat
     // Reconnect loop: a dropped WS (network blip, server restart) must NOT kill
     // the daemon. Reconnect with backoff; sessions/exec_lock persist across it.
     let mut backoff = 1u64;
+    let mut last_update_check = std::time::Instant::now();
     loop {
         if let Err(e) = connect_and_run(&client, &workdir, &my_username, &sessions, &exec_lock, &chat_states, &harness).await {
             eprintln!("connection error: {e}");
         }
+        // A dropped WS is a natural idle moment → opportunistically self-update,
+        // so a new release lands on reconnect (rate-limited to ≤ once / 5 min so
+        // a reconnect storm doesn't hammer the releases API).
+        if auto_update && last_update_check.elapsed() > Duration::from_secs(300) {
+            last_update_check = std::time::Instant::now();
+            maybe_update(&client.http, &exec_lock).await;
+        }
         eprintln!("reconnecting in {backoff}s…");
         tokio::time::sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(30);
+    }
+}
+
+/// Check for a newer release; if one exists and the agent is IDLE (no claude run
+/// in flight → `exec_lock` is free), safely apply it and re-exec into the new
+/// binary. Idle-gated so a self-update never interrupts a reply; never returns
+/// on a successful re-exec. Shared by the periodic poll + the reconnect check.
+async fn maybe_update(http: &reqwest::Client, exec_lock: &Arc<Mutex<()>>) {
+    match crate::update::check(http).await {
+        Ok(Some(r)) => {
+            // Hold the lock across apply + re-exec so no new run starts mid-update.
+            if let Ok(_guard) = exec_lock.try_lock() {
+                println!("↻ updating to v{} — restarting…", r.version);
+                if crate::update::apply(http, &r.url, &r.version, r.sha256.as_deref()).await.is_ok() {
+                    let _ = crate::update::reexec();
+                }
+            } else {
+                println!("update v{} available — will apply when idle", r.version);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => eprintln!("auto-update check failed: {e}"),
     }
 }
 
