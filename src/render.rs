@@ -183,7 +183,7 @@ fn line_esc(s: &str) -> String {
     }
 }
 
-pub(crate) fn attr_esc(s: &str) -> String {
+fn attr_esc(s: &str) -> String {
     let cleaned: String = s
         .chars()
         .map(|c| match c { '"' => '\'', '\n' | '\r' | '\t' => ' ', _ => c })
