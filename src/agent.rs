@@ -412,16 +412,23 @@ async fn compact_session(client: Client, workdir: String, chat_id: String, sessi
                 s.insert(chat_id.clone(), new_sid.to_string());
                 save_sessions(&s);
             }
-            let note = v["result"]
-                .as_str()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("older messages summarized — continuing with full continuity");
-            let card = format!(
-                "{{% tool name=\"Context compacted\" detail=\"{}\" /%}}",
-                crate::render::attr_esc(note)
-            );
-            let _ = client.send(&chat_id, &card).await;
+            // Token counts → a progress-bar card. The compaction turn READS the
+            // whole prior conversation (≈ context before) and WRITES the summary
+            // that becomes the new context (≈ context after).
+            let u = &v["usage"];
+            let before = u["input_tokens"].as_u64().unwrap_or(0)
+                + u["cache_read_input_tokens"].as_u64().unwrap_or(0)
+                + u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+            let after = u["output_tokens"].as_u64().unwrap_or(0);
+            if before == 0 {
+                // e.g. "Not enough messages to compact." — nothing meaningful freed.
+                let _ = client
+                    .send(&chat_id, "Not much to compact yet — keep chatting, then /compact to summarize the context.")
+                    .await;
+            } else {
+                let card = format!("{{% compact before=\"{before}\" after=\"{after}\" /%}}");
+                let _ = client.send(&chat_id, &card).await;
+            }
         }
         Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr);
