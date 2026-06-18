@@ -155,7 +155,7 @@ async fn main() -> Result<()> {
                 agent::run(Client::new(cli.base, token), workdir, harness, !cli.no_auto_update).await?;
             }
         }
-        Cmd::Add { name, workdir, harness } => supervisor::add(name, token, workdir, harness)?,
+        Cmd::Add { name, workdir, harness } => supervisor::add(name, token, workdir, harness, &cli.base)?,
         Cmd::Chats => chats(&Client::new(cli.base, token)).await?,
         Cmd::Send { chat, text } => send(&Client::new(cli.base, token), &chat, &text.join(" ")).await?,
         Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Cards { .. }
