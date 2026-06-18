@@ -20,6 +20,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, Notify};
 
 use crate::client::Client;
+use crate::harness::{AgentEvent, Harness, Turn};
 
 #[derive(Deserialize)]
 struct Sender { username: String }
@@ -77,13 +78,13 @@ fn save_sessions(map: &HashMap<String, String>) {
     }
 }
 
-pub async fn run(client: Client, workdir: String, auto_update: bool) -> Result<()> {
+pub async fn run(client: Client, workdir: String, harness_id: String, auto_update: bool) -> Result<()> {
     // Self-update on startup (before connecting) so a (re)started agent is
     // always current; if it updates, re-exec into the new binary.
     if auto_update {
-        if let Ok(Some((v, url))) = crate::update::check(&client.http).await {
-            println!("↻ updating to v{v}…");
-            if crate::update::apply(&client.http, &url).await.is_ok() {
+        if let Ok(Some(r)) = crate::update::check(&client.http).await {
+            println!("↻ updating to v{}…", r.version);
+            if crate::update::apply(&client.http, &r.url, &r.version, r.sha256.as_deref()).await.is_ok() {
                 let _ = crate::update::reexec(); // replaces this process
             }
         }
@@ -92,15 +93,30 @@ pub async fn run(client: Client, workdir: String, auto_update: bool) -> Result<(
     let me = client.me().await.context("getMe failed — check the token / --base")?;
     let my_username = me["username"].as_str().unwrap_or_default().to_string();
     anyhow::ensure!(!my_username.is_empty(), "could not resolve bot identity (bad token?)");
+
+    // Cloud-first harness: the bot's server-configured harness wins over the
+    // local `--harness` flag (which is the fallback / first-run default).
+    let harness_id = me["harness"].as_str().filter(|s| !s.is_empty()).map(str::to_string).unwrap_or(harness_id);
+    let harness = crate::harness::select(&harness_id);
     if !std::path::Path::new(&workdir).is_dir() {
-        eprintln!("⚠️  working directory does not exist: {workdir} — claude will fail. Check --workdir.");
+        eprintln!("⚠️  working directory does not exist: {workdir} — the harness will fail. Check --workdir.");
     }
-    println!("mafold agent ✓ connected as @{my_username}  ·  workdir={workdir}");
+    if !harness.available() {
+        eprintln!("⚠️  harness `{}` CLI not found on PATH — replies will fail until it's installed.", harness.id());
+    }
+    // Show the requested id and whether it fell back (an unimplemented harness
+    // resolves to claude-code), so cloud-first selection is observable in logs.
+    let harness_label = if harness.id() != harness_id {
+        format!("{harness_id} (→ {} fallback)", harness.id())
+    } else {
+        harness_id.clone()
+    };
+    println!("mafold agent ✓ connected as @{my_username}  ·  harness={harness_label}  ·  workdir={workdir}");
 
     // Publish the command panel (the chat "/" menu): the daemon's own control
-    // commands first, then every Claude Code skill/slash-command found on this
-    // machine, so anyone chatting the bot can discover + tap them.
-    publish_commands(&client, &workdir).await;
+    // commands first, then every skill/slash-command the harness discovers on
+    // this machine, so anyone chatting the bot can discover + tap them.
+    publish_commands(&client, &workdir, &harness).await;
 
     let sessions: Sessions = Arc::new(Mutex::new(load_sessions()));
     let chat_states: ChatStates = Arc::new(Mutex::new(HashMap::new()));
@@ -121,14 +137,14 @@ pub async fn run(client: Client, workdir: String, auto_update: bool) -> Result<(
             loop {
                 tick.tick().await;
                 match crate::update::check(&client.http).await {
-                    Ok(Some((v, url))) => {
+                    Ok(Some(r)) => {
                         if let Ok(_g) = exec_lock.try_lock() {
-                            println!("↻ updating to v{v} — restarting…");
-                            if crate::update::apply(&client.http, &url).await.is_ok() {
+                            println!("↻ updating to v{} — restarting…", r.version);
+                            if crate::update::apply(&client.http, &r.url, &r.version, r.sha256.as_deref()).await.is_ok() {
                                 let _ = crate::update::reexec();
                             }
                         } else {
-                            println!("update v{v} available — will apply when idle");
+                            println!("update v{} available — will apply when idle", r.version);
                         }
                     }
                     Ok(None) => {}
@@ -142,7 +158,7 @@ pub async fn run(client: Client, workdir: String, auto_update: bool) -> Result<(
     // the daemon. Reconnect with backoff; sessions/exec_lock persist across it.
     let mut backoff = 1u64;
     loop {
-        if let Err(e) = connect_and_run(&client, &workdir, &my_username, &sessions, &exec_lock, &chat_states).await {
+        if let Err(e) = connect_and_run(&client, &workdir, &my_username, &sessions, &exec_lock, &chat_states, &harness).await {
             eprintln!("connection error: {e}");
         }
         eprintln!("reconnecting in {backoff}s…");
@@ -167,9 +183,9 @@ fn control_commands() -> Vec<Value> {
 
 /// Build the full command panel (control commands + discovered skills/commands)
 /// and publish it. Best-effort — a failure just leaves the previous menu.
-async fn publish_commands(client: &Client, workdir: &str) {
+async fn publish_commands(client: &Client, workdir: &str, harness: &Arc<dyn Harness>) {
     let mut commands = control_commands();
-    if let Value::Array(discovered) = crate::discover::all(workdir) {
+    if let Value::Array(discovered) = harness.discover(workdir) {
         commands.extend(discovered);
     }
     let n = commands.len();
@@ -180,6 +196,7 @@ async fn publish_commands(client: &Client, workdir: &str) {
 
 /// One WS session: connect, keepalive-ping, dispatch incoming messages. Returns
 /// when the socket drops (so the caller reconnects).
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_run(
     client: &Client,
     workdir: &str,
@@ -187,6 +204,7 @@ async fn connect_and_run(
     sessions: &Sessions,
     exec_lock: &Arc<Mutex<()>>,
     chat_states: &ChatStates,
+    harness: &Arc<dyn Harness>,
 ) -> Result<()> {
     let (ws, _) = tokio_tungstenite::connect_async(&client.ws_url())
         .await
@@ -248,7 +266,7 @@ async fn connect_and_run(
                 continue;
             }
             if is_control(&name) {
-                handle_control(client, workdir, &m.conversation_id, &name, arg, sessions, chat_states).await;
+                handle_control(client, workdir, &m.conversation_id, &name, arg, sessions, chat_states, harness).await;
                 continue;
             }
         }
@@ -258,24 +276,26 @@ async fn connect_and_run(
         let sessions = sessions.clone();
         let exec_lock = exec_lock.clone();
         let chat_states = chat_states.clone();
+        let harness = harness.clone();
         let attachments = m.attachments.clone();
         let chat_id = m.conversation_id.clone();
         let content = m.content.clone();
         let model = chat_states.lock().await.get(&chat_id).and_then(|s| s.model.clone());
         tokio::spawn(async move {
-            // Emulated Claude Code slash commands (config dumps, /login, /logout,
-            // terminal-only mocks). Anything not emulated falls through to claude.
+            // Harness-emulated slash commands (config dumps, /logout, mocks);
+            // anything not emulated falls through to the harness as a prompt.
             let trimmed = content.trim();
             if let Some(rest) = trimmed.strip_prefix('/') {
                 let mut it = rest.splitn(2, char::is_whitespace);
                 let name = it.next().unwrap_or("").to_lowercase();
                 let arg = it.next().unwrap_or("").trim();
-                match crate::commands::handle(&name, arg, &workdir).await {
-                    crate::commands::Outcome::Reply(text) => { let _ = client.send(&chat_id, &text).await; return; }
-                    crate::commands::Outcome::Forward => {}
+                match harness.command(&client, &chat_id, &name, arg, &workdir).await {
+                    crate::harness::CommandOutcome::Reply(text) => { let _ = client.send(&chat_id, &text).await; return; }
+                    crate::harness::CommandOutcome::Handled => return,
+                    crate::harness::CommandOutcome::Forward => {}
                 }
             }
-            if let Err(e) = handle(&client, &workdir, &chat_id, &content, &attachments, &sessions, &exec_lock, &chat_states, model).await {
+            if let Err(e) = handle(&client, &workdir, &chat_id, &content, &attachments, &sessions, &exec_lock, &chat_states, &harness, model).await {
                 eprintln!("handle error: {e}");
             }
         });
@@ -291,6 +311,7 @@ fn is_control(name: &str) -> bool {
 }
 
 /// Run a daemon control command. Replies in-chat; never invokes claude.
+#[allow(clippy::too_many_arguments)]
 async fn handle_control(
     client: &Client,
     workdir: &str,
@@ -299,6 +320,7 @@ async fn handle_control(
     arg: &str,
     sessions: &Sessions,
     chat_states: &ChatStates,
+    harness: &Arc<dyn Harness>,
 ) {
     match name {
         "clear" | "new" => {
@@ -335,9 +357,9 @@ async fn handle_control(
             let busy = chat_states.lock().await.get(chat_id).map(|s| s.cancel.is_some()).unwrap_or(false);
             let model = chat_states.lock().await.get(chat_id).and_then(|s| s.model.clone()).unwrap_or_else(|| "default".into());
             let state = if busy { "running a reply now" } else { "idle" };
-            let auth = crate::commands::auth_status_line().await;
-            let auth_line = if auth.is_empty() { String::new() } else { format!("\n• claude: {auth}") };
-            let _ = client.send(chat_id, &format!("Agent {state}.\n• workdir: {workdir}\n• model: {model}{auth_line}")).await;
+            let auth = harness.status_line().await;
+            let auth_line = if auth.is_empty() { String::new() } else { format!("\n• {}: {auth}", harness.id()) };
+            let _ = client.send(chat_id, &format!("Agent {state}.\n• harness: {}\n• workdir: {workdir}\n• model: {model}{auth_line}", harness.id())).await;
         }
         "cwd" => {
             let _ = client.send(chat_id, &format!("Working directory: {workdir}")).await;
@@ -487,6 +509,7 @@ async fn handle(
     sessions: &Sessions,
     exec_lock: &Arc<Mutex<()>>,
     chat_states: &ChatStates,
+    harness: &Arc<dyn Harness>,
     model: Option<String>,
 ) -> Result<()> {
     let msg_id = client.create_draft(chat_id).await?;
@@ -519,7 +542,7 @@ async fn handle(
         );
     }
 
-    // Serialize: only one claude runs at a time in this workdir.
+    // Serialize: only one turn runs at a time in this workdir.
     let _guard = exec_lock.lock().await;
     let prior = sessions.lock().await.get(chat_id).cloned();
 
@@ -527,12 +550,44 @@ async fn handle(
     let cancel = Arc::new(Notify::new());
     chat_states.lock().await.entry(chat_id.to_string()).or_default().cancel = Some(cancel.clone());
 
-    match stream_claude(client, workdir, &full_prompt, &msg_id, prior.as_deref(), sessions, chat_id, model.as_deref(), &cancel).await {
-        Ok(o) if o.stopped => { let _ = client.append_delta(&msg_id, "\n\n⏹ Stopped.").await; }
-        Ok(o) if o.produced => {}
-        Ok(_) => { let _ = client.append_delta(&msg_id, "_(the agent produced no output)_").await; }
+    let turn = Turn {
+        prompt: full_prompt,
+        workdir: workdir.to_string(),
+        session: prior.clone(),
+        model,
+        cancel: cancel.clone(),
+    };
+
+    // Renderer task: drain the harness's normalized events → batched, ordered
+    // markdoc deltas (text + cards), so a slow append never stalls reading.
+    let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    let renderer = {
+        let client = client.clone();
+        let msg_id = msg_id.clone();
+        tokio::spawn(render_loop(ev_rx, client, msg_id))
+    };
+
+    let result = harness.run(turn, ev_tx).await;
+    let _ = renderer.await;
+
+    match result {
+        Ok(o) => {
+            if o.stopped {
+                let _ = client.append_delta(&msg_id, "\n\n⏹ Stopped.").await;
+            } else if !o.produced {
+                let _ = client.append_delta(&msg_id, "_(the agent produced no output)_").await;
+            }
+            // Persist the (possibly new) session so the next message resumes it.
+            if let Some(sid) = o.session {
+                let mut s = sessions.lock().await;
+                if s.get(chat_id).map(String::as_str) != Some(sid.as_str()) {
+                    s.insert(chat_id.to_string(), sid);
+                    save_sessions(&s);
+                }
+            }
+        }
         Err(e) => {
-            eprintln!("claude failed: {e}");
+            eprintln!("harness run failed: {e}");
             // A stale/expired resumed session → drop it so the next message
             // starts fresh instead of failing again.
             if prior.is_some() {
@@ -549,393 +604,37 @@ async fn handle(
     Ok(())
 }
 
-/// Outcome of one claude run.
-struct RunOutcome {
-    /// Any content (text or a card) was streamed.
-    produced: bool,
-    /// The run was interrupted by `/stop`.
-    stopped: bool,
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn stream_claude(
-    client: &Client,
-    workdir: &str,
-    prompt: &str,
-    msg_id: &str,
-    prior_session: Option<&str>,
-    sessions: &Sessions,
-    chat_id: &str,
-    model: Option<&str>,
-    cancel: &Arc<Notify>,
-) -> Result<RunOutcome> {
-    if !std::path::Path::new(workdir).is_dir() {
-        anyhow::bail!("working directory does not exist: {workdir} — check --workdir");
-    }
-    let mut cmd = tokio::process::Command::new("claude");
-    cmd.arg("-p").arg(prompt)
-        .arg("--output-format").arg("stream-json")
-        .arg("--verbose")
-        .arg("--include-partial-messages")
-        .arg("--dangerously-skip-permissions");
-    if let Some(m) = model {
-        cmd.arg("--model").arg(m);
-    }
-    // Kill the child if its handle is dropped (e.g. the task is cancelled).
-    cmd.kill_on_drop(true);
-    // Resume this conversation's session → full prior context.
-    if let Some(sid) = prior_session {
-        cmd.arg("--resume").arg(sid);
-    }
-    let mut child = cmd
-        .current_dir(workdir)
-        .env_remove("CLAUDECODE")
-        .env_remove("ANTHROPIC_API_KEY")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("couldn't run `claude` in {workdir} — is Claude Code installed and on PATH?"))?;
-
-    let stdout = child.stdout.take().context("no stdout")?;
-    let mut lines = BufReader::new(stdout).lines();
-
-    // Decouple network sends from reading claude's stdout: a sender task drains
-    // a channel and POSTs batched, ORDERED deltas. So a slow append never stalls
-    // reading — long replies stream smoothly even on a slow link.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let sender = {
-        let client = client.clone();
-        let msg_id = msg_id.to_string();
-        tokio::spawn(async move {
-            let mut buf = String::new();
-            loop {
-                match tokio::time::timeout(Duration::from_millis(120), rx.recv()).await {
-                    Ok(Some(chunk)) => {
-                        buf.push_str(&chunk);
-                        if buf.len() >= 240 {
-                            let _ = client.append_delta(&msg_id, &buf).await;
-                            buf.clear();
-                        }
-                    }
-                    Ok(None) => break,           // channel closed → claude done
-                    Err(_) => {                  // idle ~120ms → flush what we have
-                        if !buf.is_empty() {
-                            let _ = client.append_delta(&msg_id, &buf).await;
-                            buf.clear();
-                        }
-                    }
-                }
-            }
-            if !buf.is_empty() { let _ = client.append_delta(&msg_id, &buf).await; }
-        })
-    };
-
-    let mut produced = false;
-    let mut stopped = false;
-    let mut session_id: Option<String> = None;
-    // tool_use_id → lowercased tool name, so a later tool_result (e.g. bash
-    // output) can be matched back to the call that produced it.
-    let mut tool_names: HashMap<String, String> = HashMap::new();
-
+/// Drains a harness's `AgentEvent` stream → batched, ordered markdoc deltas.
+/// Batches small text chunks (≥240 bytes or ~120ms) so long replies stream
+/// smoothly even on a slow link; cards render through the same path, in order.
+async fn render_loop(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
+    client: Client,
+    msg_id: String,
+) {
+    let mut names: HashMap<String, String> = HashMap::new();
+    let mut buf = String::new();
     loop {
-        let line = tokio::select! {
-            line = lines.next_line() => match line? { Some(l) => l, None => break },
-            _ = cancel.notified() => { stopped = true; let _ = child.start_kill(); break; }
-        };
-        let line = line.trim();
-        if line.is_empty() { continue; }
-        let v: Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => continue };
-        if session_id.is_none() {
-            if let Some(sid) = v["session_id"].as_str() {
-                session_id = Some(sid.to_string());
-            }
-        }
-        // Streaming assistant text.
-        if v["type"] == "stream_event"
-            && v["event"]["type"] == "content_block_delta"
-            && v["event"]["delta"]["type"] == "text_delta"
-        {
-            if let Some(t) = v["event"]["delta"]["text"].as_str() {
-                let _ = tx.send(t.to_string());
-                produced = true;
-            }
-        }
-        // Completed assistant message → emit cards for its tool calls + thinking
-        // (text already streamed above, so it's skipped here). Shows the work as
-        // it happens so a long agentic turn never looks frozen on "typing".
-        if v["type"] == "assistant" {
-            if let Some(blocks) = v["message"]["content"].as_array() {
-                for b in blocks {
-                    match b["type"].as_str() {
-                        Some("tool_use") => {
-                            let _ = tx.send(tool_use_tag(b, &mut tool_names));
-                            produced = true;
-                        }
-                        Some("thinking") => {
-                            if let Some(tag) = thinking_tag(b) { let _ = tx.send(tag); produced = true; }
-                        }
-                        _ => {}
+        match tokio::time::timeout(Duration::from_millis(120), rx.recv()).await {
+            Ok(Some(ev)) => {
+                if let Some(s) = crate::render::render(&ev, &mut names) {
+                    buf.push_str(&s);
+                    if buf.len() >= 240 {
+                        let _ = client.append_delta(&msg_id, &buf).await;
+                        buf.clear();
                     }
                 }
             }
-        }
-        // Tool results → output cards (currently: bash stdout/stderr).
-        if v["type"] == "user" {
-            if let Some(blocks) = v["message"]["content"].as_array() {
-                for b in blocks {
-                    if b["type"] == "tool_result" {
-                        if let Some(tag) = tool_result_tag(b, &tool_names) { let _ = tx.send(tag); produced = true; }
-                    }
+            Ok(None) => break, // harness done → channel closed
+            Err(_) => {
+                if !buf.is_empty() {
+                    let _ = client.append_delta(&msg_id, &buf).await;
+                    buf.clear();
                 }
             }
         }
-        if v["type"] == "result" {
-            if let Some(tag) = result_tag(&v) { let _ = tx.send(tag); }
-            break;
-        }
     }
-    drop(tx);             // close the channel → sender flushes the tail + exits
-    let _ = sender.await;
-
-    // Remember the session for this conversation so the next message resumes it.
-    if let Some(sid) = session_id {
-        let mut s = sessions.lock().await;
-        if s.get(chat_id).map(String::as_str) != Some(sid.as_str()) {
-            s.insert(chat_id.to_string(), sid);
-            save_sessions(&s);
-        }
-    }
-
-    if stopped {
-        let _ = child.wait().await; // reap the killed child; don't treat as error
-        return Ok(RunOutcome { produced, stopped });
-    }
-    let status = child.wait().await?;
-    if !status.success() {
-        let mut err = String::new();
-        if let Some(mut se) = child.stderr.take() {
-            use tokio::io::AsyncReadExt;
-            let _ = se.read_to_string(&mut err).await;
-        }
-        let err = err.trim();
-        anyhow::bail!("claude exited unsuccessfully{}", if err.is_empty() { String::new() } else { format!(": {err}") });
-    }
-    Ok(RunOutcome { produced, stopped })
-}
-
-/// A short, human-readable detail for a tool-use card (the file, command, …).
-fn tool_detail(name: &str, input: &serde_json::Value) -> String {
-    let raw = match name.to_lowercase().as_str() {
-        "bash" => input["command"].as_str(),
-        "edit" | "write" | "multiedit" | "read" | "notebookedit" => input["file_path"].as_str(),
-        "glob" | "grep" => input["pattern"].as_str(),
-        "webfetch" => input["url"].as_str(),
-        "task" => input["description"].as_str(),
-        "todowrite" => Some("updating plan"),
-        _ => None,
-    };
-    raw.unwrap_or("").to_string()
-}
-
-/// Sanitize a value for a markdoc attribute: no quotes/newlines, capped length.
-fn attr_esc(s: &str) -> String {
-    let cleaned: String = s
-        .chars()
-        .map(|c| match c { '"' => '\'', '\n' | '\r' | '\t' => ' ', _ => c })
-        .collect();
-    let cleaned = cleaned.trim();
-    if cleaned.chars().count() > 80 {
-        format!("{}…", cleaned.chars().take(80).collect::<String>())
-    } else {
-        cleaned.to_string()
-    }
-}
-
-// ── rich card emission: map Claude Code stream-json → agent-card markdoc tags ──
-// (The shared tag contract; rendered natively by mafold-web AgentCard + the iOS
-// PrimitiveRenderer. Multi-line content goes in the tag body, not attributes.)
-
-/// A `tool_use` block → the right card. Records `id → name` so a later
-/// `tool_result` (bash output) can be matched back.
-fn tool_use_tag(b: &Value, tool_names: &mut HashMap<String, String>) -> String {
-    let name = b["name"].as_str().unwrap_or("tool");
-    let lname = name.to_lowercase();
-    if let Some(id) = b["id"].as_str() {
-        tool_names.insert(id.to_string(), lname.clone());
-    }
-    let input = &b["input"];
-    match lname.as_str() {
-        "todowrite" => todo_tag(input),
-        "edit" | "multiedit" => diff_tag_edit(&lname, input),
-        "write" => diff_tag_write(input),
-        "task" => format!(
-            "\n{{% task subagent=\"{}\" desc=\"{}\" /%}}\n",
-            attr_esc(input["subagent_type"].as_str().unwrap_or("agent")),
-            attr_esc(input["description"].as_str().unwrap_or("")),
-        ),
-        "webfetch" => format!("\n{{% web url=\"{}\" /%}}\n", attr_esc(input["url"].as_str().unwrap_or(""))),
-        "websearch" => format!("\n{{% web query=\"{}\" /%}}\n", attr_esc(input["query"].as_str().unwrap_or(""))),
-        "skill" => {
-            let sname = input["command"].as_str()
-                .or_else(|| input["skill"].as_str())
-                .or_else(|| input["name"].as_str())
-                .unwrap_or("skill");
-            let args = input["args"].as_str().or_else(|| input["arguments"].as_str()).unwrap_or("");
-            format!("\n{{% skill name=\"{}\" args=\"{}\" /%}}\n", attr_esc(sname), attr_esc(args))
-        }
-        _ => {
-            let detail = tool_detail(name, input);
-            format!("\n{{% tool name=\"{}\" detail=\"{}\" /%}}\n", attr_esc(name), attr_esc(&detail))
-        }
-    }
-}
-
-/// `{% todo %}` from a TodoWrite call — one `[x]`/`[~]`/`[ ] item` line each.
-fn todo_tag(input: &Value) -> String {
-    let mut body = String::new();
-    if let Some(items) = input["todos"].as_array() {
-        for t in items {
-            let content = t["content"].as_str().or_else(|| t["activeForm"].as_str()).unwrap_or("");
-            let mark = match t["status"].as_str().unwrap_or("pending") {
-                "completed" => 'x',
-                "in_progress" => '~',
-                _ => ' ',
-            };
-            body.push_str(&format!("[{mark}] {}\n", line_esc(content)));
-        }
-    }
-    format!("\n{{% todo %}}\n{}{{% /todo %}}\n", block_esc(&body))
-}
-
-/// `{% diff %}` from an Edit/MultiEdit call.
-fn diff_tag_edit(lname: &str, input: &Value) -> String {
-    let file = input["file_path"].as_str().unwrap_or("");
-    let (added, removed, body) = if lname == "multiedit" {
-        let mut a = 0; let mut r = 0; let mut body = String::new();
-        if let Some(edits) = input["edits"].as_array() {
-            for e in edits {
-                let (ea, er, eb) = synth_hunk(e["old_string"].as_str().unwrap_or(""), e["new_string"].as_str().unwrap_or(""));
-                a += ea; r += er; body.push_str(&eb);
-            }
-        }
-        (a, r, body)
-    } else {
-        synth_hunk(input["old_string"].as_str().unwrap_or(""), input["new_string"].as_str().unwrap_or(""))
-    };
-    diff_tag(file, added, removed, &body)
-}
-
-/// `{% diff %}` from a Write call — the whole file as added lines.
-fn diff_tag_write(input: &Value) -> String {
-    let file = input["file_path"].as_str().unwrap_or("");
-    let content = input["content"].as_str().unwrap_or("");
-    let lines: Vec<&str> = if content.is_empty() { vec![] } else { content.lines().collect() };
-    let mut body = String::new();
-    for l in &lines { body.push('+'); body.push_str(l); body.push('\n'); }
-    diff_tag(file, lines.len(), 0, &body)
-}
-
-fn diff_tag(file: &str, added: usize, removed: usize, body: &str) -> String {
-    format!(
-        "\n{{% diff file=\"{}\" added={} removed={} %}}\n{}{{% /diff %}}\n",
-        attr_esc(file), added, removed, block_esc(&cap_lines(body, 24)),
-    )
-}
-
-/// Naive line diff: all old lines as `-`, all new lines as `+`. Good enough for
-/// the small, targeted edits Claude Code makes; the renderer colors +/- lines.
-fn synth_hunk(old: &str, new: &str) -> (usize, usize, String) {
-    let oldl: Vec<&str> = if old.is_empty() { vec![] } else { old.lines().collect() };
-    let newl: Vec<&str> = if new.is_empty() { vec![] } else { new.lines().collect() };
-    let mut body = String::new();
-    for l in &oldl { body.push('-'); body.push_str(l); body.push('\n'); }
-    for l in &newl { body.push('+'); body.push_str(l); body.push('\n'); }
-    (newl.len(), oldl.len(), body)
-}
-
-/// `{% thinking %}` from an assistant thinking block (collapsed by renderers).
-fn thinking_tag(b: &Value) -> Option<String> {
-    let t = b["thinking"].as_str()?.trim();
-    if t.is_empty() { return None; }
-    Some(format!("\n{{% thinking %}}\n{}{{% /thinking %}}\n", block_esc(&cap_lines(t, 14))))
-}
-
-/// `{% bash %}` output card from a bash tool_result (matched via `tool_names`).
-fn tool_result_tag(b: &Value, tool_names: &HashMap<String, String>) -> Option<String> {
-    let id = b["tool_use_id"].as_str()?;
-    if tool_names.get(id).map(String::as_str) != Some("bash") { return None; }
-    let out = tool_result_text(b);
-    let out = out.trim();
-    if out.is_empty() { return None; }
-    Some(format!("\n{{% bash %}}\n{}{{% /bash %}}\n", block_esc(&cap_lines(out, 20))))
-}
-
-/// A tool_result's content can be a string or an array of `{type:text,text}`.
-fn tool_result_text(b: &Value) -> String {
-    match &b["content"] {
-        Value::String(s) => s.clone(),
-        Value::Array(items) => items
-            .iter()
-            .filter_map(|i| i["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
-}
-
-/// `{% result %}` run-summary card from the final `type:"result"` event.
-fn result_tag(v: &Value) -> Option<String> {
-    let dur = v["duration_ms"].as_f64();
-    let cost = v["total_cost_usd"].as_f64().filter(|c| *c > 0.0);
-    let u = &v["usage"];
-    let toks: u64 = ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
-        .iter()
-        .filter_map(|k| u[*k].as_u64())
-        .sum();
-    if dur.is_none() && cost.is_none() && toks == 0 { return None; }
-    let mut attrs = String::new();
-    if let Some(d) = dur { attrs.push_str(&format!(" duration=\"{:.1}s\"", d / 1000.0)); }
-    if toks > 0 { attrs.push_str(&format!(" tokens=\"{}\"", fmt_count(toks))); }
-    if let Some(c) = cost { attrs.push_str(&format!(" cost=\"${c:.4}\"")); }
-    Some(format!("\n{{% result{attrs} /%}}\n"))
-}
-
-fn fmt_count(n: u64) -> String {
-    if n >= 1000 { format!("{:.1}k", n as f64 / 1000.0) } else { n.to_string() }
-}
-
-/// Keep the first `max` lines of a block, with a "+N more" marker; always ends
-/// with a newline so the closing `{% /tag %}` sits on its own line.
-fn cap_lines(s: &str, max: usize) -> String {
-    let lines: Vec<&str> = s.lines().collect();
-    if lines.len() <= max {
-        let mut out = lines.join("\n");
-        if !out.is_empty() { out.push('\n'); }
-        out
-    } else {
-        let shown = lines[..max].join("\n");
-        format!("{shown}\n… (+{} more lines)\n", lines.len() - max)
-    }
-}
-
-/// Neutralize stray markdoc markers inside a tag body so a value can't close the
-/// tag early, and cap absolute length.
-fn block_esc(s: &str) -> String {
-    let mut out = s.replace("{%", "{ %").replace("%}", "% }");
-    if out.chars().count() > 4000 {
-        out = out.chars().take(4000).collect::<String>();
-        out.push_str("\n…\n");
-    }
-    out
-}
-
-/// One-line, length-capped text for a todo item.
-fn line_esc(s: &str) -> String {
-    let one: String = s.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
-    let one = one.trim();
-    if one.chars().count() > 120 {
-        format!("{}…", one.chars().take(120).collect::<String>())
-    } else {
-        one.to_string()
+    if !buf.is_empty() {
+        let _ = client.append_delta(&msg_id, &buf).await;
     }
 }
