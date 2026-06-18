@@ -307,7 +307,7 @@ async fn connect_and_run(
 
 /// Is this slash name one the daemon handles itself (vs a Claude Code skill)?
 fn is_control(name: &str) -> bool {
-    matches!(name, "clear" | "new" | "stop" | "model" | "status" | "cwd" | "help")
+    matches!(name, "clear" | "new" | "compact" | "stop" | "model" | "status" | "cwd" | "help")
 }
 
 /// Run a daemon control command. Replies in-chat; never invokes claude.
@@ -329,6 +329,14 @@ async fn handle_control(
                 if s.remove(chat_id).is_some() { save_sessions(&s); }
             }
             let _ = client.send(chat_id, "🧹 Context cleared — starting fresh.").await;
+        }
+        "compact" => {
+            // Genuinely compact this conversation's Claude session (summarize the
+            // prior context to free tokens, keeping continuity). Spawned so the
+            // (slow) claude run never blocks the message loop.
+            let (client, workdir, chat_id, sessions) =
+                (client.clone(), workdir.to_string(), chat_id.to_string(), sessions.clone());
+            tokio::spawn(async move { compact_session(client, workdir, chat_id, sessions).await; });
         }
         "stop" => {
             let notify = chat_states.lock().await.get(chat_id).and_then(|s| s.cancel.clone());
@@ -366,9 +374,68 @@ async fn handle_control(
         }
         "help" => {
             let _ = client.send(chat_id,
-                "I'm a Claude Code agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /stop — stop the running reply\n• /model <name> — switch model for this chat\n• /status · /cwd — agent info\n\nEverything else in the `/` menu is a Claude Code skill or command — tap one to run it.").await;
+                "I'm a Claude Code agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /compact — summarize the context to free up room (keeps continuity)\n• /stop — stop the running reply\n• /model <name> — switch model for this chat\n• /status · /cwd — agent info\n\nEverything else in the `/` menu is a Claude Code skill or command — tap one to run it.").await;
         }
         _ => {}
+    }
+}
+
+/// `/compact` — run Claude Code's `/compact` on this conversation's resumed
+/// session so the prior context is summarized (frees tokens, keeps continuity),
+/// keep resuming the compacted session, and post a card. Best-effort: on any
+/// failure it tells the user and leaves the existing session untouched.
+async fn compact_session(client: Client, workdir: String, chat_id: String, sessions: Sessions) {
+    let prior = sessions.lock().await.get(&chat_id).cloned();
+    let Some(sid) = prior else {
+        let _ = client
+            .send(&chat_id, "Nothing to compact yet — send me a task first, then /compact to summarize the context.")
+            .await;
+        return;
+    };
+    let _ = client.send(&chat_id, "🗜️ Compacting the conversation…").await;
+    let out = tokio::process::Command::new("claude")
+        .arg("-p").arg("/compact")
+        .arg("--resume").arg(&sid)
+        .arg("--output-format").arg("json")
+        .arg("--dangerously-skip-permissions")
+        .current_dir(&workdir)
+        .env_remove("CLAUDECODE")
+        .env_remove("ANTHROPIC_API_KEY")
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {
+            let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_default();
+            // Keep resuming the (now compacted) session for future turns.
+            if let Some(new_sid) = v["session_id"].as_str() {
+                let mut s = sessions.lock().await;
+                s.insert(chat_id.clone(), new_sid.to_string());
+                save_sessions(&s);
+            }
+            let note = v["result"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("older messages summarized — continuing with full continuity");
+            let card = format!(
+                "{{% tool name=\"Context compacted\" detail=\"{}\" /%}}",
+                crate::render::attr_esc(note)
+            );
+            let _ = client.send(&chat_id, &card).await;
+        }
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let err = err.trim();
+            let msg = if err.is_empty() {
+                "Compaction failed — the context is unchanged.".to_string()
+            } else {
+                format!("Compaction failed — the context is unchanged.\n{err}")
+            };
+            let _ = client.send(&chat_id, &msg).await;
+        }
+        Err(e) => {
+            let _ = client.send(&chat_id, &format!("Couldn't run compaction: {e}")).await;
+        }
     }
 }
 
