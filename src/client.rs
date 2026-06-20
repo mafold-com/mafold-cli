@@ -38,6 +38,14 @@ impl Client {
     pub async fn me(&self) -> Result<Value> { self.post("getMe", json!({})).await }
     pub async fn chats(&self) -> Result<Value> { self.post("getChats", json!({})).await }
 
+    /// The bot's OWNER-set config, callable by the bot itself. Returns `BotDetail`
+    /// — `{ bot, config, config_schema, secret_schema, secrets }`. The daemon uses
+    /// `config` (a `{key: value}` map of the owner's stored field values) to drive
+    /// the harness defaults (model / system prompt / working dir).
+    pub async fn bot(&self, username: &str) -> Result<Value> {
+        self.post("getBot", json!({ "username": username })).await
+    }
+
     pub async fn send(&self, chat_id: &str, text: &str) -> Result<Value> {
         self.post("sendMessage", json!({ "chat_id": chat_id, "text": text })).await
     }

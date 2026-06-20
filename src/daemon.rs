@@ -25,7 +25,7 @@ fn alive(pid: i32) -> bool { unsafe { libc::kill(pid, 0) == 0 } }
 
 /// Re-exec ourselves in a new session (detached from the controlling terminal),
 /// with stdio redirected to a log file. The parent records the pid and exits.
-pub fn start_detached(base: &str, token: &str, workdir: &str, harness: &str) -> Result<u32> {
+pub fn start_detached(base: &str, token: &str, workdir: Option<&str>, harness: &str) -> Result<u32> {
     if let Some(pid) = read_pid() {
         if alive(pid) {
             anyhow::bail!("agent already running (pid {pid}) — run `mafold stop` first");
@@ -39,11 +39,15 @@ pub fn start_detached(base: &str, token: &str, workdir: &str, harness: &str) -> 
     cmd.arg("agent")
         .env("MAFOLD_BASE", base)
         .env("MAFOLD_BOT_TOKEN", token)
-        .env("MAFOLD_WORKDIR", workdir)
         .env("MAFOLD_HARNESS", harness)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
+    // Only pin the workdir when the user set one — otherwise the child resolves
+    // it from the server owner-config (or the current dir) at runtime.
+    if let Some(w) = workdir {
+        cmd.env("MAFOLD_WORKDIR", w);
+    }
     // New session → no controlling terminal → survives the shell closing.
     unsafe {
         cmd.pre_exec(|| {

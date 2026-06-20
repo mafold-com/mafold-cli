@@ -40,8 +40,11 @@ enum Cmd {
     /// Run an agent harness as your bot (daemon): receive messages, reply with
     /// the local agent CLI in the working directory.
     Agent {
-        #[arg(long, env = "MAFOLD_WORKDIR", default_value = ".")]
-        workdir: String,
+        /// Working directory the harness runs in. If omitted, the bot's
+        /// owner-set server config (`cwd`/`workdir`) is used, else the current
+        /// directory. An explicit flag always wins over the server config.
+        #[arg(long, env = "MAFOLD_WORKDIR")]
+        workdir: Option<String>,
         /// Which agent harness to drive: claude-code (default), opencode, codex,
         /// openclaw. (Others land as they're implemented.)
         #[arg(long, env = "MAFOLD_HARNESS", default_value = "claude-code")]
@@ -138,15 +141,16 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Agent { workdir, harness, detach } => {
-            // Resolve to an absolute path (default "." = the current folder), so
-            // the agent — and the detached child, which has a different cwd —
-            // both operate on the same real directory. No fake placeholders.
-            let workdir = std::fs::canonicalize(&workdir)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or(workdir);
+            // An explicit --workdir wins; if omitted, the server owner-config (or
+            // the current dir) decides at runtime. Resolve an explicit one to an
+            // absolute path so the agent — and the detached child, which has a
+            // different cwd — both operate on the same real directory.
+            let workdir = workdir.map(|w| {
+                std::fs::canonicalize(&w).map(|p| p.to_string_lossy().into_owned()).unwrap_or(w)
+            });
             if detach {
-                let pid = daemon::start_detached(&cli.base, &token, &workdir, &harness)?;
-                println!("  workdir: {workdir}");
+                let pid = daemon::start_detached(&cli.base, &token, workdir.as_deref(), &harness)?;
+                if let Some(w) = &workdir { println!("  workdir: {w}"); }
                 println!("✓ agent running in background (pid {pid})");
                 println!("  logs:   ~/.mafold/agent.log");
                 println!("  status: mafold status");
