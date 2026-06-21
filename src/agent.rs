@@ -59,6 +59,11 @@ struct ChatState {
     /// When a `/login` is in flight in this chat, the channel that delivers the
     /// pasted auth code to the waiting `claude auth login` process.
     login_code_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    /// Set while the current turn is BLOCKED on an AskUserQuestion: the file the
+    /// hook is polling. The next chat message is the user's answer → write it
+    /// here (don't start a new turn). Set on the `AskUserQuestion` tool call,
+    /// cleared when consumed or the turn ends.
+    ask_file: Option<String>,
 }
 type ChatStates = Arc<Mutex<HashMap<String, ChatState>>>;
 
@@ -344,6 +349,18 @@ async fn connect_and_run(
                 let _ = client.send(&m.conversation_id, "🔑 Got the code — finishing sign-in…").await;
             }
             continue;
+        }
+
+        // If this turn is BLOCKED on an AskUserQuestion, this message is the
+        // user's answer — hand it to the waiting hook (via its answer file) and
+        // don't start a new turn. `/stop` still falls through to cancel the run.
+        let pending_ask = chat_states.lock().await.get(&m.conversation_id).and_then(|s| s.ask_file.clone());
+        if let Some(ask_file) = pending_ask {
+            if !(trimmed.eq_ignore_ascii_case("/stop") || trimmed.eq_ignore_ascii_case("/cancel")) {
+                let _ = std::fs::write(&ask_file, m.content.trim());
+                if let Some(s) = chat_states.lock().await.get_mut(&m.conversation_id) { s.ask_file = None; }
+                continue;
+            }
         }
 
         // Daemon control commands (`/clear`, `/stop`, `/model`, …) are handled
@@ -766,6 +783,14 @@ async fn handle(
     let cancel = Arc::new(Notify::new());
     chat_states.lock().await.entry(chat_id.to_string()).or_default().cancel = Some(cancel.clone());
 
+    // Per-turn answer file for the AskUserQuestion hook (unique → never stale).
+    let ask_file = {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let safe: String = chat_id.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
+        std::env::temp_dir().join(format!("mafold-ask-{safe}-{nanos}.txt")).to_string_lossy().into_owned()
+    };
+
     let turn = Turn {
         prompt: full_prompt,
         workdir: workdir.to_string(),
@@ -773,15 +798,21 @@ async fn handle(
         model,
         cancel: cancel.clone(),
         system,
+        ask_file: Some(ask_file.clone()),
     };
 
     // Renderer task: drain the harness's normalized events → batched, ordered
-    // markdoc deltas (text + cards), so a slow append never stalls reading.
+    // markdoc deltas (text + cards), so a slow append never stalls reading. It
+    // also flips this chat into "awaiting answer" when AskUserQuestion is called,
+    // so the next message routes to the hook's `ask_file`.
     let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     let renderer = {
         let client = client.clone();
         let msg_id = msg_id.clone();
-        tokio::spawn(render_loop(ev_rx, client, msg_id))
+        let chat_states = chat_states.clone();
+        let chat_id = chat_id.to_string();
+        let ask_file = ask_file.clone();
+        tokio::spawn(render_loop(ev_rx, client, msg_id, chat_states, chat_id, ask_file))
     };
 
     let result = harness.run(turn, ev_tx).await;
@@ -814,8 +845,10 @@ async fn handle(
             let _ = client.append_delta(&msg_id, &format!("⚠️ Agent error: {e}")).await;
         }
     }
-    // Clear the cancel handle (keep the per-chat model) now the run is over.
-    if let Some(st) = chat_states.lock().await.get_mut(chat_id) { st.cancel = None; }
+    // Clear the cancel + any pending-ask state (keep the per-chat model) now the
+    // run is over, and drop the per-turn answer file.
+    if let Some(st) = chat_states.lock().await.get_mut(chat_id) { st.cancel = None; st.ask_file = None; }
+    let _ = std::fs::remove_file(&ask_file);
     let _ = client.finalize(&msg_id).await;
     println!("→ finalized reply for chat {chat_id}");
     Ok(())
@@ -828,18 +861,30 @@ async fn render_loop(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     client: Client,
     msg_id: String,
+    chat_states: ChatStates,
+    chat_id: String,
+    ask_file: String,
 ) {
     let mut names: HashMap<String, String> = HashMap::new();
     let mut buf = String::new();
     loop {
         match tokio::time::timeout(Duration::from_millis(120), rx.recv()).await {
             Ok(Some(ev)) => {
+                // AskUserQuestion blocks the turn: flush the question card right
+                // away and mark this chat "awaiting answer" so the next message is
+                // routed to the hook's answer file (see the message loop above).
+                let is_ask = matches!(&ev, AgentEvent::ToolCall { name, .. }
+                    if name.eq_ignore_ascii_case("AskUserQuestion"));
                 if let Some(s) = crate::render::render(&ev, &mut names) {
                     buf.push_str(&s);
-                    if buf.len() >= 240 {
+                    if is_ask || buf.len() >= 240 {
                         let _ = client.append_delta(&msg_id, &buf).await;
                         buf.clear();
                     }
+                }
+                if is_ask {
+                    chat_states.lock().await.entry(chat_id.clone()).or_default().ask_file =
+                        Some(ask_file.clone());
                 }
             }
             Ok(None) => break, // harness done → channel closed

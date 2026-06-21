@@ -27,7 +27,7 @@ impl Harness for ClaudeCode {
     }
 
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
-        let Turn { prompt, workdir, session, model, cancel, system } = turn;
+        let Turn { prompt, workdir, session, model, cancel, system, ask_file } = turn;
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");
         }
@@ -43,6 +43,25 @@ impl Harness for ClaudeCode {
         // mafold awareness: who the bot is, the conversation, embeddable cards.
         if let Some(sys) = &system {
             cmd.arg("--append-system-prompt").arg(sys);
+        }
+        // Interactive AskUserQuestion: a PreToolUse hook intercepts the native
+        // tool (which would otherwise auto-decline headless), blocks until the
+        // user answers the chat card, then returns the answer as a deny-reason —
+        // which claude feeds back as the tool result, same turn. The hook waits
+        // on MAFOLD_ASK_FILE (the daemon writes the answer there). See ask_hook.
+        if let Some(af) = &ask_file {
+            cmd.env("MAFOLD_ASK_FILE", af);
+            let exe = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_else(|| "mafold".into());
+            let settings = serde_json::json!({
+                "hooks": { "PreToolUse": [{
+                    "matcher": "AskUserQuestion",
+                    "hooks": [{ "type": "command", "command": format!("\"{exe}\" ask-hook") }]
+                }]}
+            });
+            cmd.arg("--settings").arg(settings.to_string());
         }
         cmd.kill_on_drop(true);
         if let Some(sid) = &session {

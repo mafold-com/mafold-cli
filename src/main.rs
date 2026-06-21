@@ -7,6 +7,7 @@
 //! Auth is a bot token (`mb_…`) via --token or $MAFOLD_BOT_TOKEN.
 
 mod agent;
+mod ask_hook;
 mod cards;
 mod client;
 mod commands;
@@ -98,11 +99,19 @@ enum Cmd {
     /// (internal) The long-lived supervisor loop — started by `up`.
     #[command(hide = true)]
     Supervise,
+    /// (internal) PreToolUse hook claude runs for AskUserQuestion — blocks until
+    /// the user answers the chat card, then feeds the answer back. Not for humans.
+    #[command(hide = true)]
+    AskHook,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // The AskUserQuestion hook is invoked by claude (a child of the daemon) and
+    // needs no auth — it just bridges stdin/the answer file. Handle it first.
+    if matches!(cli.cmd, Cmd::AskHook) { return ask_hook::run(); }
 
     // Daemon control + self-update need no auth.
     if matches!(cli.cmd, Cmd::Stop) { return daemon::stop(); }
@@ -164,7 +173,7 @@ async fn main() -> Result<()> {
         Cmd::Send { chat, text } => send(&Client::new(cli.base, token), &chat, &text.join(" ")).await?,
         Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Cards { .. }
         | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
-        | Cmd::Rollback | Cmd::Supervise => unreachable!(),
+        | Cmd::Rollback | Cmd::Supervise | Cmd::AskHook => unreachable!(),
     }
     Ok(())
 }
