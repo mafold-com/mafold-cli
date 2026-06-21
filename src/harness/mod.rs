@@ -53,6 +53,10 @@ pub struct Turn {
     /// current conversation, embeddable cards). Appended to the agent's own
     /// system prompt; None = a pure, mafold-unaware agent.
     pub system: Option<String>,
+    /// Per-turn file the AskUserQuestion PreToolUse hook waits on: the daemon
+    /// writes the user's chat-card answer here, the hook reads it and feeds it
+    /// back to the model. None = interactive ask unsupported for this harness.
+    pub ask_file: Option<String>,
 }
 
 /// Outcome of a turn.

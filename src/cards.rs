@@ -23,7 +23,14 @@ use crate::client::Client;
 /// Pinned esbuild version fetched on demand.
 const ESBUILD_VERSION: &str = "0.24.2";
 /// Imports left for the host runtime to provide.
-const EXTERNALS: &[&str] = &["react", "react/jsx-runtime", "react-native", "@mafold/cards"];
+const EXTERNALS: &[&str] = &[
+    "react",
+    "react/jsx-runtime",
+    "react-native",
+    // Native module the host provides — lucide-react-native renders through it.
+    "react-native-svg",
+    "@mafold/cards",
+];
 
 #[derive(Subcommand)]
 pub enum CardsCmd {

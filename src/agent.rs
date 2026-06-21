@@ -59,8 +59,62 @@ struct ChatState {
     /// When a `/login` is in flight in this chat, the channel that delivers the
     /// pasted auth code to the waiting `claude auth login` process.
     login_code_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    /// Set while the current turn is BLOCKED on an AskUserQuestion: the file the
+    /// hook is polling. The next chat message is the user's answer → write it
+    /// here (don't start a new turn). Set on the `AskUserQuestion` tool call,
+    /// cleared when consumed or the turn ends.
+    ask_file: Option<String>,
 }
 type ChatStates = Arc<Mutex<HashMap<String, ChatState>>>;
+
+/// The bot's OWNER-set config (from the server, via `getBot`), distilled to the
+/// fields the daemon uses to drive harness defaults. Every field is OPTIONAL:
+/// a missing/empty key keeps today's built-in behavior. Unknown keys are ignored.
+#[derive(Default)]
+struct OwnerConfig {
+    /// Default model for turns when the chat hasn't overridden it (`/model`).
+    model: Option<String>,
+    /// Extra system prompt the owner set, appended to the mafold preamble.
+    system_prompt: Option<String>,
+    /// Default working directory when `--workdir` wasn't passed on the CLI.
+    cwd: Option<String>,
+}
+
+impl OwnerConfig {
+    /// Read the owner config via `getBot { username: <self> }` (callable by the
+    /// bot itself). Best-effort: a failed call or absent keys yield an empty
+    /// config, so the daemon falls back to its built-in defaults.
+    async fn fetch(client: &Client, username: &str) -> Self {
+        let detail = match client.bot(username).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("note: getBot failed ({e}) — using built-in defaults (no owner config)");
+                return Self::default();
+            }
+        };
+        // `config` is a flat `{key: value}` map of the owner's stored field
+        // values (strings / JSON scalars). Read a string value for `key`,
+        // trimming empties so a blank field is treated as unset.
+        let get = |key: &str| -> Option<String> {
+            detail["config"][key]
+                .as_str()
+                .map(str::to_string)
+                // a numeric/bool scalar → render it as its JSON text
+                .or_else(|| match &detail["config"][key] {
+                    Value::Null => None,
+                    other => Some(other.to_string()),
+                })
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        Self {
+            model: get("model"),
+            system_prompt: get("system_prompt"),
+            // `cwd` is the documented key; accept `workdir` as an alias.
+            cwd: get("cwd").or_else(|| get("workdir")),
+        }
+    }
+}
 
 fn sessions_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -78,7 +132,7 @@ fn save_sessions(map: &HashMap<String, String>) {
     }
 }
 
-pub async fn run(client: Client, workdir: String, harness_id: String, auto_update: bool) -> Result<()> {
+pub async fn run(client: Client, workdir: Option<String>, harness_id: String, auto_update: bool) -> Result<()> {
     // Self-update on startup (before connecting) so a (re)started agent is
     // always current; if it updates, re-exec into the new binary.
     if auto_update {
@@ -94,10 +148,28 @@ pub async fn run(client: Client, workdir: String, harness_id: String, auto_updat
     let my_username = me["username"].as_str().unwrap_or_default().to_string();
     anyhow::ensure!(!my_username.is_empty(), "could not resolve bot identity (bad token?)");
 
+    // Cloud-first owner config: the bot reads its OWNER-set config from the server
+    // and uses it to drive the harness defaults (model / system prompt / workdir).
+    // Precedence everywhere is: explicit CLI flag > server owner-config > built-in
+    // default (the same rule the `harness` selection already follows). Best-effort
+    // — a missing/failed config just keeps today's behavior.
+    let owner = OwnerConfig::fetch(&client, &my_username).await;
+
     // Cloud-first harness: the bot's server-configured harness wins over the
     // local `--harness` flag (which is the fallback / first-run default).
     let harness_id = me["harness"].as_str().filter(|s| !s.is_empty()).map(str::to_string).unwrap_or(harness_id);
     let harness = crate::harness::select(&harness_id);
+
+    // Working dir: an explicit `--workdir` wins; else the owner-config `cwd`
+    // (or `workdir`); else the current directory. Canonicalize so a relative
+    // server value resolves the same way an explicit flag does.
+    let workdir = workdir
+        .or_else(|| owner.cwd.clone())
+        .unwrap_or_else(|| ".".to_string());
+    let workdir = std::fs::canonicalize(&workdir)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or(workdir);
+
     if !std::path::Path::new(&workdir).is_dir() {
         eprintln!("⚠️  working directory does not exist: {workdir} — the harness will fail. Check --workdir.");
     }
@@ -111,13 +183,16 @@ pub async fn run(client: Client, workdir: String, harness_id: String, auto_updat
     } else {
         harness_id.clone()
     };
-    println!("mafold agent ✓ connected as @{my_username}  ·  harness={harness_label}  ·  workdir={workdir}");
+    let model_label = owner.model.as_deref().unwrap_or("default");
+    let sysprompt_label = if owner.system_prompt.is_some() { "  ·  +owner-system-prompt" } else { "" };
+    println!("mafold agent ✓ connected as @{my_username}  ·  harness={harness_label}  ·  workdir={workdir}  ·  model={model_label}{sysprompt_label}");
 
     // Publish the command panel (the chat "/" menu): the daemon's own control
     // commands first, then every skill/slash-command the harness discovers on
     // this machine, so anyone chatting the bot can discover + tap them.
     publish_commands(&client, &workdir, &harness).await;
 
+    let owner = Arc::new(owner);
     let sessions: Sessions = Arc::new(Mutex::new(load_sessions()));
     let chat_states: ChatStates = Arc::new(Mutex::new(HashMap::new()));
     // Serialize claude runs: same workdir → concurrent edits/sessions would
@@ -147,7 +222,7 @@ pub async fn run(client: Client, workdir: String, harness_id: String, auto_updat
     let mut backoff = 1u64;
     let mut last_update_check = std::time::Instant::now();
     loop {
-        if let Err(e) = connect_and_run(&client, &workdir, &my_username, &sessions, &exec_lock, &chat_states, &harness).await {
+        if let Err(e) = connect_and_run(&client, &workdir, &my_username, &sessions, &exec_lock, &chat_states, &harness, &owner).await {
             eprintln!("connection error: {e}");
         }
         // A dropped WS is a natural idle moment → opportunistically self-update,
@@ -223,6 +298,7 @@ async fn connect_and_run(
     exec_lock: &Arc<Mutex<()>>,
     chat_states: &ChatStates,
     harness: &Arc<dyn Harness>,
+    owner: &Arc<OwnerConfig>,
 ) -> Result<()> {
     let (ws, _) = tokio_tungstenite::connect_async(&client.ws_url())
         .await
@@ -275,6 +351,18 @@ async fn connect_and_run(
             continue;
         }
 
+        // If this turn is BLOCKED on an AskUserQuestion, this message is the
+        // user's answer — hand it to the waiting hook (via its answer file) and
+        // don't start a new turn. `/stop` still falls through to cancel the run.
+        let pending_ask = chat_states.lock().await.get(&m.conversation_id).and_then(|s| s.ask_file.clone());
+        if let Some(ask_file) = pending_ask {
+            if !(trimmed.eq_ignore_ascii_case("/stop") || trimmed.eq_ignore_ascii_case("/cancel")) {
+                let _ = std::fs::write(&ask_file, m.content.trim());
+                if let Some(s) = chat_states.lock().await.get_mut(&m.conversation_id) { s.ask_file = None; }
+                continue;
+            }
+        }
+
         // Daemon control commands (`/clear`, `/stop`, `/model`, …) are handled
         // locally and never reach claude. `/login` runs an interactive flow.
         // Any OTHER `/name …` falls through (emulated, mocked, or to claude).
@@ -302,9 +390,18 @@ async fn connect_and_run(
         let attachments = m.attachments.clone();
         let chat_id = m.conversation_id.clone();
         let content = m.content.clone();
-        let model = chat_states.lock().await.get(&chat_id).and_then(|s| s.model.clone());
-        // mafold awareness for this turn: identity + peer + embeddable cards.
-        let system = Some(mafold_preamble(my_username, &m.sender.username, &card_tags));
+        // Model precedence: per-chat `/model` override > owner-config default >
+        // the harness default (None).
+        let model = chat_states.lock().await.get(&chat_id).and_then(|s| s.model.clone())
+            .or_else(|| owner.model.clone());
+        // mafold awareness for this turn: identity + peer + embeddable cards,
+        // plus the owner's extra system prompt (if any) appended after it.
+        let mut sys = mafold_preamble(my_username, &m.sender.username, &card_tags);
+        if let Some(extra) = &owner.system_prompt {
+            sys.push_str("\n\n");
+            sys.push_str(extra);
+        }
+        let system = Some(sys);
         tokio::spawn(async move {
             // Harness-emulated slash commands (config dumps, /logout, mocks);
             // anything not emulated falls through to the harness as a prompt.
@@ -686,6 +783,14 @@ async fn handle(
     let cancel = Arc::new(Notify::new());
     chat_states.lock().await.entry(chat_id.to_string()).or_default().cancel = Some(cancel.clone());
 
+    // Per-turn answer file for the AskUserQuestion hook (unique → never stale).
+    let ask_file = {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        let safe: String = chat_id.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
+        std::env::temp_dir().join(format!("mafold-ask-{safe}-{nanos}.txt")).to_string_lossy().into_owned()
+    };
+
     let turn = Turn {
         prompt: full_prompt,
         workdir: workdir.to_string(),
@@ -693,15 +798,21 @@ async fn handle(
         model,
         cancel: cancel.clone(),
         system,
+        ask_file: Some(ask_file.clone()),
     };
 
     // Renderer task: drain the harness's normalized events → batched, ordered
-    // markdoc deltas (text + cards), so a slow append never stalls reading.
+    // markdoc deltas (text + cards), so a slow append never stalls reading. It
+    // also flips this chat into "awaiting answer" when AskUserQuestion is called,
+    // so the next message routes to the hook's `ask_file`.
     let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     let renderer = {
         let client = client.clone();
         let msg_id = msg_id.clone();
-        tokio::spawn(render_loop(ev_rx, client, msg_id))
+        let chat_states = chat_states.clone();
+        let chat_id = chat_id.to_string();
+        let ask_file = ask_file.clone();
+        tokio::spawn(render_loop(ev_rx, client, msg_id, chat_states, chat_id, ask_file))
     };
 
     let result = harness.run(turn, ev_tx).await;
@@ -734,8 +845,10 @@ async fn handle(
             let _ = client.append_delta(&msg_id, &format!("⚠️ Agent error: {e}")).await;
         }
     }
-    // Clear the cancel handle (keep the per-chat model) now the run is over.
-    if let Some(st) = chat_states.lock().await.get_mut(chat_id) { st.cancel = None; }
+    // Clear the cancel + any pending-ask state (keep the per-chat model) now the
+    // run is over, and drop the per-turn answer file.
+    if let Some(st) = chat_states.lock().await.get_mut(chat_id) { st.cancel = None; st.ask_file = None; }
+    let _ = std::fs::remove_file(&ask_file);
     let _ = client.finalize(&msg_id).await;
     println!("→ finalized reply for chat {chat_id}");
     Ok(())
@@ -748,18 +861,30 @@ async fn render_loop(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     client: Client,
     msg_id: String,
+    chat_states: ChatStates,
+    chat_id: String,
+    ask_file: String,
 ) {
     let mut names: HashMap<String, String> = HashMap::new();
     let mut buf = String::new();
     loop {
         match tokio::time::timeout(Duration::from_millis(120), rx.recv()).await {
             Ok(Some(ev)) => {
+                // AskUserQuestion blocks the turn: flush the question card right
+                // away and mark this chat "awaiting answer" so the next message is
+                // routed to the hook's answer file (see the message loop above).
+                let is_ask = matches!(&ev, AgentEvent::ToolCall { name, .. }
+                    if name.eq_ignore_ascii_case("AskUserQuestion"));
                 if let Some(s) = crate::render::render(&ev, &mut names) {
                     buf.push_str(&s);
-                    if buf.len() >= 240 {
+                    if is_ask || buf.len() >= 240 {
                         let _ = client.append_delta(&msg_id, &buf).await;
                         buf.clear();
                     }
+                }
+                if is_ask {
+                    chat_states.lock().await.entry(chat_id.clone()).or_default().ask_file =
+                        Some(ask_file.clone());
                 }
             }
             Ok(None) => break, // harness done → channel closed

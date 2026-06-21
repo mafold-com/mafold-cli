@@ -7,6 +7,7 @@
 //! Auth is a bot token (`mb_…`) via --token or $MAFOLD_BOT_TOKEN.
 
 mod agent;
+mod ask_hook;
 mod cards;
 mod client;
 mod commands;
@@ -40,8 +41,11 @@ enum Cmd {
     /// Run an agent harness as your bot (daemon): receive messages, reply with
     /// the local agent CLI in the working directory.
     Agent {
-        #[arg(long, env = "MAFOLD_WORKDIR", default_value = ".")]
-        workdir: String,
+        /// Working directory the harness runs in. If omitted, the bot's
+        /// owner-set server config (`cwd`/`workdir`) is used, else the current
+        /// directory. An explicit flag always wins over the server config.
+        #[arg(long, env = "MAFOLD_WORKDIR")]
+        workdir: Option<String>,
         /// Which agent harness to drive: claude-code (default), opencode, codex,
         /// openclaw. (Others land as they're implemented.)
         #[arg(long, env = "MAFOLD_HARNESS", default_value = "claude-code")]
@@ -95,11 +99,19 @@ enum Cmd {
     /// (internal) The long-lived supervisor loop — started by `up`.
     #[command(hide = true)]
     Supervise,
+    /// (internal) PreToolUse hook claude runs for AskUserQuestion — blocks until
+    /// the user answers the chat card, then feeds the answer back. Not for humans.
+    #[command(hide = true)]
+    AskHook,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // The AskUserQuestion hook is invoked by claude (a child of the daemon) and
+    // needs no auth — it just bridges stdin/the answer file. Handle it first.
+    if matches!(cli.cmd, Cmd::AskHook) { return ask_hook::run(); }
 
     // Daemon control + self-update need no auth.
     if matches!(cli.cmd, Cmd::Stop) { return daemon::stop(); }
@@ -138,15 +150,16 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Agent { workdir, harness, detach } => {
-            // Resolve to an absolute path (default "." = the current folder), so
-            // the agent — and the detached child, which has a different cwd —
-            // both operate on the same real directory. No fake placeholders.
-            let workdir = std::fs::canonicalize(&workdir)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or(workdir);
+            // An explicit --workdir wins; if omitted, the server owner-config (or
+            // the current dir) decides at runtime. Resolve an explicit one to an
+            // absolute path so the agent — and the detached child, which has a
+            // different cwd — both operate on the same real directory.
+            let workdir = workdir.map(|w| {
+                std::fs::canonicalize(&w).map(|p| p.to_string_lossy().into_owned()).unwrap_or(w)
+            });
             if detach {
-                let pid = daemon::start_detached(&cli.base, &token, &workdir, &harness)?;
-                println!("  workdir: {workdir}");
+                let pid = daemon::start_detached(&cli.base, &token, workdir.as_deref(), &harness)?;
+                if let Some(w) = &workdir { println!("  workdir: {w}"); }
                 println!("✓ agent running in background (pid {pid})");
                 println!("  logs:   ~/.mafold/agent.log");
                 println!("  status: mafold status");
@@ -160,7 +173,7 @@ async fn main() -> Result<()> {
         Cmd::Send { chat, text } => send(&Client::new(cli.base, token), &chat, &text.join(" ")).await?,
         Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Cards { .. }
         | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
-        | Cmd::Rollback | Cmd::Supervise => unreachable!(),
+        | Cmd::Rollback | Cmd::Supervise | Cmd::AskHook => unreachable!(),
     }
     Ok(())
 }
