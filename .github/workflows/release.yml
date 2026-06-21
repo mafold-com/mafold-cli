@@ -8,7 +8,26 @@ permissions:
   contents: write
 
 jobs:
+  # Create the release ONCE, up front, so the per-target build jobs only ever
+  # UPLOAD to it. Previously every matrix job ran action-gh-release and raced to
+  # CREATE the same release; the losers failed to finalize the tag
+  # ("already_exists: tag_name") and silently dropped their asset (v0.9.8 lost
+  # the linux binary that way). Idempotent: skips if the release already exists
+  # (re-runs, or a tag re-push).
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure the release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                 --title "$TAG" --notes "Automated release $TAG."
+
   build:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -30,8 +49,14 @@ jobs:
       # Per-asset checksum (the matrix can't share one SHA256SUMS file); the
       # updater verifies the binary against this before swapping it in.
       - run: shasum -a 256 "mafold-${{ matrix.target }}" | awk '{print $1}' > "mafold-${{ matrix.target }}.sha256"
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            mafold-${{ matrix.target }}
-            mafold-${{ matrix.target }}.sha256
+      # Upload to the pre-created release. No create here → no race. --clobber
+      # makes a re-run replace its own asset instead of failing.
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release upload "$TAG" \
+            "mafold-${{ matrix.target }}" \
+            "mafold-${{ matrix.target }}.sha256" \
+            --repo "$GITHUB_REPOSITORY" --clobber
