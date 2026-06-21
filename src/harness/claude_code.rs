@@ -36,7 +36,12 @@ impl Harness for ClaudeCode {
             .arg("--output-format").arg("stream-json")
             .arg("--verbose")
             .arg("--include-partial-messages")
-            .arg("--dangerously-skip-permissions");
+            .arg("--dangerously-skip-permissions")
+            // Ignore the user's GLOBAL MCP servers (e.g. browser-use): claude
+            // would otherwise spawn every configured MCP server on EVERY turn,
+            // which pops a Python dock icon and adds seconds of startup latency
+            // per reply. The daemon passes no --mcp-config, so this loads none.
+            .arg("--strict-mcp-config");
         if let Some(m) = &model {
             cmd.arg("--model").arg(m);
         }
