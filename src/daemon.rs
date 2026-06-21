@@ -5,9 +5,10 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::io::Write;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+
+use crate::platform;
 
 fn dir() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("no HOME")?;
@@ -18,10 +19,10 @@ fn dir() -> Result<PathBuf> {
 fn pid_path() -> Result<PathBuf> { Ok(dir()?.join("agent.pid")) }
 fn log_path() -> Result<PathBuf> { Ok(dir()?.join("agent.log")) }
 
-fn read_pid() -> Option<i32> {
+fn read_pid() -> Option<u32> {
     fs::read_to_string(pid_path().ok()?).ok()?.trim().parse().ok()
 }
-fn alive(pid: i32) -> bool { unsafe { libc::kill(pid, 0) == 0 } }
+fn alive(pid: u32) -> bool { platform::pid_alive(pid) }
 
 /// Re-exec ourselves in a new session (detached from the controlling terminal),
 /// with stdio redirected to a log file. The parent records the pid and exits.
@@ -48,13 +49,8 @@ pub fn start_detached(base: &str, token: &str, workdir: Option<&str>, harness: &
     if let Some(w) = workdir {
         cmd.env("MAFOLD_WORKDIR", w);
     }
-    // New session → no controlling terminal → survives the shell closing.
-    unsafe {
-        cmd.pre_exec(|| {
-            unsafe { libc::setsid() };
-            Ok(())
-        });
-    }
+    // New session / no console → survives the shell closing.
+    platform::configure_detached(&mut cmd);
     let child = cmd.spawn().context("failed to spawn background agent")?;
     let pid = child.id();
     writeln!(fs::File::create(pid_path()?)?, "{pid}")?;
@@ -64,7 +60,7 @@ pub fn start_detached(base: &str, token: &str, workdir: Option<&str>, harness: &
 pub fn stop() -> Result<()> {
     match read_pid() {
         Some(pid) if alive(pid) => {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
+            platform::terminate(pid);
             let _ = fs::remove_file(pid_path()?);
             println!("✓ stopped agent (pid {pid})");
         }

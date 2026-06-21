@@ -47,6 +47,9 @@ pub struct Turn {
     pub session: Option<String>,
     /// Per-chat model override (`/model`), or None for the harness default.
     pub model: Option<String>,
+    /// Extended-thinking budget in tokens (`/think`), or None for the harness
+    /// default (off). Maps to Claude Code's `MAX_THINKING_TOKENS`.
+    pub thinking: Option<u32>,
     /// Fires when `/stop` is invoked — the harness must kill its child and stop.
     pub cancel: Arc<Notify>,
     /// Extra system-prompt context (the daemon's mafold preamble: identity, the

@@ -13,6 +13,7 @@ mod commands;
 mod daemon;
 mod discover;
 mod harness;
+mod platform;
 mod render;
 mod supervisor;
 mod update;
@@ -102,6 +103,14 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // The agent stores its pid/log/config under `~/.mafold`, keyed off `$HOME`.
+    // Windows doesn't set HOME — fall back to USERPROFILE so the same paths work.
+    if std::env::var_os("HOME").is_none() {
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            std::env::set_var("HOME", profile);
+        }
+    }
+
     let cli = Cli::parse();
 
     // Daemon control + self-update need no auth.
