@@ -1021,9 +1021,16 @@ async fn handle(
     Ok(())
 }
 
-/// Drains a harness's `AgentEvent` stream → batched, ordered markdoc deltas.
-/// Batches small text chunks (≥240 bytes or ~120ms) so long replies stream
-/// smoothly even on a slow link; cards render through the same path, in order.
+/// Drains a harness's `AgentEvent` stream → the streamed message.
+///
+/// Assistant TEXT streams live, batched (≥240 bytes or ~120ms) for a smooth
+/// reply on a slow link. The process events (tool / bash / thinking) are NOT
+/// streamed one card each (the old noisy waterfall) — they're buffered into one
+/// collapsed `{% run %}` card emitted once at end of turn (below the answer).
+/// While tools run with no text yet, the bot bubble shows the client's own
+/// typing indicator — the "still working" bubble. AskUserQuestion is the one
+/// process event that can't wait for end-of-turn (it blocks until answered), so
+/// it's flushed live as an interactive `{% ask %}` card.
 async fn render_loop(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     client: Client,
@@ -1033,38 +1040,67 @@ async fn render_loop(
     ask_file: String,
 ) {
     let mut names: HashMap<String, String> = HashMap::new();
-    let mut buf = String::new();
+    let mut buf = String::new(); // live assistant-text buffer
+    let mut run_body = String::new(); // buffered process steps → one {% run %} card
+    let mut steps = 0usize;
+    let mut took: Option<f64> = None;
+    let mut tokens: Option<u64> = None;
+
+    macro_rules! flush_text {
+        () => {
+            if !buf.is_empty() {
+                let _ = client.append_delta(&msg_id, &buf).await;
+                buf.clear();
+            }
+        };
+    }
+
     loop {
         match tokio::time::timeout(Duration::from_millis(120), rx.recv()).await {
-            Ok(Some(ev)) => {
-                // AskUserQuestion blocks the turn: flush the question card right
-                // away and mark this chat "awaiting answer" so the next message is
-                // routed to the hook's answer file (see the message loop above).
-                let is_ask = matches!(&ev, AgentEvent::ToolCall { name, .. }
-                    if name.eq_ignore_ascii_case("AskUserQuestion"));
-                if let Some(s) = crate::render::render(&ev, &mut names) {
-                    buf.push_str(&s);
-                    if is_ask || buf.len() >= 240 {
-                        let _ = client.append_delta(&msg_id, &buf).await;
-                        buf.clear();
+            Ok(Some(ev)) => match &ev {
+                AgentEvent::Text(t) => {
+                    buf.push_str(t);
+                    if buf.len() >= 240 {
+                        flush_text!();
                     }
                 }
-                if is_ask {
+                // AskUserQuestion blocks the turn — it can't wait for the
+                // end-of-turn collapse; flush pending text + the live card now,
+                // and mark this chat "awaiting answer".
+                AgentEvent::ToolCall { name, .. } if name.eq_ignore_ascii_case("AskUserQuestion") => {
+                    flush_text!();
+                    if let Some(s) = crate::render::render(&ev, &mut names) {
+                        let _ = client.append_delta(&msg_id, &s).await;
+                    }
                     chat_states.lock().await.entry(chat_id.clone()).or_default().ask_file =
                         Some(ask_file.clone());
                 }
-            }
+                AgentEvent::Done { duration_ms, tokens: tk, .. } => {
+                    took = *duration_ms;
+                    tokens = *tk;
+                }
+                AgentEvent::Session(_) => {}
+                // tool / bash / thinking → one collapsed step line (buffered).
+                _ => {
+                    if steps < 60 {
+                        if let Some(line) = crate::render::step_line(&ev, &mut names) {
+                            run_body.push_str(&line);
+                            run_body.push('\n');
+                            steps += 1;
+                        }
+                    }
+                }
+            },
             Ok(None) => break, // harness done → channel closed
             Err(_) => {
-                if !buf.is_empty() {
-                    let _ = client.append_delta(&msg_id, &buf).await;
-                    buf.clear();
-                }
+                flush_text!(); // idle tick → keep text flowing smoothly
             }
         }
     }
-    if !buf.is_empty() {
-        let _ = client.append_delta(&msg_id, &buf).await;
+    flush_text!();
+    // The whole turn's work, collapsed into one card below the answer.
+    if !run_body.is_empty() {
+        let _ = client.append_delta(&msg_id, &crate::render::run_card(&run_body, took, tokens)).await;
     }
 }
 
