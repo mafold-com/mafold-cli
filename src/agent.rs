@@ -23,7 +23,12 @@ use crate::client::Client;
 use crate::harness::{AgentEvent, Harness, Turn};
 
 #[derive(Deserialize)]
-struct Sender { username: String }
+struct Sender {
+    username: String,
+    /// "human" | "bot" — used to avoid bot-to-bot auto-reply loops.
+    #[serde(default)]
+    kind: String,
+}
 #[derive(Deserialize, Clone)]
 struct InAttachment {
     #[serde(default)]
@@ -39,6 +44,10 @@ struct IncomingMessage {
     content: String,
     #[serde(default)]
     attachments: Vec<InAttachment>,
+    /// Set when this message arrived in a Slack-style thread — the bot's reply
+    /// must land in the same thread (normalized server-side to the root).
+    #[serde(default)]
+    thread_root_id: Option<String>,
 }
 
 fn attachments_dir() -> PathBuf {
@@ -64,8 +73,143 @@ struct ChatState {
     /// here (don't start a new turn). Set on the `AskUserQuestion` tool call,
     /// cleared when consumed or the turn ends.
     ask_file: Option<String>,
+    /// Cached group-dispatch gate for this conversation (kind + always-on),
+    /// refreshed at most once per 60s so the reply gate stays ~free.
+    gate: Option<ConvGate>,
 }
 type ChatStates = Arc<Mutex<HashMap<String, ChatState>>>;
+
+/// Per-conversation execution coordination. Turns in DIFFERENT conversations run
+/// concurrently; turns in the SAME conversation serialize (one Claude session
+/// can't be resumed twice at once). They share one workdir, so two chats editing
+/// the same files at once can clash — that's on the user to avoid. `active`
+/// counts in-flight turns so the self-updater only re-execs when everything's idle.
+struct ExecCoord {
+    conv: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    active: std::sync::atomic::AtomicUsize,
+}
+
+impl ExecCoord {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            conv: std::sync::Mutex::new(HashMap::new()),
+            active: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+    /// This conversation's turn lock (created on first use).
+    fn conv_lock(&self, chat_id: &str) -> Arc<Mutex<()>> {
+        self.conv
+            .lock()
+            .unwrap()
+            .entry(chat_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+    /// True when no turn is running anywhere → safe for the self-updater to re-exec.
+    fn idle(&self) -> bool {
+        self.active.load(std::sync::atomic::Ordering::SeqCst) == 0
+    }
+}
+
+/// RAII: a turn is in flight while this lives (bumps/decrements `ExecCoord::active`).
+struct TurnGuard(Arc<ExecCoord>);
+impl TurnGuard {
+    fn new(c: &Arc<ExecCoord>) -> Self {
+        c.active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(c.clone())
+    }
+}
+impl Drop for TurnGuard {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Whether this conversation is a group, and (for groups) whether this bot is
+/// configured always-on. Used to gate replies: in a group the daemon answers
+/// only when @-mentioned or always-on; a DM always answers.
+#[derive(Clone)]
+struct ConvGate {
+    is_group: bool,
+    always_on: bool,
+    at: std::time::Instant,
+}
+
+/// True if the bot's own @handle appears in the text (word-boundary `@`, then a
+/// username with optional `:namespace`). Mirrors the server's mention rule, so a
+/// daemon bot fires on the same mentions an internal brain would.
+fn mentions_me(text: &str, my_username: &str) -> bool {
+    let me = my_username.to_lowercase();
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'@' && (i == 0 || b[i - 1].is_ascii_whitespace()) {
+            let mut j = i + 1;
+            while j < b.len() {
+                let c = b[j];
+                if c.is_ascii_alphanumeric() || c == b'_' || c == b':' || c == b'-' { j += 1; } else { break; }
+            }
+            if j > i + 1 && text[i + 1..j].eq_ignore_ascii_case(&me) {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Group reply gate. In a group the daemon answers only when @-mentioned or set
+/// always-on; DMs always answer. Group kind + always-on are cached per
+/// conversation (60s TTL) so this costs at most two cheap calls per minute.
+async fn should_respond(
+    client: &Client,
+    conv_id: &str,
+    my_username: &str,
+    sender_is_bot: bool,
+    content: &str,
+    chat_states: &ChatStates,
+) -> bool {
+    // A mention always fires — and it's free, so check it before any fetch.
+    if mentions_me(content, my_username) {
+        return true;
+    }
+    // Never auto-chain off another bot's message (would loop two always-on bots
+    // forever); only an explicit @mention pulls this bot into a bot's message.
+    if sender_is_bot {
+        return false;
+    }
+    if let Some(g) = chat_states.lock().await.get(conv_id).and_then(|s| s.gate.clone()) {
+        if g.at.elapsed() < std::time::Duration::from_secs(60) {
+            return !g.is_group || g.always_on;
+        }
+    }
+    let is_group = client
+        .get_chat(conv_id)
+        .await
+        .ok()
+        .and_then(|c| c.get("kind").and_then(|k| k.as_str()).map(|s| s == "group"))
+        .unwrap_or(false);
+    let always_on = if is_group {
+        client
+            .group_bots(conv_id)
+            .await
+            .ok()
+            .and_then(|r| r.get("items").and_then(|i| i.as_array()).cloned())
+            .map(|items| {
+                items.iter().any(|e| {
+                    e.get("bot").and_then(|b| b.get("username")).and_then(|u| u.as_str())
+                        .map(|u| u.eq_ignore_ascii_case(my_username)).unwrap_or(false)
+                        && e.get("always_on").and_then(|a| a.as_bool()).unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    chat_states.lock().await.entry(conv_id.to_string()).or_default().gate =
+        Some(ConvGate { is_group, always_on, at: std::time::Instant::now() });
+    !is_group || always_on
+}
 
 /// The bot's OWNER-set config (from the server, via `getBot`), distilled to the
 /// fields the daemon uses to drive harness defaults. Every field is OPTIONAL:
@@ -195,10 +339,10 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     let owner = Arc::new(owner);
     let sessions: Sessions = Arc::new(Mutex::new(load_sessions()));
     let chat_states: ChatStates = Arc::new(Mutex::new(HashMap::new()));
-    // Serialize claude runs: same workdir → concurrent edits/sessions would
-    // clash. One at a time (queued); each message still shows "typing" while it
-    // waits because we open the draft before taking the lock.
-    let exec_lock = Arc::new(Mutex::new(()));
+    // Per-conversation execution: different conversations run in parallel; turns
+    // within one conversation serialize. (They share this workdir — don't run
+    // conflicting edits in two chats at once.)
+    let coord = ExecCoord::new();
 
     // Auto-update: poll every 10 minutes; if a newer release exists, apply +
     // re-exec — but only when IDLE (try_lock → no claude running/queued) so an
@@ -206,23 +350,23 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     // (below), so a new release lands within minutes, not an hour.
     if auto_update {
         let client = client.clone();
-        let exec_lock = exec_lock.clone();
+        let coord = coord.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(600));
             tick.tick().await; // consume the immediate first tick
             loop {
                 tick.tick().await;
-                maybe_update(&client.http, &exec_lock).await;
+                maybe_update(&client.http, &coord).await;
             }
         });
     }
 
     // Reconnect loop: a dropped WS (network blip, server restart) must NOT kill
-    // the daemon. Reconnect with backoff; sessions/exec_lock persist across it.
+    // the daemon. Reconnect with backoff; sessions/coord persist across it.
     let mut backoff = 1u64;
     let mut last_update_check = std::time::Instant::now();
     loop {
-        if let Err(e) = connect_and_run(&client, &workdir, &my_username, &sessions, &exec_lock, &chat_states, &harness, &owner).await {
+        if let Err(e) = connect_and_run(&client, &workdir, &my_username, &sessions, &coord, &chat_states, &harness, &owner).await {
             eprintln!("connection error: {e}");
         }
         // A dropped WS is a natural idle moment → opportunistically self-update,
@@ -230,7 +374,7 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
         // a reconnect storm doesn't hammer the releases API).
         if auto_update && last_update_check.elapsed() > Duration::from_secs(300) {
             last_update_check = std::time::Instant::now();
-            maybe_update(&client.http, &exec_lock).await;
+            maybe_update(&client.http, &coord).await;
         }
         eprintln!("reconnecting in {backoff}s…");
         tokio::time::sleep(Duration::from_secs(backoff)).await;
@@ -238,15 +382,15 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     }
 }
 
-/// Check for a newer release; if one exists and the agent is IDLE (no claude run
-/// in flight → `exec_lock` is free), safely apply it and re-exec into the new
+/// Check for a newer release; if one exists and the agent is IDLE (no turn in
+/// flight → coord is idle), safely apply it and re-exec into the new
 /// binary. Idle-gated so a self-update never interrupts a reply; never returns
 /// on a successful re-exec. Shared by the periodic poll + the reconnect check.
-async fn maybe_update(http: &reqwest::Client, exec_lock: &Arc<Mutex<()>>) {
+async fn maybe_update(http: &reqwest::Client, coord: &Arc<ExecCoord>) {
     match crate::update::check(http).await {
         Ok(Some(r)) => {
-            // Hold the lock across apply + re-exec so no new run starts mid-update.
-            if let Ok(_guard) = exec_lock.try_lock() {
+            // Only re-exec when NO turn is running anywhere (across all conversations).
+            if coord.idle() {
                 println!("↻ updating to v{} — restarting…", r.version);
                 if crate::update::apply(http, &r.url, &r.version, r.sha256.as_deref()).await.is_ok() {
                     let _ = crate::update::reexec();
@@ -295,7 +439,7 @@ async fn connect_and_run(
     workdir: &str,
     my_username: &str,
     sessions: &Sessions,
-    exec_lock: &Arc<Mutex<()>>,
+    coord: &Arc<ExecCoord>,
     chat_states: &ChatStates,
     harness: &Arc<dyn Harness>,
     owner: &Arc<OwnerConfig>,
@@ -325,8 +469,16 @@ async fn connect_and_run(
         let frame = match frame { Ok(f) => f, Err(e) => { eprintln!("ws error: {e}"); break; } };
         let text = match frame.into_text() { Ok(t) => t, Err(_) => continue };
         let env: serde_json::Value = match serde_json::from_str(&text) { Ok(v) => v, Err(_) => continue };
-        if env.get("method").and_then(|m| m.as_str()) != Some("events.messageNew") { continue; }
-        let m: IncomingMessage = match serde_json::from_value(env["params"].clone()) { Ok(m) => m, Err(_) => continue };
+        // React to new top-level messages AND thread replies (so the bot can be
+        // @-mentioned inside a thread). `messageNew` carries the message at
+        // `params`; `threadReply` nests it under `params.message`.
+        let method = env.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let raw_msg = match method {
+            "events.messageNew" => env["params"].clone(),
+            "events.threadReply" => env["params"]["message"].clone(),
+            _ => continue,
+        };
+        let m: IncomingMessage = match serde_json::from_value(raw_msg) { Ok(m) => m, Err(_) => continue };
         // Skip our own echoes + truly empty messages — but an image-only
         // message (empty text + attachments) is real, so keep it.
         if m.sender.username.eq_ignore_ascii_case(my_username)
@@ -381,15 +533,26 @@ async fn connect_and_run(
             }
         }
 
+        // Group reply gate: in a group, only answer when @-mentioned (or set
+        // always-on); DMs answer everything. (Control commands above already ran,
+        // so `/stop` etc. still work without a mention.)
+        let sender_is_bot = m.sender.kind.eq_ignore_ascii_case("bot");
+        if !should_respond(client, &m.conversation_id, my_username, sender_is_bot, &m.content, chat_states).await {
+            println!("  (group/bot · not @{my_username} → skip)");
+            continue;
+        }
+
         let client = client.clone();
         let workdir = workdir.to_string();
         let sessions = sessions.clone();
-        let exec_lock = exec_lock.clone();
+        let coord = coord.clone();
         let chat_states = chat_states.clone();
         let harness = harness.clone();
         let attachments = m.attachments.clone();
         let chat_id = m.conversation_id.clone();
         let content = m.content.clone();
+        // If the trigger arrived in a thread, the bot replies into that thread.
+        let thread_root = m.thread_root_id.clone();
         // Model precedence: per-chat `/model` override > owner-config default >
         // the harness default (None).
         let model = chat_states.lock().await.get(&chat_id).and_then(|s| s.model.clone())
@@ -411,12 +574,12 @@ async fn connect_and_run(
                 let name = it.next().unwrap_or("").to_lowercase();
                 let arg = it.next().unwrap_or("").trim();
                 match harness.command(&client, &chat_id, &name, arg, &workdir).await {
-                    crate::harness::CommandOutcome::Reply(text) => { let _ = client.send(&chat_id, &text).await; return; }
+                    crate::harness::CommandOutcome::Reply(text) => { let _ = client.send_threaded(&chat_id, &text, thread_root.as_deref()).await; return; }
                     crate::harness::CommandOutcome::Handled => return,
                     crate::harness::CommandOutcome::Forward => {}
                 }
             }
-            if let Err(e) = handle(&client, &workdir, &chat_id, &content, &attachments, &sessions, &exec_lock, &chat_states, &harness, model, system).await {
+            if let Err(e) = handle(&client, &workdir, &chat_id, thread_root.as_deref(), &content, &attachments, &sessions, &coord, &chat_states, &harness, model, system).await {
                 eprintln!("handle error: {e}");
             }
         });
@@ -736,16 +899,17 @@ async fn handle(
     client: &Client,
     workdir: &str,
     chat_id: &str,
+    thread_root: Option<&str>,
     prompt: &str,
     attachments: &[InAttachment],
     sessions: &Sessions,
-    exec_lock: &Arc<Mutex<()>>,
+    coord: &Arc<ExecCoord>,
     chat_states: &ChatStates,
     harness: &Arc<dyn Harness>,
     model: Option<String>,
     system: Option<String>,
 ) -> Result<()> {
-    let msg_id = client.create_draft(chat_id).await?;
+    let msg_id = client.create_draft(chat_id, thread_root).await?;
 
     // Download any image attachments locally so Claude can SEE them — its Read
     // tool renders images. We reference the saved paths in the prompt.
@@ -775,8 +939,11 @@ async fn handle(
         );
     }
 
-    // Serialize: only one turn runs at a time in this workdir.
-    let _guard = exec_lock.lock().await;
+    // Mark a turn in-flight (gates the self-updater), then serialize ONLY within
+    // this conversation — other conversations run in parallel.
+    let _turn = TurnGuard::new(coord);
+    let conv_lock = coord.conv_lock(chat_id);
+    let _guard = conv_lock.lock().await;
     let prior = sessions.lock().await.get(chat_id).cloned();
 
     // Register a cancel handle so `/stop` can interrupt this run; cleared below.
@@ -898,5 +1065,25 @@ async fn render_loop(
     }
     if !buf.is_empty() {
         let _ = client.append_delta(&msg_id, &buf).await;
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::mentions_me;
+
+    #[test]
+    fn mention_matching() {
+        // fires: word-boundary @ + full handle (case-insensitive)
+        assert!(mentions_me("hey @ops:claude can you help", "ops:claude"));
+        assert!(mentions_me("@ops:claude", "ops:claude"));
+        assert!(mentions_me("yo @OPS:CLAUDE", "ops:claude"));
+        assert!(mentions_me("a @x then @ops:claude", "ops:claude"));
+        assert!(mentions_me("plain @ada too", "ada"));
+        // does NOT fire
+        assert!(!mentions_me("mail me at a@ops:claude.com", "ops:claude")); // not a boundary
+        assert!(!mentions_me("ping @claude", "ops:claude"));                 // partial ≠ full handle
+        assert!(!mentions_me("just chatting, no mention", "ops:claude"));
+        assert!(!mentions_me("@opsclaudex", "ops:claude"));                  // longer handle ≠
     }
 }

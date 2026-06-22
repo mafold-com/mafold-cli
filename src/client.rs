@@ -38,6 +38,18 @@ impl Client {
     pub async fn me(&self) -> Result<Value> { self.post("getMe", json!({})).await }
     pub async fn chats(&self) -> Result<Value> { self.post("getChats", json!({})).await }
 
+    /// A single conversation (`{ id, kind, participants, … }`) — used to tell a
+    /// group from a DM for the group reply gate.
+    pub async fn get_chat(&self, chat_id: &str) -> Result<Value> {
+        self.post("getChat", json!({ "chat_id": chat_id })).await
+    }
+
+    /// Per-group bot dispatch settings (`{ items: [{ bot, always_on }] }`) —
+    /// tells the daemon whether it's set to always-on in this group.
+    pub async fn group_bots(&self, chat_id: &str) -> Result<Value> {
+        self.post("getGroupBots", json!({ "chat_id": chat_id })).await
+    }
+
     /// The bot's OWNER-set config, callable by the bot itself. Returns `BotDetail`
     /// — `{ bot, config, config_schema, secret_schema, secrets }`. The daemon uses
     /// `config` (a `{key: value}` map of the owner's stored field values) to drive
@@ -47,7 +59,17 @@ impl Client {
     }
 
     pub async fn send(&self, chat_id: &str, text: &str) -> Result<Value> {
-        self.post("sendMessage", json!({ "chat_id": chat_id, "text": text })).await
+        self.send_threaded(chat_id, text, None).await
+    }
+
+    /// Send a message, optionally as a Slack-style thread reply under
+    /// `thread_root_id` (any message in the thread; the server normalizes it).
+    pub async fn send_threaded(&self, chat_id: &str, text: &str, thread_root_id: Option<&str>) -> Result<Value> {
+        let mut body = json!({ "chat_id": chat_id, "text": text });
+        if let Some(root) = thread_root_id {
+            body["thread_root_id"] = json!(root);
+        }
+        self.post("sendMessage", body).await
     }
 
     /// Publish this bot's slash commands (the chat command panel).
@@ -75,8 +97,14 @@ impl Client {
     }
 
     // ── bot streaming write API (used by the agent daemon) ──
-    pub async fn create_draft(&self, chat_id: &str) -> Result<String> {
-        let r = self.post("botCreateDraft", json!({ "chat_id": chat_id })).await?;
+    /// Open a streaming draft. When `thread_root_id` is set, the streamed reply
+    /// lands in that thread instead of the main channel.
+    pub async fn create_draft(&self, chat_id: &str, thread_root_id: Option<&str>) -> Result<String> {
+        let mut body = json!({ "chat_id": chat_id });
+        if let Some(root) = thread_root_id {
+            body["thread_root_id"] = json!(root);
+        }
+        let r = self.post("botCreateDraft", body).await?;
         Ok(r["id"].as_str().context("botCreateDraft: no id")?.to_string())
     }
     pub async fn append_delta(&self, message_id: &str, delta: &str) -> Result<()> {
