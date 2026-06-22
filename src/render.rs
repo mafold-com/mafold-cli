@@ -39,6 +39,99 @@ pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<St
     }
 }
 
+/// A compact `kind|label|detail` line for the `{% run %}` card body — the
+/// collapsed per-turn trace. `None` for events that aren't process steps
+/// (assistant text, session id, end-of-turn). AskUserQuestion blocks the turn,
+/// so it's emitted out-of-band (a live `{% ask %}` card) and never buffered.
+pub fn step_line(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<String> {
+    match ev {
+        AgentEvent::ToolCall { id, name, input } => {
+            names.insert(id.clone(), name.to_lowercase());
+            Some(tool_step(name, input))
+        }
+        AgentEvent::ToolResult { id, text } => {
+            if names.get(id).map(String::as_str) != Some("bash") {
+                return None;
+            }
+            let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+            if first.is_empty() {
+                return None;
+            }
+            Some(format!("bash|Output|{}", cell_esc(first)))
+        }
+        AgentEvent::Thinking(t) => {
+            let first = t.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+            if first.is_empty() {
+                return None;
+            }
+            Some(format!("think|Thinking|{}", cell_esc(first)))
+        }
+        _ => None,
+    }
+}
+
+/// A tool call → one collapsed `kind|label|detail` step line.
+fn tool_step(name: &str, input: &Value) -> String {
+    match name.to_lowercase().as_str() {
+        "todowrite" => {
+            let items = input["todos"].as_array();
+            let total = items.map(|a| a.len()).unwrap_or(0);
+            let done = items
+                .map(|a| a.iter().filter(|t| t["status"].as_str() == Some("completed")).count())
+                .unwrap_or(0);
+            format!("todo|Plan|{done}/{total}")
+        }
+        "edit" | "multiedit" => {
+            let file = input["file_path"].as_str().unwrap_or("");
+            let (a, r) = if name.eq_ignore_ascii_case("multiedit") {
+                let (mut a, mut r) = (0usize, 0usize);
+                if let Some(edits) = input["edits"].as_array() {
+                    for e in edits {
+                        let (ea, er, _) = synth_hunk(e["old_string"].as_str().unwrap_or(""), e["new_string"].as_str().unwrap_or(""));
+                        a += ea;
+                        r += er;
+                    }
+                }
+                (a, r)
+            } else {
+                let (a, r, _) = synth_hunk(input["old_string"].as_str().unwrap_or(""), input["new_string"].as_str().unwrap_or(""));
+                (a, r)
+            };
+            format!("diff|{}|+{a} −{r}", cell_esc(file))
+        }
+        "write" => {
+            let file = input["file_path"].as_str().unwrap_or("");
+            let n = input["content"].as_str().map(|c| if c.is_empty() { 0 } else { c.lines().count() }).unwrap_or(0);
+            format!("diff|{}|+{n}", cell_esc(file))
+        }
+        "task" => format!(
+            "task|subagent · {}|{}",
+            cell_esc(input["subagent_type"].as_str().unwrap_or("agent")),
+            cell_esc(input["description"].as_str().unwrap_or("")),
+        ),
+        "webfetch" => format!("web|fetch|{}", cell_esc(input["url"].as_str().unwrap_or(""))),
+        "websearch" => format!("web|search|{}", cell_esc(input["query"].as_str().unwrap_or(""))),
+        "skill" => {
+            let sname = input["command"].as_str().or_else(|| input["skill"].as_str()).or_else(|| input["name"].as_str()).unwrap_or("skill");
+            let args = input["args"].as_str().or_else(|| input["arguments"].as_str()).unwrap_or("");
+            format!("skill|/{}|{}", cell_esc(sname), cell_esc(args))
+        }
+        _ => format!("tool|{}|{}", cell_esc(name), cell_esc(&tool_detail(name, input))),
+    }
+}
+
+/// Wrap a turn's buffered step lines into one collapsed `{% run %}` card.
+pub fn run_card(body: &str, dur: Option<f64>, tokens: Option<u64>) -> String {
+    let mut attrs = String::from(" status=\"done\"");
+    if let Some(d) = dur {
+        attrs.push_str(&format!(" took=\"{:.1}s\"", d / 1000.0));
+    }
+    if let Some(t) = tokens {
+        attrs.push_str(&format!(" tokens=\"{}\"", fmt_count(t)));
+    }
+    format!("\n{{% run{attrs} %}}\n{}{{% /run %}}\n", block_esc(body))
+}
+
 /// A tool call → the right card.
 fn tool_use_tag(name: &str, input: &Value) -> String {
     match name.to_lowercase().as_str() {
@@ -234,5 +327,38 @@ fn attr_esc(s: &str) -> String {
         format!("{}…", cleaned.chars().take(80).collect::<String>())
     } else {
         cleaned.to_string()
+    }
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+    use crate::harness::AgentEvent;
+    use serde_json::json;
+
+    #[test]
+    fn buffers_steps_into_one_run_card() {
+        let mut names = HashMap::new();
+        // an Edit → a diff step with +/- counts
+        let edit = AgentEvent::ToolCall {
+            id: "1".into(), name: "Edit".into(),
+            input: json!({"file_path": "src/agent.rs", "old_string": "a\nb", "new_string": "a\nc\nd"}),
+        };
+        let s1 = step_line(&edit, &mut names).unwrap();
+        assert!(s1.starts_with("diff|src/agent.rs|+"), "got {s1}");
+
+        // a Bash call + its result → a tool line then a bash Output line
+        let bcall = AgentEvent::ToolCall { id: "2".into(), name: "Bash".into(), input: json!({"command": "cargo build"}) };
+        assert_eq!(step_line(&bcall, &mut names).unwrap(), "tool|Bash|cargo build");
+        let bres = AgentEvent::ToolResult { id: "2".into(), text: "  \nFinished in 4s\ntrailing".into() };
+        assert_eq!(step_line(&bres, &mut names).unwrap(), "bash|Output|Finished in 4s");
+
+        // text / session / done are NOT steps (text streams live; done → attrs)
+        assert!(step_line(&AgentEvent::Text("hi".into()), &mut names).is_none());
+        assert!(step_line(&AgentEvent::Done { duration_ms: Some(1.0), cost_usd: None, tokens: None }, &mut names).is_none());
+
+        let card = run_card(&format!("{s1}\n{}\n", "bash|Output|Finished in 4s"), Some(12340.0), Some(4100));
+        assert!(card.contains("{% run status=\"done\" took=\"12.3s\" tokens=\"4.1k\" %}"), "got {card}");
+        assert!(card.contains("{% /run %}"));
     }
 }
