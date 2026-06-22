@@ -64,6 +64,8 @@ type Sessions = Arc<Mutex<HashMap<String, String>>>;
 #[derive(Default)]
 struct ChatState {
     model: Option<String>,
+    /// Extended-thinking budget for this chat (`/think`), in tokens. None = off.
+    thinking: Option<u32>,
     cancel: Option<Arc<Notify>>,
     /// When a `/login` is in flight in this chat, the channel that delivers the
     /// pasted auth code to the waiting `claude auth login` process.
@@ -218,6 +220,9 @@ async fn should_respond(
 struct OwnerConfig {
     /// Default model for turns when the chat hasn't overridden it (`/model`).
     model: Option<String>,
+    /// Default extended-thinking budget (tokens) when the chat hasn't set one
+    /// (`/think`). None/0 = off.
+    thinking: Option<u32>,
     /// Extra system prompt the owner set, appended to the mafold preamble.
     system_prompt: Option<String>,
     /// Default working directory when `--workdir` wasn't passed on the CLI.
@@ -253,6 +258,7 @@ impl OwnerConfig {
         };
         Self {
             model: get("model"),
+            thinking: get("thinking").and_then(|s| s.parse().ok()),
             system_prompt: get("system_prompt"),
             // `cwd` is the documented key; accept `workdir` as an alias.
             cwd: get("cwd").or_else(|| get("workdir")),
@@ -412,6 +418,7 @@ fn control_commands() -> Vec<Value> {
         serde_json::json!({ "command": "new",    "description": "Alias for /clear" }),
         serde_json::json!({ "command": "stop",   "description": "Stop the reply that's currently running" }),
         serde_json::json!({ "command": "model",  "description": "Switch the model for this chat", "arg_hint": "name | reset" }),
+        serde_json::json!({ "command": "think",  "description": "Toggle extended thinking for this chat", "arg_hint": "on | off | <tokens>" }),
         serde_json::json!({ "command": "status", "description": "Is the agent busy? show the working directory" }),
         serde_json::json!({ "command": "cwd",    "description": "Show the working directory" }),
         serde_json::json!({ "command": "help",   "description": "What this agent can do" }),
@@ -554,9 +561,15 @@ async fn connect_and_run(
         // If the trigger arrived in a thread, the bot replies into that thread.
         let thread_root = m.thread_root_id.clone();
         // Model precedence: per-chat `/model` override > owner-config default >
-        // the harness default (None).
-        let model = chat_states.lock().await.get(&chat_id).and_then(|s| s.model.clone())
-            .or_else(|| owner.model.clone());
+        // the harness default (None). `/think` budget follows the same rule.
+        let (model, thinking) = {
+            let states = chat_states.lock().await;
+            let st = states.get(&chat_id);
+            (
+                st.and_then(|s| s.model.clone()).or_else(|| owner.model.clone()),
+                st.and_then(|s| s.thinking).or(owner.thinking),
+            )
+        };
         // mafold awareness for this turn: identity + peer + embeddable cards,
         // plus the owner's extra system prompt (if any) appended after it.
         let mut sys = mafold_preamble(my_username, &m.sender.username, &card_tags);
@@ -579,7 +592,7 @@ async fn connect_and_run(
                     crate::harness::CommandOutcome::Forward => {}
                 }
             }
-            if let Err(e) = handle(&client, &workdir, &chat_id, thread_root.as_deref(), &content, &attachments, &sessions, &coord, &chat_states, &harness, model, system).await {
+            if let Err(e) = handle(&client, &workdir, &chat_id, thread_root.as_deref(), &content, &attachments, &sessions, &coord, &chat_states, &harness, model, thinking, system).await {
                 eprintln!("handle error: {e}");
             }
         });
@@ -591,7 +604,7 @@ async fn connect_and_run(
 
 /// Is this slash name one the daemon handles itself (vs a Claude Code skill)?
 fn is_control(name: &str) -> bool {
-    matches!(name, "clear" | "new" | "compact" | "stop" | "model" | "status" | "cwd" | "help")
+    matches!(name, "clear" | "new" | "compact" | "stop" | "model" | "think" | "status" | "cwd" | "help")
 }
 
 /// Run a daemon control command. Replies in-chat; never invokes claude.
@@ -645,20 +658,59 @@ async fn handle_control(
                 let _ = client.send(chat_id, &format!("Model for this chat set to `{arg}`.")).await;
             }
         }
+        "think" => {
+            // Default budget for a bare `/think on` — enough for visible reasoning
+            // without burning the whole turn on thinking.
+            const DEFAULT_THINKING: u32 = 10_000;
+            let mut states = chat_states.lock().await;
+            let st = states.entry(chat_id.to_string()).or_default();
+            let a = arg.trim().to_lowercase();
+            if a.is_empty() {
+                let cur = match st.thinking {
+                    Some(n) => format!("on ({n} tokens)"),
+                    None => "off".into(),
+                };
+                let _ = client.send(chat_id, &format!("Extended thinking for this chat: {cur}\nSet with `/think on`, `/think off`, or `/think <tokens>` (e.g. `/think 20000`).")).await;
+            } else if a == "off" || a == "reset" || a == "false" || a == "0" {
+                st.thinking = None;
+                let _ = client.send(chat_id, "Extended thinking turned off for this chat.").await;
+            } else if a == "on" || a == "true" {
+                st.thinking = Some(DEFAULT_THINKING);
+                let _ = client.send(chat_id, &format!("Extended thinking on ({DEFAULT_THINKING} tokens) for this chat.")).await;
+            } else if let Ok(n) = a.parse::<u32>() {
+                if n == 0 {
+                    st.thinking = None;
+                    let _ = client.send(chat_id, "Extended thinking turned off for this chat.").await;
+                } else {
+                    st.thinking = Some(n);
+                    let _ = client.send(chat_id, &format!("Extended thinking on ({n} tokens) for this chat.")).await;
+                }
+            } else {
+                let _ = client.send(chat_id, "Usage: `/think on` · `/think off` · `/think <tokens>` (e.g. `/think 20000`).").await;
+            }
+        }
         "status" => {
-            let busy = chat_states.lock().await.get(chat_id).map(|s| s.cancel.is_some()).unwrap_or(false);
-            let model = chat_states.lock().await.get(chat_id).and_then(|s| s.model.clone()).unwrap_or_else(|| "default".into());
+            let (busy, model, thinking) = {
+                let states = chat_states.lock().await;
+                let st = states.get(chat_id);
+                (
+                    st.map(|s| s.cancel.is_some()).unwrap_or(false),
+                    st.and_then(|s| s.model.clone()).unwrap_or_else(|| "default".into()),
+                    st.and_then(|s| s.thinking),
+                )
+            };
+            let think = match thinking { Some(n) => format!("on ({n} tokens)"), None => "off".into() };
             let state = if busy { "running a reply now" } else { "idle" };
             let auth = harness.status_line().await;
             let auth_line = if auth.is_empty() { String::new() } else { format!("\n• {}: {auth}", harness.id()) };
-            let _ = client.send(chat_id, &format!("Agent {state}.\n• harness: {}\n• workdir: {workdir}\n• model: {model}{auth_line}", harness.id())).await;
+            let _ = client.send(chat_id, &format!("Agent {state}.\n• harness: {}\n• workdir: {workdir}\n• model: {model}\n• thinking: {think}{auth_line}", harness.id())).await;
         }
         "cwd" => {
             let _ = client.send(chat_id, &format!("Working directory: {workdir}")).await;
         }
         "help" => {
             let _ = client.send(chat_id,
-                "I'm a Claude Code agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /compact — summarize the context to free up room (keeps continuity)\n• /stop — stop the running reply\n• /model <name> — switch model for this chat\n• /status · /cwd — agent info\n\nEverything else in the `/` menu is a Claude Code skill or command — tap one to run it.").await;
+                "I'm a Claude Code agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /compact — summarize the context to free up room (keeps continuity)\n• /stop — stop the running reply\n• /model <name> — switch model for this chat\n• /think on|off|<tokens> — toggle extended thinking for this chat\n• /status · /cwd — agent info\n\nEverything else in the `/` menu is a Claude Code skill or command — tap one to run it.").await;
         }
         _ => {}
     }
@@ -677,16 +729,16 @@ async fn compact_session(client: Client, workdir: String, chat_id: String, sessi
         return;
     };
     let _ = client.send(&chat_id, "🗜️ Compacting the conversation…").await;
-    let out = tokio::process::Command::new("claude")
-        .arg("-p").arg("/compact")
+    let mut cmd = tokio::process::Command::new("claude");
+    cmd.arg("-p").arg("/compact")
         .arg("--resume").arg(&sid)
         .arg("--output-format").arg("json")
         .arg("--dangerously-skip-permissions")
         .current_dir(&workdir)
         .env_remove("CLAUDECODE")
-        .env_remove("ANTHROPIC_API_KEY")
-        .output()
-        .await;
+        .env_remove("ANTHROPIC_API_KEY");
+    crate::platform::no_window(&mut cmd);
+    let out = cmd.output().await;
     match out {
         Ok(o) if o.status.success() => {
             let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_default();
@@ -741,18 +793,24 @@ async fn login_flow(client: Client, chat_id: String, arg: String, chat_states: C
     // Suppress the host browser pop-up (macOS opens via `open <url>`): prepend a
     // no-op `open` to PATH + neutralize $BROWSER. COLUMNS keeps the URL unwrapped.
     let noop = noop_open_dir();
-    let path = format!("{}:{}", noop.display(), std::env::var("PATH").unwrap_or_default());
-    let mut child = match tokio::process::Command::new("claude")
-        .args(["auth", "login", mode])
+    let path = std::env::join_paths(
+        std::iter::once(noop.clone())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
+    )
+    .map(|p| p.to_string_lossy().into_owned())
+    .unwrap_or_else(|_| std::env::var("PATH").unwrap_or_default());
+    let mut cmd = tokio::process::Command::new("claude");
+    cmd.args(["auth", "login", mode])
         .env("PATH", path)
-        .env("BROWSER", "/usr/bin/true")
         .env("COLUMNS", "4096")
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    cmd.env("BROWSER", "/usr/bin/true"); // a real no-op binary only exists on Unix
+    crate::platform::no_window(&mut cmd);
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => { let _ = client.send(&chat_id, &format!("Couldn't start `claude auth login`: {e}")).await; return; }
     };
@@ -847,10 +905,22 @@ fn extract_auth_url(line: &str) -> Option<String> {
 fn noop_open_dir() -> PathBuf {
     let dir = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".mafold/noopbin");
     let _ = std::fs::create_dir_all(&dir);
-    let open = dir.join("open");
-    if !open.exists() && std::fs::write(&open, "#!/bin/sh\nexit 0\n").is_ok() {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755));
+    #[cfg(unix)]
+    {
+        let open = dir.join("open");
+        if !open.exists() && std::fs::write(&open, "#!/bin/sh\nexit 0\n").is_ok() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Windows browser-launch doesn't shell out to an `open` binary, but
+        // shadow one anyway as a harmless no-op for anything that does.
+        let open = dir.join("open.cmd");
+        if !open.exists() {
+            let _ = std::fs::write(&open, "@echo off\r\nexit /b 0\r\n");
+        }
     }
     dir
 }
@@ -907,6 +977,7 @@ async fn handle(
     chat_states: &ChatStates,
     harness: &Arc<dyn Harness>,
     model: Option<String>,
+    thinking: Option<u32>,
     system: Option<String>,
 ) -> Result<()> {
     let msg_id = client.create_draft(chat_id, thread_root).await?;
@@ -963,6 +1034,7 @@ async fn handle(
         workdir: workdir.to_string(),
         session: prior.clone(),
         model,
+        thinking,
         cancel: cancel.clone(),
         system,
         ask_file: Some(ask_file.clone()),

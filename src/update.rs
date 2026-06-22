@@ -97,11 +97,16 @@ fn acquire_lock() -> Result<Lock> {
     let p = mafold_dir().join("update.lock");
     if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
     let f = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&p)?;
-    use std::os::unix::io::AsRawFd;
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        anyhow::bail!("couldn't acquire the update lock");
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            anyhow::bail!("couldn't acquire the update lock");
+        }
     }
-    Ok(Lock(f)) // released when the File (fd) drops
+    #[cfg(windows)]
+    crate::platform::lock_file_exclusive(&f).context("couldn't acquire the update lock")?;
+    Ok(Lock(f)) // released when the File (handle) drops
 }
 
 fn stamp_path() -> PathBuf { mafold_dir().join("installed-version") }
@@ -123,8 +128,13 @@ fn smoke_test(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Is a newer release available? Returns it (no download).
+/// Is a newer release available? Returns it (no download). No-ops on platforms
+/// the release workflow doesn't build a binary for (e.g. Windows) so the
+/// auto-update tick stays quiet instead of erroring every cycle.
 pub async fn check(http: &reqwest::Client) -> Result<Option<Release>> {
+    if target_triple().is_none() {
+        return Ok(None);
+    }
     let r = latest(http).await?;
     Ok(is_newer(&r.version, current_version()).then_some(r))
 }
@@ -185,11 +195,9 @@ pub async fn update_to_latest(http: &reqwest::Client) -> Result<Option<String>> 
     }
 }
 
-/// Replace the current process image with the (freshly updated) binary, keeping
-/// the same args + env. Never returns on success.
-#[cfg(unix)]
+/// Replace the current process with the (freshly updated) binary, keeping the
+/// same args + env. Never returns on success. Unix `exec`s in place (same pid);
+/// Windows respawns and exits — see `crate::platform::reexec`.
 pub fn reexec() -> std::io::Error {
-    use std::os::unix::process::CommandExt;
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("mafold"));
-    std::process::Command::new(exe).args(std::env::args_os().skip(1)).exec()
+    crate::platform::reexec()
 }

@@ -335,10 +335,10 @@ fn mock_reply(name: &str) -> String {
 // ───────────────────────── helpers ─────────────────────────
 
 async fn run_claude(args: &[&str], secs: u64) -> String {
-    let fut = tokio::process::Command::new("claude")
-        .args(args)
-        .stdin(Stdio::null())
-        .output();
+    let mut cmd = tokio::process::Command::new("claude");
+    cmd.args(args).stdin(Stdio::null());
+    crate::platform::no_window(&mut cmd);
+    let fut = cmd.output();
     match tokio::time::timeout(Duration::from_secs(secs), fut).await {
         Ok(Ok(o)) => {
             let mut s = String::from_utf8_lossy(&o.stdout).to_string();

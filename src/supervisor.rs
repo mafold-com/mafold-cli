@@ -8,9 +8,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+
+use crate::platform;
 
 /// One configured daemon = one bot presence.
 #[derive(Serialize, Deserialize, Clone)]
@@ -63,18 +64,15 @@ fn read_pid(name: &str) -> Option<u32> {
     fs::read_to_string(pid_path(name)).ok()?.trim().parse().ok()
 }
 fn alive(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    platform::pid_alive(pid)
 }
 
 /// Reap any exited child daemons so they don't linger as zombies — a zombie pid
 /// still answers `kill(pid, 0)`, which would make the liveness check (and thus
-/// respawn) wrongly believe a crashed daemon is still running.
+/// respawn) wrongly believe a crashed daemon is still running. (No-op where the
+/// OS has no zombies, e.g. Windows.)
 fn reap() {
-    loop {
-        let mut status = 0;
-        let r = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
-        if r <= 0 { break; } // 0 = children exist but none exited; -1 = no children
-    }
+    platform::reap_children();
 }
 
 /// `mafold add <name> --workdir … [--harness …]` (token from global --token).
@@ -124,7 +122,7 @@ const SERVICE_LABEL: &str = "com.mafold.supervisor";
 
 fn kill_supervisor_process() {
     if let Some(pid) = read_pid_file(&sup_pid_path()) {
-        unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+        platform::terminate(pid);
         let _ = fs::remove_file(sup_pid_path());
     }
 }
@@ -133,6 +131,7 @@ fn kill_supervisor_process() {
 /// (which found `claude` etc.) plus the usual user bins. A service manager
 /// (launchd/systemd) otherwise hands out a minimal PATH (`/usr/bin:/bin:…`) that
 /// lacks them — which is exactly what breaks `claude` under launchd.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn service_path() -> String {
     let base = std::env::var("PATH").unwrap_or_default();
     let extra = format!("{}/.local/bin:/opt/homebrew/bin", home().display());
@@ -287,9 +286,7 @@ fn start_supervisor(base: &str) -> Result<u32> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
-    unsafe {
-        cmd.pre_exec(|| { libc::setsid(); Ok(()) });
-    }
+    platform::configure_detached(&mut cmd);
     let child = cmd.spawn().context("failed to spawn supervisor")?;
     let pid = child.id();
     writeln!(fs::File::create(sup_pid_path())?, "{pid}")?;
@@ -363,13 +360,8 @@ fn start_one(base: &str, d: &DaemonCfg) -> Result<Option<u32>> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
-    // New session → detached from the controlling terminal.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
+    // New session / no console → detached from the controlling terminal.
+    platform::configure_detached(&mut cmd);
     let child = cmd.spawn().with_context(|| format!("failed to spawn daemon `{}`", d.name))?;
     let pid = child.id();
     writeln!(fs::File::create(pid_path(&d.name))?, "{pid}")?;
@@ -404,7 +396,7 @@ pub fn down(only: Option<&str>) -> Result<()> {
 fn stop_one(name: &str) -> Result<()> {
     match read_pid(name) {
         Some(pid) => {
-            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+            platform::terminate(pid);
             let _ = fs::remove_file(pid_path(name));
             Ok(())
         }

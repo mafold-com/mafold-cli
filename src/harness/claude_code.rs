@@ -27,7 +27,7 @@ impl Harness for ClaudeCode {
     }
 
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
-        let Turn { prompt, workdir, session, model, cancel, system, ask_file } = turn;
+        let Turn { prompt, workdir, session, model, thinking, cancel, system, ask_file } = turn;
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");
         }
@@ -44,6 +44,11 @@ impl Harness for ClaudeCode {
             .arg("--strict-mcp-config");
         if let Some(m) = &model {
             cmd.arg("--model").arg(m);
+        }
+        // Extended thinking: a non-zero budget makes the model think before each
+        // reply (streamed as `thinking` blocks). No env = Claude Code's default.
+        if let Some(budget) = thinking {
+            cmd.env("MAX_THINKING_TOKENS", budget.to_string());
         }
         // mafold awareness: who the bot is, the conversation, embeddable cards.
         if let Some(sys) = &system {
@@ -72,6 +77,8 @@ impl Harness for ClaudeCode {
         if let Some(sid) = &session {
             cmd.arg("--resume").arg(sid);
         }
+        // Don't let the console child flash a window (the agent runs detached).
+        crate::platform::no_window(&mut cmd);
         let mut child = cmd
             .current_dir(&workdir)
             .env_remove("CLAUDECODE")
@@ -206,10 +213,30 @@ fn tool_result_text(b: &Value) -> String {
 
 /// Is `bin` resolvable on `$PATH`? (cheap availability check, no spawn)
 fn on_path(bin: &str) -> bool {
+    let names = exe_candidates(bin);
     std::env::var_os("PATH").is_some_and(|paths| {
         std::env::split_paths(&paths).any(|dir| {
-            let p = dir.join(bin);
-            p.is_file() || std::fs::metadata(&p).map(|m| m.is_file()).unwrap_or(false)
+            names.iter().any(|name| {
+                let p = dir.join(name);
+                p.is_file() || std::fs::metadata(&p).map(|m| m.is_file()).unwrap_or(false)
+            })
         })
     })
+}
+
+/// Filenames to look for on `$PATH` for a program. On Unix that's just the bare
+/// name; on Windows the executable is `claude.exe` / `claude.cmd` / …, so we also
+/// try the bare name with each `PATHEXT` extension appended.
+#[cfg(not(windows))]
+fn exe_candidates(bin: &str) -> Vec<String> {
+    vec![bin.to_string()]
+}
+#[cfg(windows)]
+fn exe_candidates(bin: &str) -> Vec<String> {
+    let mut names = vec![bin.to_string()];
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    for ext in pathext.split(';').filter(|e| !e.is_empty()) {
+        names.push(format!("{bin}{}", ext.to_ascii_lowercase()));
+    }
+    names
 }
