@@ -15,6 +15,7 @@ mod commands;
 mod daemon;
 mod discover;
 mod harness;
+mod langpack;
 mod platform;
 mod render;
 mod supervisor;
@@ -80,6 +81,11 @@ enum Cmd {
     Apps {
         #[command(subcommand)]
         cmd: apps::AppsCmd,
+    },
+    /// Publish the cloud language packs (langpacks/*.json) — first-party only.
+    Langpack {
+        #[command(subcommand)]
+        cmd: langpack::LangpackCmd,
     },
 
     // ── multi-daemon supervisor: one daemon per bot ──
@@ -163,6 +169,11 @@ async fn main() -> Result<()> {
         let Cmd::Apps { cmd } = cli.cmd else { unreachable!() };
         return apps::run(cmd, cli.base, cli.token).await;
     }
+    // Langpack: publish/list check for the first-party token themselves.
+    if matches!(cli.cmd, Cmd::Langpack { .. }) {
+        let Cmd::Langpack { cmd } = cli.cmd else { unreachable!() };
+        return langpack::run(cmd, cli.base, cli.token).await;
+    }
 
     let token = cli
         .token
@@ -192,6 +203,7 @@ async fn main() -> Result<()> {
         Cmd::Chats => chats(&Client::new(cli.base, token)).await?,
         Cmd::Send { chat, text } => send(&Client::new(cli.base, token), &chat, &text.join(" ")).await?,
         Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Cards { .. } | Cmd::Apps { .. }
+        | Cmd::Langpack { .. }
         | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
         | Cmd::Rollback | Cmd::Supervise | Cmd::AskHook => unreachable!(),
     }

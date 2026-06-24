@@ -205,6 +205,22 @@ impl Client {
         self.post("removeApp", json!({ "id": id })).await
     }
 
+    // ── cloud language-pack registry (i18n) ──
+    /// Publish one language pack (first-party publisher only). `body` carries
+    /// `lang_code`, `version`, `name?`, `rtl?`, `strings`. Returns `{lang_code,
+    /// keyset, version, url}`.
+    pub async fn publish_langpack(&self, body: Value) -> Result<Value> {
+        self.post("publishLangPack", body).await
+    }
+    /// Resolve newest (or pinned) packs — used to read the current server version.
+    pub async fn resolve_langpacks(&self, requests: Value) -> Result<Value> {
+        self.post("resolveLangPacks", json!({ "requests": requests })).await
+    }
+    /// The languages the server currently serves (newest version each).
+    pub async fn list_languages(&self) -> Result<Value> {
+        self.post("listLanguages", json!({})).await
+    }
+
     fn ws_url(&self) -> String {
         let ws = self.base.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
         format!("{ws}/api/ws")
