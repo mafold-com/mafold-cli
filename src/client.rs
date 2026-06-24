@@ -78,9 +78,24 @@ impl Client {
         Ok(())
     }
 
-    /// Download a media URL (an attachment `/media/…` path, or an absolute URL).
+    /// Download a media attachment. The path comes from the server, so it's NOT
+    /// trusted as an arbitrary URL: only a relative `/media/…`-style path (joined
+    /// onto our own `base`) or an absolute URL on the SAME origin as `base` is
+    /// fetched. Anything else (a foreign `http(s)://` host) is rejected so a
+    /// crafted attachment URL can't make the daemon do an SSRF request.
     pub async fn download(&self, path: &str) -> Result<Vec<u8>> {
-        let url = if path.starts_with("http") { path.to_string() } else { format!("{}{}", self.base, path) };
+        let url = if path.starts_with("http://") || path.starts_with("https://") {
+            // Absolute URL → only allow it if it's on our own API origin.
+            if !same_origin(&self.base, path) {
+                anyhow::bail!("refusing to fetch attachment from a non-Mafold origin: {path}");
+            }
+            path.to_string()
+        } else if path.starts_with('/') {
+            // A relative server path (e.g. `/media/…`) → resolve against base.
+            format!("{}{}", self.base, path)
+        } else {
+            anyhow::bail!("refusing to fetch attachment from a non-relative, non-Mafold URL: {path}");
+        };
         let bytes = self.http.get(&url).send().await?.error_for_status()?.bytes().await?;
         Ok(bytes.to_vec())
     }
@@ -149,8 +164,79 @@ impl Client {
         self.post("listCards", json!({})).await
     }
 
-    pub fn ws_url(&self) -> String {
+    // ── developer mini-app registry ──
+    /// Publish a compiled mini-app bundle. `meta` is the full AppManifest JSON
+    /// (carrying `id` = `owner/slug` and `version`); the server gates publish on
+    /// owning the `owner` namespace. Mirrors `publish_card` (different route, a
+    /// manifest instead of card meta).
+    pub async fn publish_app(&self, meta: &Value, bundle: Vec<u8>) -> Result<Value> {
+        let form = reqwest::multipart::Form::new()
+            .text("meta", serde_json::to_string(meta)?)
+            .part(
+                "bundle",
+                reqwest::multipart::Part::bytes(bundle)
+                    .file_name("app.js")
+                    .mime_str("application/javascript")?,
+            );
+        let v: Value = self
+            .http
+            .post(format!("{}/api/publishApp", self.base))
+            .bearer_auth(&self.token)
+            .multipart(form)
+            .send()
+            .await
+            .context("publishApp request failed")?
+            .json()
+            .await
+            .context("publishApp returned non-JSON")?;
+        if v.get("ok").and_then(Value::as_bool) == Some(false) {
+            anyhow::bail!("publishApp: {}", v["description"].as_str().unwrap_or("error"));
+        }
+        Ok(v["result"].clone())
+    }
+
+    /// Every mini-app whose namespace the caller may manage (the "my apps" view).
+    pub async fn list_apps(&self) -> Result<Value> {
+        self.post("listApps", json!({})).await
+    }
+
+    /// Take down a mini-app the caller owns (all versions). Returns `{removed}`.
+    pub async fn remove_app(&self, id: &str) -> Result<Value> {
+        self.post("removeApp", json!({ "id": id })).await
+    }
+
+    fn ws_url(&self) -> String {
         let ws = self.base.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
-        format!("{ws}/api/ws?token={}", self.token)
+        format!("{ws}/api/ws")
+    }
+
+    /// The WS handshake request — sends the bot token via an `Authorization:
+    /// Bearer` header instead of the URL query string (so the secret doesn't sit
+    /// in logs / proxies). Pass this straight to `connect_async`.
+    pub fn ws_request(&self) -> tokio_tungstenite::tungstenite::ClientRequestBuilder {
+        let uri: tokio_tungstenite::tungstenite::http::Uri = self
+            .ws_url()
+            .parse()
+            .expect("ws url should be a valid URI");
+        tokio_tungstenite::tungstenite::ClientRequestBuilder::new(uri)
+            .with_header("Authorization", format!("Bearer {}", self.token))
+    }
+}
+
+/// Do two URLs share the same origin (scheme + host + port)? Used to keep the
+/// attachment downloader from following an absolute URL to a foreign host.
+fn same_origin(base: &str, other: &str) -> bool {
+    fn origin(u: &str) -> Option<(String, String)> {
+        // scheme://host[:port]/…  → (scheme, host[:port]) lowercased.
+        let (scheme, rest) = u.split_once("://")?;
+        let authority = rest.split('/').next().unwrap_or("");
+        if authority.is_empty() {
+            return None;
+        }
+        Some((scheme.to_lowercase(), authority.to_lowercase()))
+    }
+    match (origin(base), origin(other)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
     }
 }

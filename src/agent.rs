@@ -55,8 +55,85 @@ fn attachments_dir() -> PathBuf {
     PathBuf::from(home).join(".mafold").join("attachments")
 }
 
+/// Turn a server-supplied attachment basename into a SAFE filename that can never
+/// escape the attachments dir. Keeps only the final path component (so any
+/// `..`/absolute prefix is dropped), then restricts to `[A-Za-z0-9._-]`. A name
+/// that is empty / all-dots after sanitizing falls back to `image.jpg`.
+fn sanitize_attachment_name(raw: &str) -> String {
+    // `file_name()` strips any directory parts (incl. `..` and absolute roots).
+    let base = std::path::Path::new(raw)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let cleaned: String = base
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .collect();
+    // Reject empty / dot-only names (`.`, `..`, `…`) which aren't real filenames.
+    if cleaned.is_empty() || cleaned.chars().all(|c| c == '.') {
+        "image.jpg".to_string()
+    } else {
+        cleaned
+    }
+}
+
 // ── per-conversation Claude session map (persisted) ──
 type Sessions = Arc<Mutex<HashMap<String, String>>>;
+
+/// Who may drive this bot at all. `claude -p … --dangerously-skip-permissions`
+/// is host code execution, so a turn must NEVER be driven by anyone outside this
+/// list — checked BEFORE the group @-mention gate, the pending-ask/login relay,
+/// and any control command. Default-allow is the bot's OWNER only (the account's
+/// `parent_username` from `getMe`); the owner can widen it via the env var
+/// `MAFOLD_ALLOWED_USERS` (comma-separated usernames that ADD to the list), and
+/// the literal `*` opts back into the old "anyone" behavior. Usernames are
+/// trimmed + lowercased for comparison (mirrors the @-mention matching).
+struct AllowList {
+    /// Explicitly allowed usernames (lowercased). Includes the owner.
+    users: std::collections::HashSet<String>,
+    /// `*` was given → anyone may drive the bot (still excludes bots).
+    anyone: bool,
+}
+
+impl AllowList {
+    /// Build from the bot's owner (`getMe` → `parent_username`, may be absent for
+    /// a top-level/ownerless bot) plus the `MAFOLD_ALLOWED_USERS` env var.
+    fn build(owner: Option<&str>) -> Self {
+        let mut users = std::collections::HashSet::new();
+        let mut anyone = false;
+        if let Some(o) = owner {
+            let o = o.trim().to_lowercase();
+            if !o.is_empty() {
+                users.insert(o);
+            }
+        }
+        if let Ok(env) = std::env::var("MAFOLD_ALLOWED_USERS") {
+            for raw in env.split(',') {
+                let u = raw.trim().to_lowercase();
+                if u.is_empty() {
+                    continue;
+                }
+                if u == "*" {
+                    anyone = true;
+                } else {
+                    users.insert(u);
+                }
+            }
+        }
+        Self { users, anyone }
+    }
+
+    /// May this sender drive the bot? Bots are NEVER implicitly allowed (don't let
+    /// bots drive bots), even when `*` is set. An allow-listed bot username still
+    /// passes, so an owner who explicitly lists a bot can opt it in.
+    fn allows(&self, username: &str, is_bot: bool) -> bool {
+        let u = username.trim().to_lowercase();
+        if self.users.contains(&u) {
+            return true;
+        }
+        self.anyone && !is_bot
+    }
+}
 
 // ── per-conversation live control state (in-memory) ──
 // `model` overrides the model for this chat (`/model …`); `cancel`, when a run
@@ -70,11 +147,19 @@ struct ChatState {
     /// When a `/login` is in flight in this chat, the channel that delivers the
     /// pasted auth code to the waiting `claude auth login` process.
     login_code_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    /// The lowercased username that started the in-flight `/login` flow. Only
+    /// that same sender may relay the pasted OAuth code (a shared-group bot must
+    /// not let a bystander inject a code into someone else's sign-in).
+    login_owner: Option<String>,
     /// Set while the current turn is BLOCKED on an AskUserQuestion: the file the
     /// hook is polling. The next chat message is the user's answer → write it
     /// here (don't start a new turn). Set on the `AskUserQuestion` tool call,
     /// cleared when consumed or the turn ends.
     ask_file: Option<String>,
+    /// The lowercased username that triggered the in-flight turn. Only that same
+    /// sender may answer its AskUserQuestion (so one participant can't answer
+    /// another user's agent question in a shared group).
+    ask_owner: Option<String>,
     /// Cached group-dispatch gate for this conversation (kind + always-on),
     /// refreshed at most once per 60s so the reply gate stays ~free.
     gate: Option<ConvGate>,
@@ -171,40 +256,47 @@ async fn should_respond(
     content: &str,
     chat_states: &ChatStates,
 ) -> bool {
+    // Never auto-chain off another bot's message (would loop two always-on bots
+    // — or two bots that @-mention each other — forever). Checked BEFORE the
+    // mention short-circuit so a bot's @mention can't pull this bot into a loop.
+    if sender_is_bot {
+        return false;
+    }
     // A mention always fires — and it's free, so check it before any fetch.
     if mentions_me(content, my_username) {
         return true;
-    }
-    // Never auto-chain off another bot's message (would loop two always-on bots
-    // forever); only an explicit @mention pulls this bot into a bot's message.
-    if sender_is_bot {
-        return false;
     }
     if let Some(g) = chat_states.lock().await.get(conv_id).and_then(|s| s.gate.clone()) {
         if g.at.elapsed() < std::time::Duration::from_secs(60) {
             return !g.is_group || g.always_on;
         }
     }
-    let is_group = client
-        .get_chat(conv_id)
-        .await
-        .ok()
-        .and_then(|c| c.get("kind").and_then(|k| k.as_str()).map(|s| s == "group"))
-        .unwrap_or(false);
+    // Fail CLOSED on an API error: a failed `get_chat` must NOT make a group look
+    // like a DM (which would answer every message with no mention). Treat an error
+    // as "a group requiring a mention" and DON'T cache that verdict (so the next
+    // message re-checks instead of being stuck wrong for 60s).
+    let kind = match client.get_chat(conv_id).await {
+        Ok(c) => c.get("kind").and_then(|k| k.as_str()).map(str::to_string),
+        Err(_) => return false, // can't tell → treat as a group; require a mention
+    };
+    let is_group = kind.as_deref() == Some("group");
     let always_on = if is_group {
-        client
-            .group_bots(conv_id)
-            .await
-            .ok()
-            .and_then(|r| r.get("items").and_then(|i| i.as_array()).cloned())
-            .map(|items| {
-                items.iter().any(|e| {
-                    e.get("bot").and_then(|b| b.get("username")).and_then(|u| u.as_str())
-                        .map(|u| u.eq_ignore_ascii_case(my_username)).unwrap_or(false)
-                        && e.get("always_on").and_then(|a| a.as_bool()).unwrap_or(false)
+        match client.group_bots(conv_id).await {
+            Ok(r) => r
+                .get("items")
+                .and_then(|i| i.as_array())
+                .map(|items| {
+                    items.iter().any(|e| {
+                        e.get("bot").and_then(|b| b.get("username")).and_then(|u| u.as_str())
+                            .map(|u| u.eq_ignore_ascii_case(my_username)).unwrap_or(false)
+                            && e.get("always_on").and_then(|a| a.as_bool()).unwrap_or(false)
+                    })
                 })
-            })
-            .unwrap_or(false)
+                .unwrap_or(false),
+            // Can't tell if we're always-on → fail closed (require a mention) and
+            // don't cache, so the next message re-checks.
+            Err(_) => return false,
+        }
     } else {
         false
     };
@@ -277,8 +369,17 @@ fn load_sessions() -> HashMap<String, String> {
         .unwrap_or_default()
 }
 fn save_sessions(map: &HashMap<String, String>) {
-    if let Ok(s) = serde_json::to_string(map) {
-        let _ = std::fs::write(sessions_path(), s);
+    // Atomic: write a sibling `.tmp` then rename over the real file, so a crash
+    // mid-write can't truncate/corrupt sessions.json and silently wipe every
+    // resumable session. (A clobbered `.tmp` is harmless — it's per-write scratch.)
+    let Ok(s) = serde_json::to_string(map) else { return };
+    let path = sessions_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, s).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
     }
 }
 
@@ -297,6 +398,23 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     let me = client.me().await.context("getMe failed — check the token / --base")?;
     let my_username = me["username"].as_str().unwrap_or_default().to_string();
     anyhow::ensure!(!my_username.is_empty(), "could not resolve bot identity (bad token?)");
+
+    // Account whitelist for who may DRIVE the bot (host code execution). Cache the
+    // OWNER (this bot account's `parent_username` from getMe) as the default-allow,
+    // widened by the `MAFOLD_ALLOWED_USERS` env var (`*` = anyone). Enforced as a
+    // hard gate before any turn / control / pending-ask / login relay. See AllowList.
+    let owner_username = me["parent_username"].as_str().map(str::to_string);
+    let allow = Arc::new(AllowList::build(owner_username.as_deref()));
+    {
+        let mut who: Vec<String> = allow.users.iter().cloned().collect();
+        who.sort();
+        let listed = if who.is_empty() { "(none)".to_string() } else { who.join(", ") };
+        let anyone = if allow.anyone { "  ·  + anyone (MAFOLD_ALLOWED_USERS=*)" } else { "" };
+        println!("access: only these users may drive me → {listed}{anyone}");
+        if allow.users.is_empty() && !allow.anyone {
+            eprintln!("⚠️  no owner resolved and MAFOLD_ALLOWED_USERS unset — NO ONE may drive me. Set MAFOLD_ALLOWED_USERS.");
+        }
+    }
 
     // Cloud-first owner config: the bot reads its OWNER-set config from the server
     // and uses it to drive the harness defaults (model / system prompt / workdir).
@@ -372,7 +490,7 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     let mut backoff = 1u64;
     let mut last_update_check = std::time::Instant::now();
     loop {
-        if let Err(e) = connect_and_run(&client, &workdir, &my_username, &sessions, &coord, &chat_states, &harness, &owner).await {
+        if let Err(e) = connect_and_run(&client, &workdir, &my_username, &sessions, &coord, &chat_states, &harness, &owner, &allow).await {
             eprintln!("connection error: {e}");
         }
         // A dropped WS is a natural idle moment → opportunistically self-update,
@@ -450,8 +568,9 @@ async fn connect_and_run(
     chat_states: &ChatStates,
     harness: &Arc<dyn Harness>,
     owner: &Arc<OwnerConfig>,
+    allow: &Arc<AllowList>,
 ) -> Result<()> {
-    let (ws, _) = tokio_tungstenite::connect_async(&client.ws_url())
+    let (ws, _) = tokio_tungstenite::connect_async(client.ws_request())
         .await
         .context("WebSocket connect failed")?;
     let (mut write, mut read) = ws.split();
@@ -491,17 +610,55 @@ async fn connect_and_run(
         if m.sender.username.eq_ignore_ascii_case(my_username)
             || (m.content.trim().is_empty() && m.attachments.is_empty()) { continue; }
 
-        println!("← @{}: {}", m.sender.username, m.content);
+        let sender_is_bot = m.sender.kind.eq_ignore_ascii_case("bot");
+        let sender_lc = m.sender.username.trim().to_lowercase();
+
+        // ACCESS GATE (RCE guard): `claude … --dangerously-skip-permissions` is
+        // host code execution, so a message from a sender NOT on the allow-list
+        // must NEVER drive a turn, answer a pending ask, relay a login code, or
+        // run a control command. Enforced BEFORE every fast-path below and before
+        // the group @-mention gate. Owner / allow-listed only; bots never implicitly.
+        if !allow.allows(&m.sender.username, sender_is_bot) {
+            println!("← @{} (not authorized → ignored)", m.sender.username);
+            continue;
+        }
+
+        // Redact when a `/login` or AskUserQuestion is pending for this chat — a
+        // pasted OAuth code / answer would otherwise land in the log in cleartext.
+        let redact = {
+            let states = chat_states.lock().await;
+            states.get(&m.conversation_id)
+                .map(|s| s.login_code_tx.is_some() || s.ask_file.is_some())
+                .unwrap_or(false)
+        };
+        if redact {
+            println!("← @{}: [redacted, {} chars]", m.sender.username, m.content.trim().chars().count());
+        } else {
+            println!("← @{}: {}", m.sender.username, m.content);
+        }
 
         let trimmed = m.content.trim();
 
         // If a `/login` in this chat is waiting for the pasted Authentication
         // Code, this message IS that code — feed it to the login process (don't
-        // treat it as a prompt). `/stop` cancels the sign-in.
-        let pending_login = chat_states.lock().await.get(&m.conversation_id).and_then(|s| s.login_code_tx.clone());
+        // treat it as a prompt). `/stop` cancels the sign-in. Only the SAME sender
+        // who started the sign-in may relay the code (a bystander must not inject
+        // an OAuth code into someone else's flow in a shared group).
+        let pending_login = {
+            let states = chat_states.lock().await;
+            states.get(&m.conversation_id).and_then(|s| {
+                match (&s.login_code_tx, &s.login_owner) {
+                    (Some(tx), Some(o)) if *o == sender_lc => Some(tx.clone()),
+                    _ => None,
+                }
+            })
+        };
         if let Some(tx) = pending_login {
             if trimmed.eq_ignore_ascii_case("/stop") || trimmed.eq_ignore_ascii_case("/cancel") {
-                if let Some(s) = chat_states.lock().await.get_mut(&m.conversation_id) { s.login_code_tx = None; }
+                if let Some(s) = chat_states.lock().await.get_mut(&m.conversation_id) {
+                    s.login_code_tx = None;
+                    s.login_owner = None;
+                }
                 let _ = client.send(&m.conversation_id, "Cancelled sign-in.").await;
             } else {
                 let _ = tx.send(trimmed.to_string()).await;
@@ -513,7 +670,17 @@ async fn connect_and_run(
         // If this turn is BLOCKED on an AskUserQuestion, this message is the
         // user's answer — hand it to the waiting hook (via its answer file) and
         // don't start a new turn. `/stop` still falls through to cancel the run.
-        let pending_ask = chat_states.lock().await.get(&m.conversation_id).and_then(|s| s.ask_file.clone());
+        // Only the SAME sender who triggered the turn may answer it (so one
+        // participant can't answer another user's agent question in a group).
+        let pending_ask = {
+            let states = chat_states.lock().await;
+            states.get(&m.conversation_id).and_then(|s| {
+                match (&s.ask_file, &s.ask_owner) {
+                    (Some(f), Some(o)) if *o == sender_lc => Some(f.clone()),
+                    _ => None,
+                }
+            })
+        };
         if let Some(ask_file) = pending_ask {
             if !(trimmed.eq_ignore_ascii_case("/stop") || trimmed.eq_ignore_ascii_case("/cancel")) {
                 let _ = std::fs::write(&ask_file, m.content.trim());
@@ -525,13 +692,15 @@ async fn connect_and_run(
         // Daemon control commands (`/clear`, `/stop`, `/model`, …) are handled
         // locally and never reach claude. `/login` runs an interactive flow.
         // Any OTHER `/name …` falls through (emulated, mocked, or to claude).
+        // (All reachable only by an allow-listed sender — gated above.)
         if let Some(rest) = trimmed.strip_prefix('/') {
             let mut it = rest.splitn(2, char::is_whitespace);
             let name = it.next().unwrap_or("").to_lowercase();
             let arg = it.next().unwrap_or("").trim();
             if name == "login" {
-                let (client, chat_id, arg, chat_states) = (client.clone(), m.conversation_id.clone(), arg.to_string(), chat_states.clone());
-                tokio::spawn(async move { login_flow(client, chat_id, arg, chat_states).await; });
+                let (client, chat_id, arg, chat_states, login_owner) =
+                    (client.clone(), m.conversation_id.clone(), arg.to_string(), chat_states.clone(), sender_lc.clone());
+                tokio::spawn(async move { login_flow(client, chat_id, arg, chat_states, login_owner).await; });
                 continue;
             }
             if is_control(&name) {
@@ -543,7 +712,6 @@ async fn connect_and_run(
         // Group reply gate: in a group, only answer when @-mentioned (or set
         // always-on); DMs answer everything. (Control commands above already ran,
         // so `/stop` etc. still work without a mention.)
-        let sender_is_bot = m.sender.kind.eq_ignore_ascii_case("bot");
         if !should_respond(client, &m.conversation_id, my_username, sender_is_bot, &m.content, chat_states).await {
             println!("  (group/bot · not @{my_username} → skip)");
             continue;
@@ -558,6 +726,9 @@ async fn connect_and_run(
         let attachments = m.attachments.clone();
         let chat_id = m.conversation_id.clone();
         let content = m.content.clone();
+        // The (lowercased) sender that triggered this turn — only they may answer
+        // its AskUserQuestion (bound into the per-chat state by `handle`).
+        let turn_sender = sender_lc.clone();
         // If the trigger arrived in a thread, the bot replies into that thread.
         let thread_root = m.thread_root_id.clone();
         // Model precedence: per-chat `/model` override > owner-config default >
@@ -592,7 +763,7 @@ async fn connect_and_run(
                     crate::harness::CommandOutcome::Forward => {}
                 }
             }
-            if let Err(e) = handle(&client, &workdir, &chat_id, thread_root.as_deref(), &content, &attachments, &sessions, &coord, &chat_states, &harness, model, thinking, system).await {
+            if let Err(e) = handle(&client, &workdir, &chat_id, thread_root.as_deref(), &content, &attachments, &sessions, &coord, &chat_states, &harness, model, thinking, system, &turn_sender).await {
                 eprintln!("handle error: {e}");
             }
         });
@@ -785,7 +956,7 @@ async fn compact_session(client: Client, workdir: String, chat_id: String, sessi
 /// Interactive `/login`: drive `claude auth login`, post the sign-in URL to the
 /// chat (host browser suppressed), then write the Authentication Code the user
 /// pastes back into the login process's stdin. Re-auths the agent's own `claude`.
-async fn login_flow(client: Client, chat_id: String, arg: String, chat_states: ChatStates) {
+async fn login_flow(client: Client, chat_id: String, arg: String, chat_states: ChatStates, login_owner: String) {
     use tokio::io::AsyncWriteExt;
     let mode = if arg.contains("console") { "--console" } else { "--claudeai" };
     let _ = client.send(&chat_id, "🔐 Starting Anthropic sign-in… I'll post the link here; approve it, then paste the Authentication Code back to me. (This also re-authenticates the agent's own `claude`.)").await;
@@ -828,9 +999,15 @@ async fn login_flow(client: Client, chat_id: String, arg: String, chat_states: C
     }
     drop(tx);
 
-    // Register the code channel so a pasted message reaches this flow.
+    // Register the code channel so a pasted message reaches this flow — bound to
+    // the sender who started the sign-in (only they may relay the code).
     let (code_tx, mut code_rx) = tokio::sync::mpsc::channel::<String>(1);
-    chat_states.lock().await.entry(chat_id.clone()).or_default().login_code_tx = Some(code_tx);
+    {
+        let mut states = chat_states.lock().await;
+        let st = states.entry(chat_id.clone()).or_default();
+        st.login_code_tx = Some(code_tx);
+        st.login_owner = Some(login_owner.clone());
+    }
 
     // Phase 1: read output until we find + post the sign-in URL (60s budget).
     let post_url = async {
@@ -880,7 +1057,10 @@ async fn login_flow(client: Client, chat_id: String, arg: String, chat_states: C
 }
 
 async fn clear_login(chat_states: &ChatStates, chat_id: &str) {
-    if let Some(s) = chat_states.lock().await.get_mut(chat_id) { s.login_code_tx = None; }
+    if let Some(s) = chat_states.lock().await.get_mut(chat_id) {
+        s.login_code_tx = None;
+        s.login_owner = None;
+    }
 }
 
 /// Extract the OAuth sign-in URL from a line of `claude auth login` output —
@@ -979,6 +1159,7 @@ async fn handle(
     model: Option<String>,
     thinking: Option<u32>,
     system: Option<String>,
+    turn_sender: &str,
 ) -> Result<()> {
     let msg_id = client.create_draft(chat_id, thread_root).await?;
 
@@ -991,10 +1172,14 @@ async fn handle(
         let Some(url) = a.url.as_deref() else { continue };
         match client.download(url).await {
             Ok(bytes) => {
-                let name = url.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("image.jpg");
+                // The basename is SERVER-supplied → never trust it as a path. Take
+                // only the final path component (drops any `..`/absolute prefix),
+                // then sanitize to `[A-Za-z0-9._-]` so it can't escape the dir.
+                let raw = url.rsplit('/').next().unwrap_or("");
+                let name = sanitize_attachment_name(raw);
                 let dir = attachments_dir();
                 let _ = std::fs::create_dir_all(&dir);
-                let path = dir.join(name);
+                let path = dir.join(&name);
                 if std::fs::write(&path, &bytes).is_ok() {
                     saved.push(path.to_string_lossy().into_owned());
                 }
@@ -1018,8 +1203,15 @@ async fn handle(
     let prior = sessions.lock().await.get(chat_id).cloned();
 
     // Register a cancel handle so `/stop` can interrupt this run; cleared below.
+    // Also record the triggering sender so ONLY they can answer this turn's
+    // AskUserQuestion (bound when render_loop sets `ask_file`).
     let cancel = Arc::new(Notify::new());
-    chat_states.lock().await.entry(chat_id.to_string()).or_default().cancel = Some(cancel.clone());
+    {
+        let mut states = chat_states.lock().await;
+        let st = states.entry(chat_id.to_string()).or_default();
+        st.cancel = Some(cancel.clone());
+        st.ask_owner = Some(turn_sender.to_string());
+    }
 
     // Per-turn answer file for the AskUserQuestion hook (unique → never stale).
     let ask_file = {
@@ -1086,23 +1278,22 @@ async fn handle(
     }
     // Clear the cancel + any pending-ask state (keep the per-chat model) now the
     // run is over, and drop the per-turn answer file.
-    if let Some(st) = chat_states.lock().await.get_mut(chat_id) { st.cancel = None; st.ask_file = None; }
+    if let Some(st) = chat_states.lock().await.get_mut(chat_id) { st.cancel = None; st.ask_file = None; st.ask_owner = None; }
     let _ = std::fs::remove_file(&ask_file);
     let _ = client.finalize(&msg_id).await;
     println!("→ finalized reply for chat {chat_id}");
     Ok(())
 }
 
-/// Drains a harness's `AgentEvent` stream → the streamed message.
+/// Drains a harness's `AgentEvent` stream → ordered markdoc deltas, with
+/// consecutive tool calls GROUPED into one collapsible `{% run %}` card.
 ///
-/// Assistant TEXT streams live, batched (≥240 bytes or ~120ms) for a smooth
-/// reply on a slow link. The process events (tool / bash / thinking) are NOT
-/// streamed one card each (the old noisy waterfall) — they're buffered into one
-/// collapsed `{% run %}` card emitted once at end of turn (below the answer).
-/// While tools run with no text yet, the bot bubble shows the client's own
-/// typing indicator — the "still working" bubble. AskUserQuestion is the one
-/// process event that can't wait for end-of-turn (it blocks until answered), so
-/// it's flushed live as an interactive `{% ask %}` card.
+/// The reply stays a live transcript IN ARRIVAL ORDER — but a run of back-to-back
+/// tool calls (no narration between them) collapses into one card labelled like
+/// "Ran 2 shell commands" / "Read 1 file, ran 1 shell command"; tapping it expands
+/// the real tool/output cards. Assistant TEXT separates groups: narration flushes
+/// the current group first, so it reads `…text… [run group] …text… [run group]`.
+/// AskUserQuestion flushes immediately (it blocks until answered).
 async fn render_loop(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     client: Client,
@@ -1112,17 +1303,25 @@ async fn render_loop(
     ask_file: String,
 ) {
     let mut names: HashMap<String, String> = HashMap::new();
-    let mut buf = String::new(); // live assistant-text buffer
-    let mut run_body = String::new(); // buffered process steps → one {% run %} card
-    let mut steps = 0usize;
-    let mut took: Option<f64> = None;
-    let mut tokens: Option<u64> = None;
+    let mut buf = String::new(); // narration text
+    let mut group = String::new(); // consecutive tool cards → one {% run %}
+    let mut counts: HashMap<&'static str, usize> = HashMap::new();
 
-    macro_rules! flush_text {
+    macro_rules! flush_buf {
         () => {
             if !buf.is_empty() {
                 let _ = client.append_delta(&msg_id, &buf).await;
                 buf.clear();
+            }
+        };
+    }
+    macro_rules! flush_group {
+        () => {
+            if !group.is_empty() {
+                let card = crate::render::run_card(&crate::render::run_summary(&counts), &group);
+                let _ = client.append_delta(&msg_id, &card).await;
+                group.clear();
+                counts.clear();
             }
         };
     }
@@ -1131,54 +1330,56 @@ async fn render_loop(
         match tokio::time::timeout(Duration::from_millis(120), rx.recv()).await {
             Ok(Some(ev)) => match &ev {
                 AgentEvent::Text(t) => {
+                    flush_group!(); // tools so far → one run card, before this narration
                     buf.push_str(t);
                     if buf.len() >= 240 {
-                        flush_text!();
+                        flush_buf!();
                     }
                 }
-                // AskUserQuestion blocks the turn — it can't wait for the
-                // end-of-turn collapse; flush pending text + the live card now,
-                // and mark this chat "awaiting answer".
+                // AskUserQuestion blocks the turn — flush everything + the live
+                // interactive card now, and mark this chat "awaiting answer".
                 AgentEvent::ToolCall { name, .. } if name.eq_ignore_ascii_case("AskUserQuestion") => {
-                    flush_text!();
+                    flush_buf!();
+                    flush_group!();
                     if let Some(s) = crate::render::render(&ev, &mut names) {
                         let _ = client.append_delta(&msg_id, &s).await;
                     }
                     chat_states.lock().await.entry(chat_id.clone()).or_default().ask_file =
                         Some(ask_file.clone());
                 }
-                AgentEvent::Done { duration_ms, tokens: tk, .. } => {
-                    took = *duration_ms;
-                    tokens = *tk;
+                AgentEvent::Done { .. } => {
+                    flush_buf!();
+                    flush_group!();
+                    if let Some(s) = crate::render::render(&ev, &mut names) {
+                        let _ = client.append_delta(&msg_id, &s).await; // {% result %}
+                    }
                 }
                 AgentEvent::Session(_) => {}
-                // tool / bash / thinking → one collapsed step line (buffered).
+                // tool / diff / bash result / thinking → into the current group.
                 _ => {
-                    if steps < 60 {
-                        if let Some(line) = crate::render::step_line(&ev, &mut names) {
-                            run_body.push_str(&line);
-                            run_body.push('\n');
-                            steps += 1;
-                        }
+                    flush_buf!(); // any narration before this group goes out first
+                    if let Some(k) = crate::render::tool_kind(&ev) {
+                        *counts.entry(k).or_insert(0) += 1;
+                    }
+                    if let Some(s) = crate::render::render(&ev, &mut names) {
+                        group.push_str(&s);
                     }
                 }
             },
             Ok(None) => break, // harness done → channel closed
             Err(_) => {
-                flush_text!(); // idle tick → keep text flowing smoothly
+                flush_buf!(); // keep narration smooth; the group keeps buffering
             }
         }
     }
-    flush_text!();
-    // The whole turn's work, collapsed into one card below the answer.
-    if !run_body.is_empty() {
-        let _ = client.append_delta(&msg_id, &crate::render::run_card(&run_body, took, tokens)).await;
-    }
+    flush_buf!();
+    flush_group!();
 }
 
 #[cfg(test)]
 mod gate_tests {
-    use super::mentions_me;
+    use super::{mentions_me, sanitize_attachment_name, AllowList};
+    use std::collections::HashSet;
 
     #[test]
     fn mention_matching() {
@@ -1193,5 +1394,75 @@ mod gate_tests {
         assert!(!mentions_me("ping @claude", "ops:claude"));                 // partial ≠ full handle
         assert!(!mentions_me("just chatting, no mention", "ops:claude"));
         assert!(!mentions_me("@opsclaudex", "ops:claude"));                  // longer handle ≠
+    }
+
+    /// Build an AllowList directly (bypassing the env var) so the `allows` logic
+    /// is tested deterministically regardless of the test process environment.
+    fn list(users: &[&str], anyone: bool) -> AllowList {
+        AllowList {
+            users: users.iter().map(|u| u.to_string()).collect::<HashSet<_>>(),
+            anyone,
+        }
+    }
+
+    #[test]
+    fn allowlist_owner_only_default() {
+        let a = list(&["ops"], false);
+        // owner may drive (case/space-insensitive)
+        assert!(a.allows("ops", false));
+        assert!(a.allows("OPS", false));
+        assert!(a.allows("  ops  ", false));
+        // anyone else is denied
+        assert!(!a.allows("mallory", false));
+        // a bot is denied even if it shares the owner-ish name unless listed
+        assert!(!a.allows("eve", true));
+    }
+
+    #[test]
+    fn allowlist_extra_users_added() {
+        let a = list(&["ops", "ada"], false);
+        assert!(a.allows("ops", false));
+        assert!(a.allows("ada", false));
+        assert!(!a.allows("bob", false));
+    }
+
+    #[test]
+    fn allowlist_star_allows_anyone_but_not_bots() {
+        let a = list(&["ops"], true);
+        assert!(a.allows("ops", false));
+        assert!(a.allows("anyone", false)); // `*` → any human
+        assert!(!a.allows("loopbot", true)); // but never a bot (no bot-drives-bot)
+        // an explicitly-listed bot still passes (owner opted it in)
+        let b = list(&["ops", "trustedbot"], true);
+        assert!(b.allows("trustedbot", true));
+    }
+
+    #[test]
+    fn allowlist_build_owner_default() {
+        // With no MAFOLD_ALLOWED_USERS set in this process, build() yields the
+        // owner only. (Guard against a stray env var so the assert is meaningful.)
+        if std::env::var("MAFOLD_ALLOWED_USERS").is_err() {
+            let a = AllowList::build(Some("Owner"));
+            assert!(a.allows("owner", false)); // lowercased
+            assert!(!a.allows("stranger", false));
+            assert!(!a.anyone);
+            // no owner + no env → nobody
+            let none = AllowList::build(None);
+            assert!(!none.allows("anyone", false));
+        }
+    }
+
+    #[test]
+    fn attachment_names_are_sanitized() {
+        assert_eq!(sanitize_attachment_name("photo.jpg"), "photo.jpg");
+        assert_eq!(sanitize_attachment_name("a-b_c.1.png"), "a-b_c.1.png");
+        // path traversal / absolute basenames collapse to a safe leaf
+        assert_eq!(sanitize_attachment_name("etc"), "etc"); // (file_name of `../../etc` is `etc`)
+        assert_eq!(sanitize_attachment_name(".."), "image.jpg");
+        assert_eq!(sanitize_attachment_name("."), "image.jpg");
+        assert_eq!(sanitize_attachment_name(""), "image.jpg");
+        // disallowed chars (incl. would-be separators) become `_`
+        assert_eq!(sanitize_attachment_name("a b/c.png"), "c.png"); // file_name drops the dir
+        assert_eq!(sanitize_attachment_name("we ird$.jpg"), "we_ird_.jpg");
     }
 }

@@ -7,6 +7,7 @@
 //! Auth is a bot token (`mb_…`) via --token or $MAFOLD_BOT_TOKEN.
 
 mod agent;
+mod apps;
 mod ask_hook;
 mod cards;
 mod client;
@@ -74,6 +75,11 @@ enum Cmd {
     Cards {
         #[command(subcommand)]
         cmd: cards::CardsCmd,
+    },
+    /// Author, preview, and publish developer mini-apps.
+    Apps {
+        #[command(subcommand)]
+        cmd: apps::AppsCmd,
     },
 
     // ── multi-daemon supervisor: one daemon per bot ──
@@ -152,6 +158,11 @@ async fn main() -> Result<()> {
         let Cmd::Cards { cmd } = cli.cmd else { unreachable!() };
         return cards::run(cmd, cli.base, cli.token).await;
     }
+    // Apps: init/dev need no token; publish/list/remove check for one themselves.
+    if matches!(cli.cmd, Cmd::Apps { .. }) {
+        let Cmd::Apps { cmd } = cli.cmd else { unreachable!() };
+        return apps::run(cmd, cli.base, cli.token).await;
+    }
 
     let token = cli
         .token
@@ -180,7 +191,7 @@ async fn main() -> Result<()> {
         Cmd::Add { name, workdir, harness } => supervisor::add(name, token, workdir, harness, &cli.base)?,
         Cmd::Chats => chats(&Client::new(cli.base, token)).await?,
         Cmd::Send { chat, text } => send(&Client::new(cli.base, token), &chat, &text.join(" ")).await?,
-        Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Cards { .. }
+        Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Cards { .. } | Cmd::Apps { .. }
         | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
         | Cmd::Rollback | Cmd::Supervise | Cmd::AskHook => unreachable!(),
     }

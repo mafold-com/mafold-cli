@@ -91,6 +91,20 @@ impl Harness for ClaudeCode {
         let stdout = child.stdout.take().context("no stdout")?;
         let mut lines = BufReader::new(stdout).lines();
 
+        // Drain stderr CONCURRENTLY: if `claude` writes more than the pipe buffer
+        // (~64KB) to stderr while we're blocked reading stdout / on wait(), the
+        // pipe fills, claude blocks on its write, and the turn deadlocks holding
+        // the conversation lock. A reader task keeps stderr flowing the whole turn.
+        let stderr_task = child.stderr.take().map(|se| {
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = String::new();
+                let mut se = se;
+                let _ = se.read_to_string(&mut buf).await;
+                buf
+            })
+        });
+
         let mut produced = false;
         let mut stopped = false;
         let mut session_id: Option<String> = None;
@@ -171,18 +185,21 @@ impl Harness for ClaudeCode {
 
         if stopped {
             let _ = child.wait().await; // reap the killed child; not an error
+            if let Some(t) = stderr_task { t.abort(); }
             return Ok(TurnOutcome { produced, stopped, session: session_id });
         }
         let status = child.wait().await?;
         if !status.success() {
-            let mut err = String::new();
-            if let Some(mut se) = child.stderr.take() {
-                use tokio::io::AsyncReadExt;
-                let _ = se.read_to_string(&mut err).await;
-            }
+            // The concurrent reader already drained stderr (no post-wait read that
+            // could have deadlocked) — just collect what it captured.
+            let err = match stderr_task {
+                Some(t) => t.await.unwrap_or_default(),
+                None => String::new(),
+            };
             let err = err.trim();
             bail!("claude exited unsuccessfully{}", if err.is_empty() { String::new() } else { format!(": {err}") });
         }
+        if let Some(t) = stderr_task { t.abort(); }
         Ok(TurnOutcome { produced, stopped, session: session_id })
     }
 

@@ -210,7 +210,10 @@ async fn cmd_list(base: String, token: Option<String>) -> Result<()> {
 
 // ───────────────────────────── esbuild ─────────────────────────────
 
-fn bundle_args(outfile: &str) -> Vec<String> {
+/// Build the esbuild bundle args. `extra_externals` lets the apps pipeline add
+/// `@mafold/app` / `@mafold/runtime-core` to the host-provided imports without
+/// forking the bundler invocation (see §「落地映射」of the unified-runtime spec).
+pub(crate) fn bundle_args_with(outfile: &str, extra_externals: &[&str]) -> Vec<String> {
     let mut a = vec![
         "--bundle".into(),
         "--format=cjs".into(),
@@ -218,10 +221,14 @@ fn bundle_args(outfile: &str) -> Vec<String> {
         "--jsx=automatic".into(),
         format!("--outfile={outfile}"),
     ];
-    for e in EXTERNALS {
+    for e in EXTERNALS.iter().chain(extra_externals.iter()) {
         a.push(format!("--external:{e}"));
     }
     a
+}
+
+fn bundle_args(outfile: &str) -> Vec<String> {
+    bundle_args_with(outfile, &[])
 }
 
 /// esbuild's per-platform npm package (the binary lives at package/bin/esbuild).
@@ -245,7 +252,7 @@ fn mafold_home() -> PathBuf {
 }
 
 /// Ensure a usable esbuild binary exists, fetching it once to ~/.mafold/bin.
-async fn ensure_esbuild() -> Result<PathBuf> {
+pub(crate) async fn ensure_esbuild() -> Result<PathBuf> {
     let bin = mafold_home().join("bin").join("esbuild");
     if bin.exists() {
         return Ok(bin);
@@ -300,7 +307,7 @@ fn read_manifest(dir: &str) -> Result<CardManifest> {
     serde_json::from_str(&text).context("mafold.card.json is not valid JSON")
 }
 
-fn write(path: &Path, contents: &str) -> Result<()> {
+pub(crate) fn write(path: &Path, contents: &str) -> Result<()> {
     std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))
 }
 
@@ -311,7 +318,7 @@ fn valid_tag(tag: &str) -> bool {
         && tag.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-fn title_case(tag: &str) -> String {
+pub(crate) fn title_case(tag: &str) -> String {
     tag.split('-')
         .map(|w| {
             let mut ch = w.chars();

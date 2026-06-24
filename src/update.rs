@@ -4,7 +4,9 @@
 //! - a cross-process **flock** (`~/.mafold/update.lock`) so only one updater
 //!   touches the binary at a time;
 //! - a **version stamp** so a second updater skips a download already done;
-//! - **SHA256** verification against the release's `SHA256SUMS` (when present);
+//! - **MANDATORY SHA256** verification against the release's `<asset>.sha256` —
+//!   the self-replacing binary runs `--dangerously-skip-permissions`, so an
+//!   unverifiable download (missing/unfetchable checksum) ABORTS the update;
 //! - a **pre-swap smoke test** (`<tmp> --version`) so a corrupt/wrong-arch binary
 //!   never gets swapped in;
 //! - a **backup** (`mafold.old`) for `mafold rollback`.
@@ -74,7 +76,8 @@ async fn latest(http: &reqwest::Client) -> Result<Release> {
 }
 
 /// The expected SHA256 for `asset_name`, from its sibling `<asset>.sha256` asset
-/// (published by the release workflow). Older releases lack it → verify skipped.
+/// (published by the release workflow). `None` if the asset is absent or the
+/// fetch fails → `apply` then ABORTS (an unverifiable binary is never swapped in).
 async fn sha256_for(http: &reqwest::Client, release: &serde_json::Value, asset_name: &str) -> Option<String> {
     let want = format!("{asset_name}.sha256");
     let url = release["assets"].as_array()?
@@ -148,12 +151,16 @@ pub async fn apply(http: &reqwest::Client, url: &str, version: &str, sha256: Opt
         return Ok(());
     }
     let bin = binary_path()?;
+    // Fail CLOSED: the binary we're about to swap in runs
+    // `--dangerously-skip-permissions`, so a download we can't verify is never
+    // applied. A missing/unfetchable `<asset>.sha256` aborts the update.
+    let want = sha256.context(
+        "release is missing its .sha256 checksum asset — refusing to update an unverifiable binary",
+    )?;
     let bytes = http.get(url).header("User-Agent", "mafold-cli").send().await?.error_for_status()?.bytes().await?;
-    if let Some(want) = sha256 {
-        let got = sha256_hex(&bytes);
-        if !got.eq_ignore_ascii_case(want) {
-            anyhow::bail!("checksum mismatch (want {want}, got {got}) — refusing to update");
-        }
+    let got = sha256_hex(&bytes);
+    if !got.eq_ignore_ascii_case(want) {
+        anyhow::bail!("checksum mismatch (want {want}, got {got}) — refusing to update");
     }
     // Unique temp per process so concurrent updaters never clobber each other.
     let tmp = bin.with_file_name(format!("mafold.new.{}", std::process::id()));
