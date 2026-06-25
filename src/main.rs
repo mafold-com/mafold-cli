@@ -151,6 +151,12 @@ async fn main() -> Result<()> {
         _ => {}
     }
     if matches!(cli.cmd, Cmd::Update) {
+        // No release binary is built for this platform (e.g. linux-arm64) → don't
+        // claim "up to date" (the check would always no-op). Be honest instead.
+        if !update::platform_supported() {
+            println!("no mafold release is built for your platform — self-update isn't available.\nSee https://github.com/mafold-com/mafold-cli/releases");
+            return Ok(());
+        }
         let http = reqwest::Client::new();
         match update::update_to_latest(&http).await {
             Ok(Some(v)) => println!("✓ updated to v{v} — restart a running agent with: mafold stop && mafold agent --detach …"),

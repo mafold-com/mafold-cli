@@ -37,18 +37,31 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             os: macos-latest
+            bin: mafold
           - target: x86_64-apple-darwin
             os: macos-latest
+            bin: mafold
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            bin: mafold
+          # The Windows binary is mafold.exe; the asset keeps the extension-less
+          # `mafold-<target>` name so the updater's lookup (mafold-{triple}) matches.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            bin: mafold.exe
     runs-on: ${{ matrix.os }}
+    # bash on every runner (windows-latest has Git Bash) so cp/shasum/awk/gh work
+    # uniformly — the default shell on windows-latest is pwsh, which lacks them.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }}
-      - run: cp "target/${{ matrix.target }}/release/mafold" "mafold-${{ matrix.target }}"
+      - run: cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "mafold-${{ matrix.target }}"
       # Per-asset checksum (the matrix can't share one SHA256SUMS file); the
       # updater verifies the binary against this before swapping it in.
       - run: shasum -a 256 "mafold-${{ matrix.target }}" | awk '{print $1}' > "mafold-${{ matrix.target }}.sha256"

@@ -42,9 +42,18 @@ fn target_triple() -> Option<&'static str> {
         Some("x86_64-apple-darwin")
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         Some("x86_64-unknown-linux-gnu")
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Some("x86_64-pc-windows-msvc")
     } else {
         None
     }
+}
+
+/// Whether self-update can run here — i.e. the release workflow builds a binary
+/// for this platform. False on e.g. linux-arm64, so `mafold update` can say
+/// "no build for your platform" instead of the misleading "already up to date".
+pub fn platform_supported() -> bool {
+    target_triple().is_some()
 }
 
 fn parse_semver(v: &str) -> (u64, u64, u64) {
@@ -186,7 +195,11 @@ pub async fn apply(http: &reqwest::Client, url: &str, version: &str, sha256: Opt
         anyhow::bail!("checksum mismatch (want {want}, got {got}) — refusing to update");
     }
     // Unique temp per process so concurrent updaters never clobber each other.
-    let tmp = bin.with_file_name(format!("mafold.new.{}", std::process::id()));
+    // Keep the binary's extension (Windows needs `.exe` to run the smoke test).
+    let tmp = match bin.extension().and_then(|e| e.to_str()) {
+        Some(ext) => bin.with_file_name(format!("mafold.new.{}.{ext}", std::process::id())),
+        None => bin.with_file_name(format!("mafold.new.{}", std::process::id())),
+    };
     std::fs::write(&tmp, &bytes)?;
     #[cfg(unix)]
     {
@@ -197,11 +210,51 @@ pub async fn apply(http: &reqwest::Client, url: &str, version: &str, sha256: Opt
         let _ = std::fs::remove_file(&tmp);
         anyhow::bail!("downloaded binary failed its `--version` smoke test — refusing to update");
     }
-    // Back up the current binary for `mafold rollback`, then atomically swap.
+    // Back up the current binary for `mafold rollback` (reading/copying a running
+    // exe is fine on every OS), then swap the new one in.
     let _ = std::fs::copy(&bin, bin.with_file_name("mafold.old"));
-    std::fs::rename(&tmp, &bin).context("failed to replace the binary")?;
+    install_running_binary(&tmp, &bin, true)?;
     let _ = std::fs::write(stamp_path(), version);
     Ok(())
+}
+
+/// Install `src` as `bin`, where `bin` may be the CURRENTLY RUNNING executable.
+/// Unix overwrites in place (rename/copy straight over it). Windows can't
+/// overwrite a running `.exe`, but it CAN rename the live file aside (the running
+/// process keeps executing the moved image), so we move it out of the way first,
+/// then put the new binary at the canonical path. `mv` renames `src` in (consumes
+/// it, for apply); `!mv` copies (keeps it, for rollback's backup).
+fn install_running_binary(src: &Path, bin: &Path, mv: bool) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let aside = bin.with_file_name(format!("mafold.prev.{}.exe", std::process::id()));
+        let _ = std::fs::remove_file(&aside);
+        if bin.exists() {
+            std::fs::rename(bin, &aside).context("failed to move the running binary aside")?;
+        }
+        let placed = if mv {
+            std::fs::rename(src, bin)
+        } else {
+            std::fs::copy(src, bin).map(|_| ())
+        };
+        if let Err(e) = placed {
+            let _ = std::fs::rename(&aside, bin); // undo so we never lose the binary
+            return Err(e).context("failed to place the new binary");
+        }
+        // Best-effort: the old image is still memory-mapped by the live process, so
+        // this may fail; it then lingers harmlessly until the next launch.
+        let _ = std::fs::remove_file(&aside);
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        if mv {
+            std::fs::rename(src, bin).context("failed to replace the binary")?;
+        } else {
+            std::fs::copy(src, bin).context("failed to restore the previous binary")?;
+        }
+        Ok(())
+    }
 }
 
 /// Restore the previous binary (`mafold.old`) — `mafold rollback`.
@@ -211,7 +264,7 @@ pub fn rollback() -> Result<()> {
     if !backup.exists() {
         anyhow::bail!("no backup to roll back to (looked for {})", backup.display());
     }
-    std::fs::copy(&backup, &bin).context("failed to restore the previous binary")?;
+    install_running_binary(&backup, &bin, false)?;
     let _ = std::fs::remove_file(stamp_path());
     println!("✓ rolled back to the previous binary ({})", backup.display());
     Ok(())
