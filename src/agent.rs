@@ -639,6 +639,16 @@ async fn connect_and_run(
         // @-mentioned inside a thread). `messageNew` carries the message at
         // `params`; `threadReply` nests it under `params.message`.
         let method = env.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        // A new cli release was published (server got the GitHub webhook) → check +
+        // apply NOW instead of waiting for the 10-min poll (which stays as backstop).
+        // maybe_update is idle-gated, so it never interrupts a turn; on success it
+        // re-execs into the new binary.
+        if method == "events.cliUpdate" {
+            let http = client.http.clone();
+            let coord = coord.clone();
+            tokio::spawn(async move { maybe_update(&http, &coord).await; });
+            continue;
+        }
         let raw_msg = match method {
             "events.messageNew" => env["params"].clone(),
             "events.threadReply" => env["params"]["message"].clone(),
