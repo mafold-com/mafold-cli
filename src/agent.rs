@@ -529,7 +529,7 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     let mut backoff = 1u64;
     let mut last_update_check = std::time::Instant::now();
     loop {
-        if let Err(e) = connect_and_run(&client, &workdir, &my_username, &sessions, &coord, &chat_states, &bot_msg_ids, &harness, &owner, &allow).await {
+        if let Err(e) = connect_and_run(&client, &workdir, &my_username, &sessions, &coord, &chat_states, &bot_msg_ids, &harness, &owner, &allow, auto_update).await {
             eprintln!("connection error: {e}");
         }
         // A dropped WS is a natural idle moment → opportunistically self-update,
@@ -609,6 +609,9 @@ async fn connect_and_run(
     harness: &Arc<dyn Harness>,
     owner: &Arc<OwnerConfig>,
     allow: &Arc<AllowList>,
+    // Standalone agent (true) self-updates on cliUpdate; a supervised child
+    // (--no-auto-update → false) nudges the supervisor to update instead.
+    auto_update: bool,
 ) -> Result<()> {
     let (ws, _) = tokio_tungstenite::connect_async(client.ws_request())
         .await
@@ -644,9 +647,19 @@ async fn connect_and_run(
         // maybe_update is idle-gated, so it never interrupts a turn; on success it
         // re-execs into the new binary.
         if method == "events.cliUpdate" {
-            let http = client.http.clone();
-            let coord = coord.clone();
-            tokio::spawn(async move { maybe_update(&http, &coord).await; });
+            if auto_update {
+                // Standalone agent: self-update now (idle-gated, re-execs on success).
+                let http = client.http.clone();
+                let coord = coord.clone();
+                tokio::spawn(async move { maybe_update(&http, &coord).await; });
+            } else {
+                // Supervised (--no-auto-update): the SUPERVISOR owns updates and
+                // respawns us on the new binary. Don't self-re-exec out from under
+                // it — just nudge it to check immediately (instead of waiting for
+                // its 10-min poll).
+                crate::update::request_nudge();
+                println!("↻ cliUpdate received — nudged supervisor to update");
+            }
             continue;
         }
         // The run-card Stop button (relayed by the API as events.cancelRun, NOT a

@@ -17,13 +17,16 @@ jobs:
   create-release:
     runs-on: ubuntu-latest
     steps:
-      - name: Ensure the release exists
+      # Create it as a DRAFT — a draft fires no `published` webhook and is excluded
+      # from releases/latest, so neither the instant cliUpdate path nor the poll
+      # see it until the `publish` job (below) flips it live with assets attached.
+      - name: Ensure the release exists (draft)
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
                  --title "$TAG" --notes "Automated release $TAG."
 
   build:
@@ -60,3 +63,17 @@ jobs:
             "mafold-${{ matrix.target }}" \
             "mafold-${{ matrix.target }}.sha256" \
             --repo "$GITHUB_REPOSITORY" --clobber
+
+  # Flip the draft live ONLY after every asset is uploaded, so the GitHub `release`
+  # `published` webhook (→ api /githubWebhook → events.cliUpdate → daemons update)
+  # fires when the binaries actually exist. Otherwise the instant update races an
+  # empty release and falls back to the 10-min poll.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false

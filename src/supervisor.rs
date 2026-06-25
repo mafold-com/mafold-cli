@@ -318,9 +318,13 @@ pub async fn supervise(base: String) {
                 }
             }
         }
-        // Update check every 10 min (60 × 10s) — matches the standalone agent.
+        // Update check every 10 min (60 × 10s), OR immediately when an agent child
+        // nudged us (it relayed an events.cliUpdate) — so a new release lands in
+        // seconds via the webhook path, not only on the 10-min poll.
         ticks += 1;
-        if ticks % 60 == 0 {
+        let nudged = crate::update::take_nudge();
+        if nudged || ticks % 60 == 0 {
+            if nudged { println!("↻ update nudge from a daemon — checking now"); }
             match crate::update::check(&http).await {
                 Ok(Some(r)) => {
                     println!("↻ update v{} available — applying + restarting daemons…", r.version);

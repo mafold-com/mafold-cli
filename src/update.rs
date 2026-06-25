@@ -115,6 +115,29 @@ fn acquire_lock() -> Result<Lock> {
 fn stamp_path() -> PathBuf { mafold_dir().join("installed-version") }
 fn read_stamp() -> Option<String> { std::fs::read_to_string(stamp_path()).ok().map(|s| s.trim().to_string()) }
 
+// ── supervisor update nudge ──
+fn nudge_path() -> PathBuf { mafold_dir().join("update-nudge") }
+/// Ask the supervisor to run an update check NOW. A `--no-auto-update` agent
+/// child writes this on `events.cliUpdate` (supervised mode) so the SUPERVISOR —
+/// which owns updates and respawns children — applies it, instead of the child
+/// self-re-execing out from under the supervisor.
+pub fn request_nudge() {
+    let p = nudge_path();
+    if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
+    let _ = std::fs::write(p, b"");
+}
+/// Consume a pending update nudge (true if one was set). The supervisor checks
+/// this each loop tick for an immediate (non-poll) update.
+pub fn take_nudge() -> bool {
+    let p = nudge_path();
+    if p.exists() {
+        let _ = std::fs::remove_file(&p);
+        true
+    } else {
+        false
+    }
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
