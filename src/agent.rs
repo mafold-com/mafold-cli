@@ -649,6 +649,42 @@ async fn connect_and_run(
             tokio::spawn(async move { maybe_update(&http, &coord).await; });
             continue;
         }
+        // The run-card Stop button (relayed by the API as events.cancelRun, NOT a
+        // `/stop` chat message). Authorization is enforced HERE by the same
+        // AllowList that gates all interaction: an allow-listed sender cancels the
+        // running turn (reusing the per-chat cancel Notify); anyone else gets a
+        // directed alert pushed back, and the run keeps going.
+        if method == "events.cancelRun" {
+            let conv_id = env["params"]["conversation_id"].as_str().unwrap_or("").to_string();
+            let from = env["params"]["from"].as_str().unwrap_or("").to_string();
+            if allow.allows(&from, false) {
+                cancel_run(chat_states, &conv_id).await;
+            } else {
+                println!("← stop from @{from} (not authorized → alert)");
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let _ = client
+                        .push_alert(&from, Some("Can't stop"), "Only the bot's owner (or an allow-listed user) can stop this run.", "error")
+                        .await;
+                });
+            }
+            continue;
+        }
+        // Inline query: the user is typing `@me …` (not sent yet). The API relays
+        // it here and waits briefly for an answer; we reply with card(s)/results
+        // via answerInlineQuery. Spawned so a slow handler never stalls the loop.
+        if method == "events.inlineQuery" {
+            let query_id = env["params"]["query_id"].as_str().unwrap_or("").to_string();
+            let query = env["params"]["query"].as_str().unwrap_or("").to_string();
+            if !query_id.is_empty() {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let results = inline_results(&query);
+                    let _ = client.answer_inline_query(&query_id, results).await;
+                });
+            }
+            continue;
+        }
         let raw_msg = match method {
             "events.messageNew" => env["params"].clone(),
             "events.threadReply" => env["params"]["message"].clone(),
@@ -848,6 +884,34 @@ fn is_control(name: &str) -> bool {
     matches!(name, "clear" | "new" | "compact" | "stop" | "model" | "think" | "status" | "cwd" | "help")
 }
 
+/// v0 inline-query handler. The full plumbing (client → API → daemon → API →
+/// client) is what this feature delivers; this handler is intentionally minimal:
+/// it turns the typed query into a single "send this" suggestion so the @bot
+/// inline round-trip is observable end-to-end. Results are message bodies (a
+/// result MAY contain `{% card %}` tags) — picking one sends it as a message.
+/// Richer, per-bot inline handlers (returning real cards) are a follow-up.
+fn inline_results(query: &str) -> Vec<String> {
+    let q = query.trim();
+    if q.is_empty() {
+        Vec::new()
+    } else {
+        vec![q.to_string()]
+    }
+}
+
+/// Signal the in-flight turn for `chat_id` to cancel (if any), reusing the
+/// per-chat cancel `Notify`. Shared by `/stop` and the run-card Stop button
+/// (events.cancelRun). Returns true if a run was actually signalled.
+async fn cancel_run(chat_states: &ChatStates, chat_id: &str) -> bool {
+    let notify = chat_states.lock().await.get(chat_id).and_then(|s| s.cancel.clone());
+    if let Some(n) = notify {
+        n.notify_one();
+        true
+    } else {
+        false
+    }
+}
+
 /// Run a daemon control command. Replies in-chat; never invokes claude.
 #[allow(clippy::too_many_arguments)]
 async fn handle_control(
@@ -877,11 +941,8 @@ async fn handle_control(
             tokio::spawn(async move { compact_session(client, workdir, chat_id, sessions).await; });
         }
         "stop" => {
-            let notify = chat_states.lock().await.get(chat_id).and_then(|s| s.cancel.clone());
-            if let Some(n) = notify {
-                n.notify_one();
-                // The running task finalizes its draft with a stop notice.
-            } else {
+            // The running task finalizes its draft with a stop notice.
+            if !cancel_run(chat_states, chat_id).await {
                 let _ = client.send(chat_id, "Nothing is running right now.").await;
             }
         }

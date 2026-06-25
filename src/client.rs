@@ -158,6 +158,26 @@ impl Client {
         Ok(())
     }
 
+    /// Push a directed alert popup to a single user (Telegram answerCallbackQuery
+    /// `show_alert` analog). Used to tell a non-allow-listed user their Stop
+    /// request was denied. `level` ∈ {info, success, error}.
+    pub async fn push_alert(&self, to: &str, title: Option<&str>, text: &str, level: &str) -> Result<()> {
+        let mut body = json!({ "to_username": to, "text": text, "level": level });
+        if let Some(t) = title {
+            body["title"] = json!(t);
+        }
+        self.post("pushAlert", body).await?;
+        Ok(())
+    }
+
+    /// Answer a pending inline query (the user is typing `@me …`). `results` are
+    /// message bodies — each may carry `{% card %}` tags; the client shows them as
+    /// pickable suggestions and sends the chosen one.
+    pub async fn answer_inline_query(&self, query_id: &str, results: Vec<String>) -> Result<()> {
+        self.post("answerInlineQuery", json!({ "query_id": query_id, "results": results })).await?;
+        Ok(())
+    }
+
     // ── developer card registry ──
     /// Publish a compiled card bundle. `meta` carries tag/version/displayName.
     pub async fn publish_card(&self, meta: &Value, bundle: Vec<u8>) -> Result<Value> {
