@@ -141,15 +141,32 @@ impl AllowList {
     }
 }
 
-// ── per-conversation live control state (in-memory) ──
-// `model` overrides the model for this chat (`/model …`); `cancel`, when a run
-// is in flight, lets `/stop` interrupt it. Both keyed by conversation id.
+// ── per-turn live control state (in-memory) ──
+// One conversation can have SEVERAL turns in flight at once (the user fired more
+// than one task, or the daemon serves it concurrently). Each turn is keyed by its
+// own draft message id, so `/stop`, the run-card Stop button, and AskUserQuestion
+// answers can each target the right one.
+struct TurnHandle {
+    /// Interrupt this turn's run (run-card Stop on this draft → cancel just it;
+    /// `/stop` → cancel every turn in the conversation).
+    cancel: Arc<Notify>,
+    /// Set while THIS turn is BLOCKED on an AskUserQuestion: the file its hook
+    /// polls. The user answers by REPLYING to this turn's draft message; that
+    /// reply's text is written here (which turn it belongs to is the reply target,
+    /// so concurrent asks never cross). Cleared when consumed or the turn ends.
+    ask_file: Option<String>,
+    /// The lowercased username that triggered this turn (only they may answer its
+    /// AskUserQuestion — a bystander can't answer someone else's agent question).
+    owner: String,
+}
+
+// `model` overrides the model for this chat (`/model …`). Conversation-scoped;
+// the in-flight turns live in `turns` (keyed by draft message id).
 #[derive(Default)]
 struct ChatState {
     model: Option<String>,
     /// Extended-thinking budget for this chat (`/think`), in tokens. None = off.
     thinking: Option<u32>,
-    cancel: Option<Arc<Notify>>,
     /// When a `/login` is in flight in this chat, the channel that delivers the
     /// pasted auth code to the waiting `claude auth login` process.
     login_code_tx: Option<tokio::sync::mpsc::Sender<String>>,
@@ -157,15 +174,8 @@ struct ChatState {
     /// that same sender may relay the pasted OAuth code (a shared-group bot must
     /// not let a bystander inject a code into someone else's sign-in).
     login_owner: Option<String>,
-    /// Set while the current turn is BLOCKED on an AskUserQuestion: the file the
-    /// hook is polling. The next chat message is the user's answer → write it
-    /// here (don't start a new turn). Set on the `AskUserQuestion` tool call,
-    /// cleared when consumed or the turn ends.
-    ask_file: Option<String>,
-    /// The lowercased username that triggered the in-flight turn. Only that same
-    /// sender may answer its AskUserQuestion (so one participant can't answer
-    /// another user's agent question in a shared group).
-    ask_owner: Option<String>,
+    /// In-flight turns, keyed by their draft message id. Concurrent turns coexist.
+    turns: HashMap<String, TurnHandle>,
     /// Cached group-dispatch gate for this conversation (kind + always-on),
     /// refreshed at most once per 60s so the reply gate stays ~free.
     gate: Option<ConvGate>,
@@ -200,31 +210,21 @@ impl BotMsgMemory {
 }
 type BotMsgIds = Arc<std::sync::Mutex<BotMsgMemory>>;
 
-/// Per-conversation execution coordination. Turns in DIFFERENT conversations run
-/// concurrently; turns in the SAME conversation serialize (one Claude session
-/// can't be resumed twice at once). They share one workdir, so two chats editing
-/// the same files at once can clash — that's on the user to avoid. `active`
-/// counts in-flight turns so the self-updater only re-execs when everything's idle.
+/// Execution coordination. Turns run CONCURRENTLY — across conversations AND
+/// within one conversation (each turn has its own draft + claude session; a
+/// conversation's session forks when two turns overlap). They share one workdir,
+/// so two turns editing the same files at once can clash — that's on the user to
+/// avoid (per-turn worktree isolation is a future hardening). `active` counts
+/// in-flight turns so the self-updater only re-execs when everything's idle.
 struct ExecCoord {
-    conv: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
     active: std::sync::atomic::AtomicUsize,
 }
 
 impl ExecCoord {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            conv: std::sync::Mutex::new(HashMap::new()),
             active: std::sync::atomic::AtomicUsize::new(0),
         })
-    }
-    /// This conversation's turn lock (created on first use).
-    fn conv_lock(&self, chat_id: &str) -> Arc<Mutex<()>> {
-        self.conv
-            .lock()
-            .unwrap()
-            .entry(chat_id.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
     }
     /// True when no turn is running anywhere → safe for the self-updater to re-exec.
     fn idle(&self) -> bool {
@@ -670,8 +670,14 @@ async fn connect_and_run(
         if method == "events.cancelRun" {
             let conv_id = env["params"]["conversation_id"].as_str().unwrap_or("").to_string();
             let from = env["params"]["from"].as_str().unwrap_or("").to_string();
+            // The Stop button carries the draft's message_id → cancel just THAT
+            // turn. Absent (older clients) → cancel every turn in the conversation.
+            let msg_id = env["params"]["message_id"].as_str().map(str::to_string);
             if allow.allows(&from, false) {
-                cancel_run(chat_states, &conv_id).await;
+                match &msg_id {
+                    Some(mid) => { cancel_turn(chat_states, &conv_id, mid).await; }
+                    None => { cancel_all(chat_states, &conv_id).await; }
+                }
             } else {
                 println!("← stop from @{from} (not authorized → alert)");
                 let client = client.clone();
@@ -732,7 +738,7 @@ async fn connect_and_run(
         let redact = {
             let states = chat_states.lock().await;
             states.get(&m.conversation_id)
-                .map(|s| s.login_code_tx.is_some() || s.ask_file.is_some())
+                .map(|s| s.login_code_tx.is_some() || s.turns.values().any(|t| t.ask_file.is_some()))
                 .unwrap_or(false)
         };
         if redact {
@@ -771,24 +777,29 @@ async fn connect_and_run(
             continue;
         }
 
-        // If this turn is BLOCKED on an AskUserQuestion, this message is the
-        // user's answer — hand it to the waiting hook (via its answer file) and
-        // don't start a new turn. `/stop` still falls through to cancel the run.
-        // Only the SAME sender who triggered the turn may answer it (so one
-        // participant can't answer another user's agent question in a group).
-        let pending_ask = {
+        // AskUserQuestion answer routing (concurrency-safe): a turn blocked on an
+        // ask is answered by REPLYING to that turn's draft message. The reply
+        // target (message_id) picks the exact turn, so two concurrent asks never
+        // cross. Only the turn's own triggering sender may answer it. `/stop`
+        // falls through to cancel instead.
+        let pending_ask: Option<(String, String)> = if let Some(rid) = m.reply_to_id.as_deref() {
             let states = chat_states.lock().await;
-            states.get(&m.conversation_id).and_then(|s| {
-                match (&s.ask_file, &s.ask_owner) {
-                    (Some(f), Some(o)) if *o == sender_lc => Some(f.clone()),
+            states
+                .get(&m.conversation_id)
+                .and_then(|s| s.turns.get(rid))
+                .and_then(|t| match &t.ask_file {
+                    Some(f) if t.owner == sender_lc => Some((rid.to_string(), f.clone())),
                     _ => None,
-                }
-            })
+                })
+        } else {
+            None
         };
-        if let Some(ask_file) = pending_ask {
+        if let Some((rid, ask_file)) = pending_ask {
             if !(trimmed.eq_ignore_ascii_case("/stop") || trimmed.eq_ignore_ascii_case("/cancel")) {
                 let _ = std::fs::write(&ask_file, m.content.trim());
-                if let Some(s) = chat_states.lock().await.get_mut(&m.conversation_id) { s.ask_file = None; }
+                if let Some(s) = chat_states.lock().await.get_mut(&m.conversation_id) {
+                    if let Some(t) = s.turns.get_mut(&rid) { t.ask_file = None; }
+                }
                 continue;
             }
         }
@@ -912,11 +923,29 @@ fn inline_results(query: &str) -> Vec<String> {
     }
 }
 
-/// Signal the in-flight turn for `chat_id` to cancel (if any), reusing the
-/// per-chat cancel `Notify`. Shared by `/stop` and the run-card Stop button
-/// (events.cancelRun). Returns true if a run was actually signalled.
-async fn cancel_run(chat_states: &ChatStates, chat_id: &str) -> bool {
-    let notify = chat_states.lock().await.get(chat_id).and_then(|s| s.cancel.clone());
+/// Cancel EVERY in-flight turn in a conversation (the `/stop` command). Returns
+/// how many were signalled.
+async fn cancel_all(chat_states: &ChatStates, chat_id: &str) -> usize {
+    let notifies: Vec<Arc<Notify>> = chat_states
+        .lock()
+        .await
+        .get(chat_id)
+        .map(|s| s.turns.values().map(|t| t.cancel.clone()).collect())
+        .unwrap_or_default();
+    for n in &notifies {
+        n.notify_one();
+    }
+    notifies.len()
+}
+
+/// Cancel ONE turn by its draft message id (the run-card Stop button → it stops
+/// just that card's turn). Returns true if a matching turn was signalled.
+async fn cancel_turn(chat_states: &ChatStates, chat_id: &str, msg_id: &str) -> bool {
+    let notify = chat_states
+        .lock()
+        .await
+        .get(chat_id)
+        .and_then(|s| s.turns.get(msg_id).map(|t| t.cancel.clone()));
     if let Some(n) = notify {
         n.notify_one();
         true
@@ -954,8 +983,9 @@ async fn handle_control(
             tokio::spawn(async move { compact_session(client, workdir, chat_id, sessions).await; });
         }
         "stop" => {
-            // The running task finalizes its draft with a stop notice.
-            if !cancel_run(chat_states, chat_id).await {
+            // `/stop` stops EVERY in-flight turn in this conversation; each running
+            // task finalizes its own draft with a stop notice.
+            if cancel_all(chat_states, chat_id).await == 0 {
                 let _ = client.send(chat_id, "Nothing is running right now.").await;
             }
         }
@@ -1009,7 +1039,7 @@ async fn handle_control(
                 let states = chat_states.lock().await;
                 let st = states.get(chat_id);
                 (
-                    st.map(|s| s.cancel.is_some()).unwrap_or(false),
+                    st.map(|s| !s.turns.is_empty()).unwrap_or(false),
                     st.and_then(|s| s.model.clone()).unwrap_or_else(|| "default".into()),
                     st.and_then(|s| s.thinking),
                 )
@@ -1402,8 +1432,6 @@ async fn handle(
     turn_sender: &str,
     group_context: Option<String>,
 ) -> Result<()> {
-    let msg_id = client.create_draft(chat_id, thread_root).await?;
-
     // Multi-party group context (untrusted, prepended) so the bot follows the
     // conversation the access gate would otherwise hide. None for DMs.
     let mut full_prompt = match &group_context {
@@ -1439,23 +1467,15 @@ async fn handle(
         );
     }
 
-    // Mark a turn in-flight (gates the self-updater), then serialize ONLY within
-    // this conversation — other conversations run in parallel.
+    // Mark a turn in-flight (gates the self-updater). NO conversation lock:
+    // turns run CONCURRENTLY — each gets its own draft, claude session, and
+    // renderer, so the bot can serve several tasks/chats at once.
     let _turn = TurnGuard::new(coord);
-    let conv_lock = coord.conv_lock(chat_id);
-    let _guard = conv_lock.lock().await;
+    // Snapshot the conversation's session to resume from (context so far). Truly
+    // concurrent turns fork from this same parent; the chat-history re-injection
+    // above keeps continuity, and whichever turn finishes last advances the
+    // canonical session id (below).
     let prior = sessions.lock().await.get(chat_id).cloned();
-
-    // Register a cancel handle so `/stop` can interrupt this run; cleared below.
-    // Also record the triggering sender so ONLY they can answer this turn's
-    // AskUserQuestion (bound when render_loop sets `ask_file`).
-    let cancel = Arc::new(Notify::new());
-    {
-        let mut states = chat_states.lock().await;
-        let st = states.entry(chat_id.to_string()).or_default();
-        st.cancel = Some(cancel.clone());
-        st.ask_owner = Some(turn_sender.to_string());
-    }
 
     // Per-turn answer file for the AskUserQuestion hook (unique → never stale).
     let ask_file = {
@@ -1464,6 +1484,20 @@ async fn handle(
         let safe: String = chat_id.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
         std::env::temp_dir().join(format!("mafold-ask-{safe}-{nanos}.txt")).to_string_lossy().into_owned()
     };
+
+    // Open the draft NOW (right before streaming) so a turn never shows an empty
+    // bubble while it sets up. Register it keyed by its draft id, so `/stop`, the
+    // Stop button, and ask-answers (reply → this draft) can target THIS turn.
+    let cancel = Arc::new(Notify::new());
+    let msg_id = client.create_draft(chat_id, thread_root).await?;
+    {
+        let mut states = chat_states.lock().await;
+        let st = states.entry(chat_id.to_string()).or_default();
+        st.turns.insert(
+            msg_id.clone(),
+            TurnHandle { cancel: cancel.clone(), ask_file: None, owner: turn_sender.to_string() },
+        );
+    }
 
     let turn = Turn {
         prompt: full_prompt,
@@ -1520,9 +1554,9 @@ async fn handle(
             let _ = client.append_delta(&msg_id, &format!("⚠️ Agent error: {e}")).await;
         }
     }
-    // Clear the cancel + any pending-ask state (keep the per-chat model) now the
-    // run is over, and drop the per-turn answer file.
-    if let Some(st) = chat_states.lock().await.get_mut(chat_id) { st.cancel = None; st.ask_file = None; st.ask_owner = None; }
+    // Drop this turn's handle (cancel + pending-ask) now the run is over; the
+    // per-chat model/gate stay. Drop the per-turn answer file.
+    if let Some(st) = chat_states.lock().await.get_mut(chat_id) { st.turns.remove(&msg_id); }
     let _ = std::fs::remove_file(&ask_file);
     let _ = client.finalize(&msg_id).await;
     println!("→ finalized reply for chat {chat_id}");
@@ -1604,7 +1638,9 @@ async fn render_loop(
                     push_running!(false);
                 }
                 // AskUserQuestion blocks the turn — commit everything + the live
-                // interactive card now (force-push), mark this chat "awaiting answer".
+                // interactive card now (force-push), and mark THIS turn (by its
+                // draft id) awaiting an answer. The user answers by replying to this
+                // draft, so concurrent asks in one conversation never cross.
                 AgentEvent::ToolCall { name, .. } if name.eq_ignore_ascii_case("AskUserQuestion") => {
                     commit_buf!();
                     commit_group!();
@@ -1612,8 +1648,11 @@ async fn render_loop(
                         full.push_str(&s);
                     }
                     push_running!(true);
-                    chat_states.lock().await.entry(chat_id.clone()).or_default().ask_file =
-                        Some(ask_file.clone());
+                    if let Some(st) = chat_states.lock().await.get_mut(&chat_id) {
+                        if let Some(t) = st.turns.get_mut(&msg_id) {
+                            t.ask_file = Some(ask_file.clone());
+                        }
+                    }
                 }
                 AgentEvent::Done { .. } => {
                     commit_buf!();
