@@ -63,8 +63,12 @@ jobs:
       - run: cargo build --release --target ${{ matrix.target }}
       - run: cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "mafold-${{ matrix.target }}"
       # Per-asset checksum (the matrix can't share one SHA256SUMS file); the
-      # updater verifies the binary against this before swapping it in.
-      - run: shasum -a 256 "mafold-${{ matrix.target }}" | awk '{print $1}' > "mafold-${{ matrix.target }}.sha256"
+      # updater verifies the binary against this before swapping it in. macOS has
+      # `shasum` (no coreutils); Linux + Windows Git Bash have `sha256sum` (no
+      # `shasum`). Use whichever exists — both print "<hash>  <file>".
+      - run: |
+          f="mafold-${{ matrix.target }}"
+          if command -v sha256sum >/dev/null 2>&1; then sha256sum "$f"; else shasum -a 256 "$f"; fi | awk '{print $1}' > "$f.sha256"
       # Upload to the pre-created release. No create here → no race. --clobber
       # makes a re-run replace its own asset instead of failing.
       - name: Upload release assets
