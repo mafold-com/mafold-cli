@@ -822,7 +822,7 @@ async fn connect_and_run(
             }
             // Rebuild multi-party group context the access gate dropped (None for
             // DMs / when there's nothing the resumed session is missing).
-            let group_context = recent_group_context(&client, &chat_id, &me_user, &turn_sender, &trigger_id).await;
+            let group_context = recent_group_context(&client, &chat_id, &me_user, &turn_sender, &trigger_id, thread_root.as_deref()).await;
             if let Err(e) = handle(&client, &workdir, &chat_id, thread_root.as_deref(), &content, &attachments, &sessions, &coord, &chat_states, &harness, model, thinking, system, &turn_sender, group_context).await {
                 eprintln!("handle error: {e}");
             }
@@ -1236,11 +1236,19 @@ async fn recent_group_context(
     my_username: &str,
     _trigger_sender_lc: &str,
     trigger_id: &str,
+    thread_root: Option<&str>,
 ) -> Option<String> {
     const MAX_MSGS: usize = 30; // cap injected lines (recent-most kept)
     const MAX_CHARS: usize = 600; // cap per-message length (anti-bloat / anti-flood)
     let me_lc = my_username.trim().to_lowercase();
-    let page = client.get_chat_history(chat_id, 50).await.ok()?;
+    // When the turn fired INSIDE a thread, pull the THREAD's history (root +
+    // replies) — thread replies aren't in the channel's main timeline, so the
+    // bot would otherwise only see the channel and be blind to the thread it's
+    // replying in. Top-level turns use the channel history.
+    let page = match thread_root {
+        Some(root) => client.get_thread_messages(chat_id, root, 50).await.ok()?,
+        None => client.get_chat_history(chat_id, 50).await.ok()?,
+    };
     let items = page.get("items").and_then(|i| i.as_array())?;
     let mut rows: Vec<(String, String, String)> = Vec::new(); // (created_at, who, body)
     for msg in items {

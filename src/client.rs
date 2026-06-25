@@ -52,6 +52,17 @@ impl Client {
         self.post("getChatHistory", json!({ "chat_id": chat_id, "limit": limit })).await
     }
 
+    /// A thread's messages (root + replies) — used to rebuild context when the
+    /// bot is @-mentioned INSIDE a thread (thread replies aren't in the channel's
+    /// main timeline, so getChatHistory alone misses them).
+    pub async fn get_thread_messages(&self, chat_id: &str, root_message_id: &str, limit: usize) -> Result<Value> {
+        self.post(
+            "getThreadMessages",
+            json!({ "chat_id": chat_id, "root_message_id": root_message_id, "limit": limit }),
+        )
+        .await
+    }
+
     /// Per-group bot dispatch settings (`{ items: [{ bot, always_on }] }`) —
     /// tells the daemon whether it's set to always-on in this group.
     pub async fn group_bots(&self, chat_id: &str) -> Result<Value> {
