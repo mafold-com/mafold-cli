@@ -44,6 +44,14 @@ impl Client {
         self.post("getChat", json!({ "chat_id": chat_id })).await
     }
 
+    /// Recent messages in a conversation (`{ items: [Message] }`). The access
+    /// gate drops non-owner messages so they never reach claude's resumed
+    /// session; for a group turn the daemon re-fetches history to rebuild the
+    /// multi-party context (see `recent_group_context`).
+    pub async fn get_chat_history(&self, chat_id: &str, limit: usize) -> Result<Value> {
+        self.post("getChatHistory", json!({ "chat_id": chat_id, "limit": limit })).await
+    }
+
     /// Per-group bot dispatch settings (`{ items: [{ bot, always_on }] }`) —
     /// tells the daemon whether it's set to always-on in this group.
     pub async fn group_bots(&self, chat_id: &str) -> Result<Value> {
@@ -124,6 +132,14 @@ impl Client {
     }
     pub async fn append_delta(&self, message_id: &str, delta: &str) -> Result<()> {
         self.post("botAppendDelta", json!({ "message_id": message_id, "delta": delta })).await?;
+        Ok(())
+    }
+
+    /// Replace a streaming draft's FULL content (Telegram `sendMessageDraft`
+    /// style — each push is the complete snapshot, so we can rewrite earlier
+    /// output, e.g. swap a trailing `{% generating %}` card for `{% result %}`).
+    pub async fn edit_draft(&self, message_id: &str, content: &str) -> Result<()> {
+        self.post("botEditDraft", json!({ "message_id": message_id, "content": content })).await?;
         Ok(())
     }
     pub async fn finalize(&self, message_id: &str) -> Result<()> {
