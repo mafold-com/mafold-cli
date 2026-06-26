@@ -242,6 +242,32 @@ impl Client {
         Ok(v["result"].clone())
     }
 
+    /// Upload a media asset (e.g. an app logo) via `/api/uploadFile`. Returns the
+    /// bare `MediaUploadResponse` (`{media_id, url, mime, size_bytes, filename?}`)
+    /// — NOT the `{ok,result}` envelope — with `url` = a served `/media/…` path.
+    pub async fn upload_media(&self, bytes: Vec<u8>, filename: &str, mime: &str) -> Result<Value> {
+        let form = reqwest::multipart::Form::new().part(
+            "file",
+            reqwest::multipart::Part::bytes(bytes)
+                .file_name(filename.to_string())
+                .mime_str(mime)?,
+        );
+        let resp = self
+            .http
+            .post(format!("{}/api/uploadFile", self.base))
+            .bearer_auth(&self.token)
+            .multipart(form)
+            .send()
+            .await
+            .context("uploadFile request failed")?;
+        let status = resp.status();
+        let text = resp.text().await.context("uploadFile: reading body")?;
+        if !status.is_success() {
+            anyhow::bail!("uploadFile failed ({status}): {text}");
+        }
+        serde_json::from_str(&text).context("uploadFile returned non-JSON")
+    }
+
     /// Every mini-app whose namespace the caller may manage (the "my apps" view).
     pub async fn list_apps(&self) -> Result<Value> {
         self.post("listApps", json!({})).await

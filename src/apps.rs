@@ -160,7 +160,7 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
     let token = token.context(
         "publish needs your bot token — pass --token or set $MAFOLD_BOT_TOKEN",
     )?;
-    let manifest = read_manifest(dir)?;
+    let mut manifest = read_manifest(dir)?;
     let (_owner, slug) = parse_app_id(&manifest.id)
         .context("mafold.app.json id must be `owner/slug` (reverse-DNS is no longer valid)")?;
     if manifest.version.trim().is_empty() {
@@ -169,6 +169,25 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
     let entry = Path::new(dir).join(&manifest.entry);
     if !entry.exists() {
         anyhow::bail!("entry not found: {}", entry.display());
+    }
+
+    let client = Client::new(base, token);
+
+    // If `icon` points at a LOCAL image file (relative to the project dir),
+    // upload it and rewrite `icon` to the served `/media/…` path so the published
+    // manifest carries a real logo. A lucide glyph name or an existing URL is
+    // left untouched. See apps/AppIcon.tsx (web renders either kind).
+    if let Some(icon) = manifest.icon.clone() {
+        if let Some(path) = local_logo_path(dir, &icon) {
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("reading icon {}", path.display()))?;
+            let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("logo");
+            println!("→ uploading logo {} ({:.1} KB) …", icon, bytes.len() as f64 / 1024.0);
+            let r = client.upload_media(bytes, fname, mime_for(fname)).await?;
+            let url = r["url"].as_str().context("uploadFile returned no url")?.to_string();
+            println!("  logo:  {url}");
+            manifest.icon = Some(url);
+        }
     }
 
     let esbuild = ensure_esbuild().await?;
@@ -195,7 +214,6 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
     // (not a hand-picked subset) — reconstruct it from the parsed fields + the
     // flattened `rest` so panel/capabilities/tag survive.
     let meta = manifest.to_json();
-    let client = Client::new(base, token);
     let r = client.publish_app(&meta, bundle).await?;
     let id = r["id"].as_str().unwrap_or(&manifest.id);
     let version = r["version"].as_str().unwrap_or(&manifest.version);
@@ -267,6 +285,36 @@ impl AppManifest {
         }
         m.insert("entry".into(), json!(self.entry));
         Value::Object(m)
+    }
+}
+
+/// If `icon` names a LOCAL image file (relative to the project dir) — not a
+/// lucide glyph name and not a URL/data URI — return its path. Requires the file
+/// to exist with a known image extension.
+fn local_logo_path(dir: &str, icon: &str) -> Option<std::path::PathBuf> {
+    if icon.starts_with("http://") || icon.starts_with("https://") || icon.starts_with("data:") {
+        return None;
+    }
+    let ext = Path::new(icon).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+    let is_image = matches!(ext.as_deref(), Some("png" | "jpg" | "jpeg" | "svg" | "webp" | "gif" | "avif"));
+    if !is_image {
+        return None;
+    }
+    let path = Path::new(dir).join(icon);
+    path.is_file().then_some(path)
+}
+
+/// Best-effort content-type from a filename extension (the server also re-derives
+/// + gates the stored extension).
+fn mime_for(name: &str) -> &'static str {
+    match Path::new(name).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("svg") => "image/svg+xml",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("avif") => "image/avif",
+        _ => "application/octet-stream",
     }
 }
 
