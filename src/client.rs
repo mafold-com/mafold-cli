@@ -178,6 +178,13 @@ impl Client {
         Ok(())
     }
 
+    /// Answer a pending app.ask (R3 bot.ask) with a single structured JSON result.
+    /// The value crosses back to the app as a ResultMessage only — never a message.
+    pub async fn answer_app_ask(&self, query_id: &str, result: Value) -> Result<()> {
+        self.post("answerAppAsk", json!({ "query_id": query_id, "result": result })).await?;
+        Ok(())
+    }
+
     // ── developer card registry ──
     /// Publish a compiled card bundle. `meta` carries tag/version/displayName.
     pub async fn publish_card(&self, meta: &Value, bundle: Vec<u8>) -> Result<Value> {
