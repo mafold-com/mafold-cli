@@ -130,3 +130,23 @@ pub fn select(id: &str) -> Arc<dyn Harness> {
         _ => Arc::new(claude_code::ClaudeCode),
     }
 }
+
+/// Probe which known harnesses are installed on THIS machine (their CLI is on
+/// PATH) — the control plane's capability report for New-Bot recommendation.
+/// Returns `(id, available)`. Extend `BINS` as more harness impls land.
+pub fn probe() -> Vec<(&'static str, bool)> {
+    // (harness id, the CLI binary whose presence signals it's installed)
+    const BINS: &[(&str, &str)] = &[
+        ("claude-code", "claude"),
+        ("opencode", "opencode"),
+        ("codex", "codex"),
+        ("openclaw", "openclaw"),
+    ];
+    BINS.iter().map(|(id, bin)| (*id, on_path(bin))).collect()
+}
+
+fn on_path(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|p| p.join(bin).is_file()))
+        .unwrap_or(false)
+}
