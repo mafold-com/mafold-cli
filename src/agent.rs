@@ -704,22 +704,6 @@ async fn connect_and_run(
             }
             continue;
         }
-        // R3 bot.ask: a compose-assistant app asks this bot a structured,
-        // message-free question. The API relays it here and waits (≤90s) for a
-        // structured JSON answer via answerAppAsk. Generic plumbing = receive +
-        // spawn + answer; the per-bot phase logic lives in `app_ask_reply`.
-        if method == "events.appAsk" {
-            let query_id = env["params"]["query_id"].as_str().unwrap_or("").to_string();
-            if !query_id.is_empty() {
-                let client = client.clone();
-                let params = env["params"].clone();
-                tokio::spawn(async move {
-                    let result = app_ask_reply(&params).await;
-                    let _ = client.answer_app_ask(&query_id, result).await;
-                });
-            }
-            continue;
-        }
         let raw_msg = match method {
             "events.messageNew" => env["params"].clone(),
             "events.threadReply" => env["params"]["message"].clone(),
@@ -937,19 +921,6 @@ fn inline_results(query: &str) -> Vec<String> {
     } else {
         vec![q.to_string()]
     }
-}
-
-/// R3 bot.ask handler hook. The GENERIC daemon framework relays `events.appAsk`
-/// here and answers the app with whatever JSON this returns. `params` carries
-/// `{app_id, session_id, turn, payload, conversation_id, from}`. The default is a
-/// not-implemented stub; a bot that wants compose-assistant support (e.g. Synple)
-/// replaces this body to dispatch by `payload["phase"]` into its engine.
-async fn app_ask_reply(params: &Value) -> Value {
-    let app_id = params["app_id"].as_str().unwrap_or("");
-    serde_json::json!({
-        "error": "not_implemented",
-        "message": format!("this bot has no app.ask handler ({app_id})"),
-    })
 }
 
 /// Cancel EVERY in-flight turn in a conversation (the `/stop` command). Returns
