@@ -285,7 +285,9 @@ async fn login(base: &str, username: Option<String>, password: Option<String>) -
     };
     session::save(&sess)?;
     println!("✓ logged in as {uname} on {}", sess.device_name);
-    report_with(base, &sess).await
+    report_with(base, &sess).await?;
+    println!("\n→ keep this machine available + auto-provision new bots:  mafold up");
+    Ok(())
 }
 
 /// `mafold report` — re-report this machine's available harnesses.
