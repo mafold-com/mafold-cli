@@ -1313,16 +1313,36 @@ native card. Write the tag directly — do NOT wrap it in a code fence or escape
         }
         s.push_str("Use a card when it communicates better than prose; otherwise reply normally.");
     }
-    // Interactive questions: the agent often doesn't realize AskUserQuestion works
-    // here (it's a core tool, never in the ToolSearch / "deferred tools" list), so
-    // it hunts for it, gives up, and falls back to prose. Tell it plainly.
+    // The two interactive cards worth reaching for constantly — write the tag
+    // yourself, inline, rather than relying on a tool. They beat plain-text
+    // fallbacks, so spell out the exact syntax and encourage liberal use.
     s.push_str(
-        "\n\nINTERACTIVE QUESTIONS: you have the built-in AskUserQuestion tool. It is a CORE \
-tool that is ALWAYS available here — do NOT look for it via ToolSearch and do NOT assume it is \
-missing because it isn't in a \"deferred tools\" list. Just call it directly. Mafold renders each \
-question as an interactive card with tappable options, and the user's choice arrives as their \
-next message so you continue the same turn. Prefer it over asking the user to \"reply 1/2/3\" in \
-plain text whenever you need them to choose between options.",
+        "\n\nTWO CARDS WORTH USING OFTEN — write the tag yourself, inline:\n\
+\n• {% ask %} — a tap-to-answer question card; the most reliable way to offer the user choices \
+here. Line-encoded body: one `q|<header>|<multi 0/1>|<question>` line per question, each followed by \
+its `o|<label>|<description>` option lines. End your turn with it — the user's tap comes back as \
+their next message and you continue. Example:\n\
+{% ask %}\nq|Deploy|0|Ship to prod now?\no|Yes|blue-green, ~2 min\no|Hold|I'll review first\n{% /ask %}\n\
+\n• {% html %} — a sandboxed mini-UI (charts, demos, small games, rich layouts, dashboards). Put \
+your HTML between the tags and CLOSE with {% /html %} (NOT a second {% html %} — a common mistake \
+that breaks the card). Scripts run; there is no network / same-origin. Reach for it whenever \
+something visual communicates better than text.\n\
+\nLean on these — favor them over plain-text \"reply 1/2/3\" prompts or describing what a chart \
+would look like.",
+    );
+    // Interactive questions + concurrency. The agent over-trusts AskUserQuestion
+    // (flaky via the blocking hook) and wrongly concludes parallel sessions have
+    // died — steer it to the `{% ask %}` card and reassure it about concurrency.
+    s.push_str(
+        "\n\nINTERACTIVE QUESTIONS: prefer the {% ask %} card above — it's the most reliable way to \
+get a tap-to-answer choice here. The native AskUserQuestion tool also works (a hook turns it into \
+the same card) but can time out or be unavailable, so reach for the CARD first. Either way, never \
+make the user type \"1/2/3\" in prose when a tappable choice fits.\n\
+\n\nCONCURRENT SESSIONS: the owner often runs SEVERAL agent sessions for you at once (in different \
+conversations), plus background tasks that outlive a single turn. They run independently and keep \
+going on their own. If the user mentions \"the other session\" or work happening elsewhere, do NOT \
+assume it crashed, stalled, or was interrupted just because you can't see it from here — it is \
+almost certainly still running. Never claim a session or task is dead without direct evidence.",
     );
     s
 }

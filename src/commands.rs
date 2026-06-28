@@ -199,54 +199,93 @@ fn dump_file(title: &str, lang: &str, path: &Path) -> String {
 
 // ───────────────────────── usage stats ─────────────────────────
 
-/// `/stats` — Claude Code usage from `~/.claude/stats-cache.json`, rendered as a
-/// `{% stats %}` card (totals grid + daily-activity sparkline + per-model split).
+/// `/stats` — Claude Code usage computed LIVE from the session transcripts under
+/// `~/.claude/projects/<project>/*.jsonl`, rendered as a `{% stats %}` card
+/// (totals grid + daily-activity sparkline + per-model split).
+///
+/// We do NOT read `~/.claude/stats-cache.json`: that aggregate is only flushed
+/// periodically and routinely lags the real history by weeks, which made `/usage`
+/// show stale numbers. The transcripts are written every turn, so reading them is
+/// always current. Each assistant turn records its real token `usage` + `model`;
+/// we sum per-model tokens, count tool-call blocks, active days, busiest hour, and
+/// a per-day message sparkline. Cost: one full pass over the history per call
+/// (~1s); only `"type":"assistant"` lines are JSON-parsed.
 fn stats() -> String {
-    let path = home().join(".claude/stats-cache.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return "📊 No usage data yet (`~/.claude/stats-cache.json` not found).".into();
-    };
-    let Ok(d) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return "📊 Couldn't read the stats cache.".into();
-    };
+    use std::collections::{HashMap, HashSet};
 
-    let sessions = d["totalSessions"].as_u64().unwrap_or(0);
-    let messages = d["totalMessages"].as_u64().unwrap_or(0);
+    let files = jsonl_transcripts(&home().join(".claude/projects"));
+    if files.is_empty() {
+        return "📊 No usage data yet (no transcripts under `~/.claude/projects/`).".into();
+    }
 
-    // Per-model token totals (top 5).
-    let mut models: Vec<(String, u64)> = vec![];
+    let mut model_tokens: HashMap<String, u64> = HashMap::new();
     let mut total_tokens: u64 = 0;
-    if let Some(mu) = d["modelUsage"].as_object() {
-        for (m, u) in mu {
-            let tok: u64 = ["inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"]
+    let mut tools: u64 = 0;
+    let mut messages: u64 = 0;
+    let mut sessions: HashSet<String> = HashSet::new();
+    let mut per_day: HashMap<String, u64> = HashMap::new(); // YYYY-MM-DD → assistant turns
+    let mut per_hour: [u64; 24] = [0; 24];
+    let mut first_date: Option<String> = None;
+
+    for f in &files {
+        let Ok(bytes) = std::fs::read(f) else { continue };
+        // Lossy so a single bad byte never drops a whole transcript.
+        for line in String::from_utf8_lossy(&bytes).lines() {
+            // Cheap pre-filter: skip the (many) non-assistant lines without parsing.
+            if !line.contains("\"type\":\"assistant\"") { continue; }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            if v["type"].as_str() != Some("assistant") { continue; }
+            let m = &v["message"];
+            let u = &m["usage"];
+
+            // Token total — same four buckets the old cache summed.
+            let tok: u64 = ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
                 .iter().filter_map(|k| u[*k].as_u64()).sum();
-            total_tokens += tok;
-            models.push((short_model(m), tok));
+            if tok > 0 {
+                total_tokens += tok;
+                if let Some(model) = m["model"].as_str() {
+                    *model_tokens.entry(short_model(model)).or_default() += tok;
+                }
+            }
+
+            messages += 1;
+            if let Some(content) = m["content"].as_array() {
+                tools += content.iter().filter(|b| b["type"].as_str() == Some("tool_use")).count() as u64;
+            }
+            if let Some(sid) = v["sessionId"].as_str() { sessions.insert(sid.to_string()); }
+            if let Some(ts) = v["timestamp"].as_str() {
+                if ts.len() >= 10 {
+                    *per_day.entry(ts[..10].to_string()).or_default() += 1;
+                    if ts.len() >= 13 {
+                        if let Ok(h) = ts[11..13].parse::<usize>() {
+                            if h < 24 { per_hour[h] += 1; }
+                        }
+                    }
+                    if first_date.as_deref().is_none_or(|f| ts < f) {
+                        first_date = Some(ts.to_string());
+                    }
+                }
+            }
         }
     }
+
+    // Per-model token totals (top 5).
+    let mut models: Vec<(String, u64)> = model_tokens.into_iter().collect();
     models.sort_by(|a, b| b.1.cmp(&a.1));
     models.truncate(5);
 
-    // Daily activity → tool-call total, active days, message-count sparkline.
-    let mut tools: u64 = 0;
-    let mut days = 0u64;
-    let mut spark: Vec<u64> = vec![];
-    if let Some(da) = d["dailyActivity"].as_array() {
-        days = da.len() as u64;
-        for e in da {
-            tools += e["toolCallCount"].as_u64().unwrap_or(0);
-            spark.push(e["messageCount"].as_u64().unwrap_or(0));
-        }
-    }
+    // Active days + daily-turn sparkline (chronological, last 45 days).
+    let mut day_keys: Vec<String> = per_day.keys().cloned().collect();
+    day_keys.sort();
+    let days = day_keys.len() as u64;
+    let mut spark: Vec<u64> = day_keys.iter().map(|d| per_day[d]).collect();
     if spark.len() > 45 { spark = spark[spark.len() - 45..].to_vec(); }
 
     // Busiest hour.
-    let hour = d["hourCounts"].as_object()
-        .and_then(|h| h.iter().max_by_key(|(_, v)| v.as_u64().unwrap_or(0)).map(|(k, _)| k.clone()))
-        .and_then(|k| k.parse::<u32>().ok())
+    let hour = (0..24usize).filter(|&h| per_hour[h] > 0).max_by_key(|&h| per_hour[h])
         .map(|h| format!("{h:02}:00"))
         .unwrap_or_default();
-    let since = fmt_date(d["firstSessionDate"].as_str().unwrap_or(""));
+    let since = fmt_date(first_date.as_deref().unwrap_or(""));
 
     let mut body = String::new();
     for (m, tok) in &models {
@@ -258,8 +297,24 @@ fn stats() -> String {
 
     format!(
         "{{% stats sessions=\"{}\" messages=\"{}\" tools=\"{}\" tokens=\"{}\" days=\"{}\" since=\"{}\" hour=\"{}\" %}}\n{}{{% /stats %}}",
-        humanize(sessions), humanize(messages), humanize(tools), humanize(total_tokens), days, since, hour, body,
+        humanize(sessions.len() as u64), humanize(messages), humanize(tools), humanize(total_tokens), days, since, hour, body,
     )
+}
+
+/// All `*.jsonl` transcripts under `<root>/<project>/` (one project dir per cwd).
+fn jsonl_transcripts(root: &Path) -> Vec<PathBuf> {
+    let mut out = vec![];
+    let Ok(projects) = std::fs::read_dir(root) else { return out };
+    for proj in projects.flatten() {
+        let Ok(entries) = std::fs::read_dir(proj.path()) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+                out.push(p);
+            }
+        }
+    }
+    out
 }
 
 /// 1_234_567 → "1.2M" (K/M/B, trailing `.0` stripped).
