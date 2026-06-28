@@ -16,6 +16,7 @@ mod daemon;
 mod discover;
 mod harness;
 mod langpack;
+mod session;
 mod platform;
 mod render;
 mod supervisor;
@@ -107,6 +108,18 @@ enum Cmd {
     Down { name: Option<String> },
     /// Show the last lines of a bot daemon's log.
     Logs { name: String },
+
+    // ── human control plane (New-Bot harness recommendation + provisioning) ──
+    /// Log in your HUMAN account so the Mafold app can recommend a harness from
+    /// this machine (and soon auto-provision bots). Reports installed harnesses.
+    Login {
+        #[arg(long)]
+        username: Option<String>,
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Re-report this machine's available harnesses (uses the saved login).
+    Report,
     /// Roll back to the previous binary (after a bad update).
     Rollback,
     /// (internal) The long-lived supervisor loop — started by `up`.
@@ -180,6 +193,14 @@ async fn main() -> Result<()> {
         let Cmd::Langpack { cmd } = cli.cmd else { unreachable!() };
         return langpack::run(cmd, cli.base, cli.token).await;
     }
+    // Human control plane: `login` mints the s_ session; `report` uses it. No bot token.
+    if matches!(cli.cmd, Cmd::Login { .. }) {
+        let Cmd::Login { username, password } = cli.cmd else { unreachable!() };
+        return login(&cli.base, username, password).await;
+    }
+    if matches!(cli.cmd, Cmd::Report) {
+        return report_harnesses(&cli.base).await;
+    }
 
     let token = cli
         .token
@@ -209,10 +230,95 @@ async fn main() -> Result<()> {
         Cmd::Chats => chats(&Client::new(cli.base, token)).await?,
         Cmd::Send { chat, text } => send(&Client::new(cli.base, token), &chat, &text.join(" ")).await?,
         Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Cards { .. } | Cmd::Apps { .. }
-        | Cmd::Langpack { .. }
+        | Cmd::Langpack { .. } | Cmd::Login { .. } | Cmd::Report
         | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
         | Cmd::Rollback | Cmd::Supervise | Cmd::AskHook => unreachable!(),
     }
+    Ok(())
+}
+
+fn prompt(label: &str) -> String {
+    use std::io::Write;
+    print!("{label}");
+    let _ = std::io::stdout().flush();
+    let mut s = String::new();
+    let _ = std::io::stdin().read_line(&mut s);
+    s.trim().to_string()
+}
+
+/// Read a secret without echoing (Unix: toggle the tty via `stty`).
+fn prompt_password(label: &str) -> String {
+    use std::io::Write;
+    print!("{label}");
+    let _ = std::io::stdout().flush();
+    let _ = std::process::Command::new("stty").arg("-echo").status();
+    let mut s = String::new();
+    let _ = std::io::stdin().read_line(&mut s);
+    let _ = std::process::Command::new("stty").arg("echo").status();
+    println!();
+    s.trim().to_string()
+}
+
+/// `mafold login` — mint a human `s_` session + report this machine's harnesses.
+async fn login(base: &str, username: Option<String>, password: Option<String>) -> Result<()> {
+    let username = username.unwrap_or_else(|| prompt("Mafold username: "));
+    let password = password.unwrap_or_else(|| prompt_password("Password: "));
+    let http = reqwest::Client::new();
+    let resp: serde_json::Value = http
+        .post(format!("{base}/api/auth/login"))
+        .json(&serde_json::json!({ "username": username, "password": password }))
+        .send().await.context("login request failed")?
+        .json().await.context("login: non-JSON response")?;
+    if resp.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        anyhow::bail!("login failed: {}", resp["description"].as_str().unwrap_or("check username/password"));
+    }
+    let result = &resp["result"];
+    let token = result["token"].as_str().context("login: no token in response")?.to_string();
+    let uname = result["user"]["username"].as_str().unwrap_or(&username).to_string();
+
+    let prev = session::load();
+    let sess = session::Session {
+        token,
+        username: uname.clone(),
+        device_id: session::device_id(prev.as_ref().map(|p| p.device_id.as_str())),
+        device_name: session::device_name(),
+    };
+    session::save(&sess)?;
+    println!("✓ logged in as {uname} on {}", sess.device_name);
+    report_with(base, &sess).await?;
+    println!("\n→ keep this machine available + auto-provision new bots:  mafold up");
+    Ok(())
+}
+
+/// `mafold report` — re-report this machine's available harnesses.
+async fn report_harnesses(base: &str) -> Result<()> {
+    let sess = session::load().context("not logged in — run `mafold login` first")?;
+    report_with(base, &sess).await
+}
+
+async fn report_with(base: &str, sess: &session::Session) -> Result<()> {
+    let probed = harness::probe();
+    let harnesses: Vec<serde_json::Value> = probed
+        .iter()
+        .map(|(id, available)| serde_json::json!({ "id": id, "available": available }))
+        .collect();
+    let avail: Vec<&str> = probed.iter().filter(|(_, a)| *a).map(|(id, _)| *id).collect();
+    Client::new(base.to_string(), sess.token.clone())
+        .call(
+            "reportHarnesses",
+            serde_json::json!({
+                "device_id": sess.device_id,
+                "device_name": sess.device_name,
+                "harnesses": harnesses,
+            }),
+        )
+        .await
+        .context("reportHarnesses failed")?;
+    println!(
+        "✓ reported harnesses on {} — available: {}",
+        sess.device_name,
+        if avail.is_empty() { "(none detected)".to_string() } else { avail.join(", ") }
+    );
     Ok(())
 }
 

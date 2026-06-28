@@ -339,8 +339,74 @@ pub async fn supervise(base: String) {
                 Err(e) => eprintln!("update check failed: {e}"),
             }
         }
+        // Control plane (after `mafold login`): claim any auto-provisioned bots
+        // (→ add + start their daemons, no `mafold add` paste) and keep this
+        // machine's harness report fresh (~every 30s) so New-Bot sees it online.
+        if let Some(sess) = crate::session::load() {
+            if let Err(e) = poll_provisions(&http, &base, &sess).await {
+                eprintln!("provision poll failed: {e}");
+            }
+            if ticks % 3 == 0 {
+                let _ = report_local_harnesses(&http, &base, &sess).await;
+            }
+        }
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     }
+}
+
+/// Claim auto-provision requests for this device and wire each bot into the local
+/// config (the next loop tick starts its daemon). The bot's mb_ token arrives over
+/// the owner's authenticated session — no copy-paste.
+async fn poll_provisions(http: &reqwest::Client, base: &str, sess: &crate::session::Session) -> Result<()> {
+    let resp: serde_json::Value = http
+        .post(format!("{base}/api/claimProvisions"))
+        .bearer_auth(&sess.token)
+        .json(&serde_json::json!({ "device_id": sess.device_id }))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let items = resp.pointer("/result/items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    for it in items {
+        let name = it["bot_username"].as_str().unwrap_or_default().to_string();
+        let token = it["token"].as_str().unwrap_or_default().to_string();
+        if name.is_empty() || token.is_empty() {
+            continue;
+        }
+        let harness = it["harness"].as_str().map(str::to_string);
+        let workdir = provision_workdir(&name);
+        match add(name.clone(), token, workdir, harness, base) {
+            Ok(()) => println!("⬇ provisioned @{name} — its daemon starts on the next tick"),
+            Err(e) => eprintln!("provision @{name} failed: {e}"),
+        }
+    }
+    Ok(())
+}
+
+/// Re-send this machine's available harnesses (keeps the device "online").
+async fn report_local_harnesses(http: &reqwest::Client, base: &str, sess: &crate::session::Session) -> Result<()> {
+    let harnesses: Vec<serde_json::Value> = crate::harness::probe()
+        .into_iter()
+        .map(|(id, available)| serde_json::json!({ "id": id, "available": available }))
+        .collect();
+    http.post(format!("{base}/api/reportHarnesses"))
+        .bearer_auth(&sess.token)
+        .json(&serde_json::json!({
+            "device_id": sess.device_id,
+            "device_name": sess.device_name,
+            "harnesses": harnesses,
+        }))
+        .send()
+        .await?;
+    Ok(())
+}
+
+/// Default workdir for an auto-provisioned bot: `~/.mafold/work/<label>` (created).
+fn provision_workdir(bot_username: &str) -> String {
+    let label = bot_username.rsplit(':').next().unwrap_or(bot_username);
+    let dir = home().join(".mafold/work").join(label);
+    let _ = fs::create_dir_all(&dir);
+    dir.to_string_lossy().into_owned()
 }
 
 fn start_one(base: &str, d: &DaemonCfg) -> Result<Option<u32>> {

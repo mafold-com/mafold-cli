@@ -35,6 +35,9 @@ impl Client {
         Ok(v["result"].clone())
     }
 
+    /// Generic authenticated RPC for callers outside this module (login, report…).
+    pub async fn call(&self, method: &str, body: Value) -> Result<Value> { self.post(method, body).await }
+
     pub async fn me(&self) -> Result<Value> { self.post("getMe", json!({})).await }
     pub async fn chats(&self) -> Result<Value> { self.post("getChats", json!({})).await }
 

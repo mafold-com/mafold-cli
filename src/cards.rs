@@ -375,6 +375,12 @@ const styles = StyleSheet.create({{
 export default defineCard({{
   tag: "{tag}",
   attributes: {{ name: {{ type: "string" }} }},
+  // examples power the detail-page preview and show others how to call the card.
+  // Each is {{ name, props, description? }} — add one per state worth showing.
+  examples: [
+    {{ name: "Default", props: {{ name: "world" }} }},
+    {{ name: "Named", props: {{ name: "Mafold" }}, description: "with a custom name" }},
+  ],
   component: {title},
 }});
 "#,
