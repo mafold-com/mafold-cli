@@ -72,6 +72,17 @@ impl Client {
         self.post("getGroupBots", json!({ "chat_id": chat_id })).await
     }
 
+    // ── shared-room CRDT relay (the AI's room peer; see room.rs) ──
+    pub async fn room_changes(&self, conv: &str, app: &str) -> Result<Value> {
+        self.post("roomChanges", json!({ "conv": conv, "app": app })).await
+    }
+    pub async fn room_change(&self, conv: &str, app: &str, changes: Vec<String>) -> Result<Value> {
+        self.post("roomChange", json!({ "conv": conv, "app": app, "changes": changes })).await
+    }
+    pub async fn list_installs(&self, conv: &str) -> Result<Value> {
+        self.post("listInstalls", json!({ "conversation_id": conv })).await
+    }
+
     /// The bot's OWNER-set config, callable by the bot itself. Returns `BotDetail`
     /// — `{ bot, config, config_schema, secret_schema, secrets }`. The daemon uses
     /// `config` (a `{key: value}` map of the owner's stored field values) to drive

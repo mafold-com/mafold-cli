@@ -435,6 +435,16 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     let my_username = me["username"].as_str().unwrap_or_default().to_string();
     anyhow::ensure!(!my_username.is_empty(), "could not resolve bot identity (bad token?)");
 
+    // Export creds + install the room skill so child processes the agent spawns
+    // (`mafold room …`, run by the agent via the room skill) reuse THIS daemon's
+    // identity + base without re-reading daemons.json. MAFOLD_CONV is set
+    // per-turn on the claude child (concurrent turns can't share a global).
+    std::env::set_var("MAFOLD_BOT_TOKEN", &client.token);
+    std::env::set_var("MAFOLD_BASE", &client.base);
+    if let Err(e) = crate::room::install_skill() {
+        eprintln!("room skill install skipped: {e}");
+    }
+
     // Account whitelist for who may DRIVE the bot (host code execution). Cache the
     // OWNER (this bot account's `parent_username` from getMe) as the default-allow,
     // widened by the `MAFOLD_ALLOWED_USERS` env var (`*` = anyone). Enforced as a
@@ -1521,6 +1531,7 @@ async fn handle(
 
     let turn = Turn {
         prompt: full_prompt,
+        conv: chat_id.to_string(),
         workdir: workdir.to_string(),
         session: prior.clone(),
         model,

@@ -27,7 +27,7 @@ impl Harness for ClaudeCode {
     }
 
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
-        let Turn { prompt, workdir, session, model, thinking, cancel, system, ask_file } = turn;
+        let Turn { prompt, workdir, session, model, thinking, cancel, system, ask_file, conv } = turn;
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");
         }
@@ -45,6 +45,10 @@ impl Harness for ClaudeCode {
         if let Some(m) = &model {
             cmd.arg("--model").arg(m);
         }
+        // Export the current conversation so `mafold room …` (run by the agent
+        // via the room skill) defaults to THIS room. Per-turn (not a global env)
+        // because concurrent turns run different conversations.
+        cmd.env("MAFOLD_CONV", &conv);
         // Extended thinking: a non-zero budget makes the model think before each
         // reply (streamed as `thinking` blocks). No env = Claude Code's default.
         if let Some(budget) = thinking {

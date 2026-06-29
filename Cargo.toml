@@ -1,6 +1,6 @@
 [package]
 name = "mafold-cli"
-version = "0.9.25"
+version = "0.9.26"
 edition = "2021"
 description = "Mafold from your terminal — a CLI client (chats / send) + a Claude Code agent daemon."
 license = "MIT"
@@ -20,6 +20,10 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
 sha2 = "0.10"
+# Shared-room CRDT peer for the AI: same crate/version the API uses
+# (compact_room_log), so change blobs interop with web's @automerge/automerge.
+automerge = "0.5"
+base64 = "0.22"
 
 # Process/session control (detach via setsid, liveness + stop via signals) — Unix only.
 [target.'cfg(unix)'.dependencies]

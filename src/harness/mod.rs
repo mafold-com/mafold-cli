@@ -42,6 +42,9 @@ pub enum AgentEvent {
 /// One turn to run against a harness.
 pub struct Turn {
     pub prompt: String,
+    /// The conversation id this turn runs in — exported to the agent's process
+    /// env as `MAFOLD_CONV` so `mafold room …` (the room skill) targets it.
+    pub conv: String,
     pub workdir: String,
     /// The harness's prior session id for this conversation, to resume context.
     pub session: Option<String>,
