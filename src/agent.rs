@@ -218,17 +218,30 @@ type BotMsgIds = Arc<std::sync::Mutex<BotMsgMemory>>;
 /// in-flight turns so the self-updater only re-execs when everything's idle.
 struct ExecCoord {
     active: std::sync::atomic::AtomicUsize,
+    /// File the in-flight-turn count is published to, so the supervisor can DRAIN
+    /// (wait a turn out) before a cliUpdate restart instead of killing it.
+    busy_file: Option<std::path::PathBuf>,
 }
 
 impl ExecCoord {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
+    fn new(busy_file: Option<std::path::PathBuf>) -> Arc<Self> {
+        let c = Arc::new(Self {
             active: std::sync::atomic::AtomicUsize::new(0),
-        })
+            busy_file,
+        });
+        c.publish_busy(); // clear any stale marker from a prior (killed) process
+        c
     }
     /// True when no turn is running anywhere → safe for the self-updater to re-exec.
     fn idle(&self) -> bool {
         self.active.load(std::sync::atomic::Ordering::SeqCst) == 0
+    }
+    /// Write the current in-flight-turn count for the supervisor's drain check.
+    fn publish_busy(&self) {
+        if let Some(p) = &self.busy_file {
+            let n = self.active.load(std::sync::atomic::Ordering::SeqCst);
+            let _ = std::fs::write(p, n.to_string());
+        }
     }
 }
 
@@ -237,12 +250,14 @@ struct TurnGuard(Arc<ExecCoord>);
 impl TurnGuard {
     fn new(c: &Arc<ExecCoord>) -> Self {
         c.active.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        c.publish_busy();
         Self(c.clone())
     }
 }
 impl Drop for TurnGuard {
     fn drop(&mut self) {
         self.0.active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.publish_busy();
     }
 }
 
@@ -515,7 +530,16 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     // Per-conversation execution: different conversations run in parallel; turns
     // within one conversation serialize. (They share this workdir — don't run
     // conflicting edits in two chats at once.)
-    let coord = ExecCoord::new();
+    // Publish the in-flight-turn count so the supervisor can DRAIN (wait a live
+    // turn out) before a cliUpdate restart — keyed by the supervisor-passed name
+    // so its drain check finds the same marker.
+    let busy_file = {
+        let name = std::env::var("MAFOLD_DAEMON_NAME").unwrap_or_else(|_| my_username.clone());
+        let p = crate::supervisor::busy_path(&name);
+        if let Some(parent) = p.parent() { let _ = std::fs::create_dir_all(parent); }
+        Some(p)
+    };
+    let coord = ExecCoord::new(busy_file);
 
     // Auto-update: poll every 10 minutes; if a newer release exists, apply +
     // re-exec — but only when IDLE (try_lock → no claude running/queued) so an

@@ -46,6 +46,44 @@ fn safe(name: &str) -> String {
 fn pid_path(name: &str) -> PathBuf {
     daemons_dir().join(safe(name)).join("pid")
 }
+
+/// Per-daemon in-flight-turn marker: the daemon writes its active-turn count here
+/// (via `TurnGuard`), and the supervisor reads it to DRAIN — wait a live turn out
+/// before a cliUpdate restart instead of killing the reply mid-flight.
+pub(crate) fn busy_path(name: &str) -> PathBuf {
+    daemons_dir().join(safe(name)).join("busy")
+}
+
+fn busy_count(name: &str) -> usize {
+    fs::read_to_string(busy_path(name)).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+}
+
+/// Wait (up to `max`) for every ALIVE daemon to finish its in-flight turns before
+/// a restart, so the daemon watching its own release doesn't kill a turn. A dead
+/// daemon's stale marker is ignored; the cap stops a forever-busy daemon from
+/// blocking updates indefinitely.
+async fn drain_daemons(daemons: &[DaemonCfg], max: std::time::Duration) {
+    let start = std::time::Instant::now();
+    loop {
+        let busy: Vec<String> = daemons
+            .iter()
+            .filter_map(|d| {
+                let live = read_pid(&d.name).map(alive).unwrap_or(false);
+                let n = busy_count(&d.name);
+                (live && n > 0).then(|| format!("{}={n}", d.name))
+            })
+            .collect();
+        if busy.is_empty() {
+            return;
+        }
+        if start.elapsed() >= max {
+            println!("↻ drain capped at {max:?} — restarting anyway (still busy: {})", busy.join(", "));
+            return;
+        }
+        println!("↻ waiting for in-flight turns before restart: {}", busy.join(", "));
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
 fn log_path(name: &str) -> PathBuf {
     daemons_dir().join(safe(name)).join("log")
 }
@@ -329,6 +367,11 @@ pub async fn supervise(base: String) {
                 Ok(Some(r)) => {
                     println!("↻ update v{} available — applying + restarting daemons…", r.version);
                     if crate::update::apply(&http, &r.url, &r.version, r.sha256.as_deref()).await.is_ok() {
+                        // Graceful drain: download is done; now let in-flight turns
+                        // finish before the kill+reexec, so a daemon watching its
+                        // own release doesn't cut off a reply. Capped so a stuck
+                        // turn can't block updates forever.
+                        drain_daemons(&cfg.daemons, std::time::Duration::from_secs(300)).await;
                         for d in &cfg.daemons { let _ = stop_one(&d.name); }
                         let _ = crate::update::reexec(); // new supervisor respawns daemons (new binary)
                     } else {
@@ -427,6 +470,9 @@ fn start_one(base: &str, d: &DaemonCfg) -> Result<Option<u32>> {
         .env("MAFOLD_BOT_TOKEN", &d.token)
         .env("MAFOLD_WORKDIR", &d.workdir)
         .env("MAFOLD_HARNESS", d.harness.as_deref().unwrap_or("claude-code"))
+        // So the daemon writes its busy marker at the path the supervisor's drain
+        // check reads (keyed by THIS exact daemon name).
+        .env("MAFOLD_DAEMON_NAME", &d.name)
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
