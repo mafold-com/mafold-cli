@@ -741,6 +741,20 @@ async fn connect_and_run(
             }
             continue;
         }
+        // "Clear chat history" from a client → drop this conversation's Claude
+        // session so the next turn starts a fresh coding-agent context (the
+        // server-side brains reset via a boundary; self-hosted agents reset here).
+        if method == "events.chatCleared" {
+            let conv_id = env["params"]["conversation_id"].as_str().unwrap_or("").to_string();
+            if !conv_id.is_empty() {
+                let mut s = sessions.lock().await;
+                if s.remove(&conv_id).is_some() {
+                    save_sessions(&s);
+                    println!("← chat cleared ({conv_id}) → dropped Claude session");
+                }
+            }
+            continue;
+        }
         let raw_msg = match method {
             "events.messageNew" => env["params"].clone(),
             "events.threadReply" => env["params"]["message"].clone(),
