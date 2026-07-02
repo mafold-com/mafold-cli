@@ -148,7 +148,7 @@ pub fn probe() -> Vec<(&'static str, bool)> {
     BINS.iter().map(|(id, bin)| (*id, on_path(bin))).collect()
 }
 
-fn on_path(bin: &str) -> bool {
+pub(crate) fn on_path(bin: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).any(|p| p.join(bin).is_file()))
         .unwrap_or(false)

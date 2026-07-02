@@ -504,6 +504,9 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     }
     if !harness.available() {
         eprintln!("⚠️  harness `{}` CLI not found on PATH — replies will fail until it's installed.", harness.id());
+        if harness.id() == "claude-code" {
+            eprintln!("    install it with: mafold install claude-code");
+        }
     }
     // Show the requested id and whether it fell back (an unimplemented harness
     // resolves to claude-code), so cloud-first selection is observable in logs.

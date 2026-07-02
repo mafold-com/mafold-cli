@@ -16,7 +16,7 @@ case "$os-$arch" in
 esac
 
 command -v claude >/dev/null 2>&1 || \
-  echo "⚠️  Claude Code (claude) not found on PATH — needed for 'agent'. https://claude.com/claude-code" >&2
+  echo "⚠️  Claude Code (claude) not found on PATH — needed for 'agent'. Fix with: mafold install claude-code  (or https://claude.com/claude-code)" >&2
 
 dir="${HOME}/.mafold"; mkdir -p "$dir"; bin="$dir/mafold"
 url="https://github.com/$REPO/releases/latest/download/mafold-$target"

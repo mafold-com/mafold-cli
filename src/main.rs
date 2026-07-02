@@ -15,6 +15,7 @@ mod commands;
 mod daemon;
 mod discover;
 mod harness;
+mod install;
 mod langpack;
 mod session;
 mod platform;
@@ -66,6 +67,14 @@ enum Cmd {
     Status,
     /// Update mafold to the latest release.
     Update,
+    /// Install a tool the Mafold agent needs (today: claude-code).
+    Install {
+        /// The tool to install — currently only `claude-code`.
+        tool: String,
+        /// Don't ask before running the official installer.
+        #[arg(long, short)]
+        yes: bool,
+    },
     /// List your conversations.
     Chats,
     /// Send a message. <chat> is a conversation id or a @username.
@@ -214,6 +223,10 @@ async fn main() -> Result<()> {
     if matches!(cli.cmd, Cmd::Report) {
         return report_harnesses(&cli.base).await;
     }
+    // Machine setup — no account or token involved at all.
+    if let Cmd::Install { tool, yes } = &cli.cmd {
+        return install::run(tool, *yes);
+    }
 
     let token = cli
         .token
@@ -242,8 +255,8 @@ async fn main() -> Result<()> {
         Cmd::Add { name, workdir, harness } => supervisor::add(name, token, workdir, harness, &cli.base)?,
         Cmd::Chats => chats(&Client::new(cli.base, token)).await?,
         Cmd::Send { chat, text } => send(&Client::new(cli.base, token), &chat, &text.join(" ")).await?,
-        Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Cards { .. } | Cmd::Apps { .. }
-        | Cmd::Room { .. }
+        Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Install { .. } | Cmd::Cards { .. }
+        | Cmd::Apps { .. } | Cmd::Room { .. }
         | Cmd::Langpack { .. } | Cmd::Login { .. } | Cmd::Report
         | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
         | Cmd::Rollback | Cmd::Supervise | Cmd::AskHook => unreachable!(),
@@ -275,6 +288,11 @@ fn prompt_password(label: &str) -> String {
 
 /// `mafold login` — mint a human `s_` session + report this machine's harnesses.
 async fn login(base: &str, username: Option<String>, password: Option<String>) -> Result<()> {
+    // Default (no args) → browser device flow, à la `gh auth login`. Passing
+    // --username/--password keeps the direct password login (CI / scripted).
+    if username.is_none() && password.is_none() {
+        return login_device(base).await;
+    }
     let username = username.unwrap_or_else(|| prompt("Mafold username: "));
     let password = password.unwrap_or_else(|| prompt_password("Password: "));
     let http = reqwest::Client::new();
@@ -289,7 +307,50 @@ async fn login(base: &str, username: Option<String>, password: Option<String>) -
     let result = &resp["result"];
     let token = result["token"].as_str().context("login: no token in response")?.to_string();
     let uname = result["user"]["username"].as_str().unwrap_or(&username).to_string();
+    finish_login(base, token, uname).await
+}
 
+/// gh-style device login: get a short code, the user approves it in the Mafold
+/// web app, and we poll until the session token comes back. Works on headless /
+/// remote machines (no browser needed on THIS box — approve from your phone).
+async fn login_device(base: &str) -> Result<()> {
+    let http = reqwest::Client::new();
+    let start: serde_json::Value = http
+        .post(format!("{base}/api/auth/device/start"))
+        .json(&serde_json::json!({ "device": session::device_name(), "platform": std::env::consts::OS }))
+        .send().await.context("device/start failed")?
+        .json().await.context("device/start: non-JSON response")?;
+    let r = &start["result"];
+    let device_code = r["device_code"].as_str().context("device/start: no device_code")?.to_string();
+    let user_code = r["user_code"].as_str().unwrap_or("");
+    let verify_url = r["verify_url"].as_str().unwrap_or("https://mafold.com/login/device");
+    let interval = r["interval"].as_u64().unwrap_or(3).max(1);
+
+    println!("\n  Open this URL in your browser:  {verify_url}");
+    println!("  and enter the code:             {user_code}\n");
+    println!("  Waiting for you to approve…  (Ctrl-C to cancel)");
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        let poll: serde_json::Value = http
+            .post(format!("{base}/api/auth/device/poll"))
+            .json(&serde_json::json!({ "device_code": device_code }))
+            .send().await.context("device/poll failed")?
+            .json().await.context("device/poll: non-JSON response")?;
+        match poll["result"]["status"].as_str().unwrap_or("") {
+            "approved" => {
+                let token = poll["result"]["token"].as_str().context("approved but no token")?.to_string();
+                let uname = poll["result"]["username"].as_str().unwrap_or("").to_string();
+                return finish_login(base, token, uname).await;
+            }
+            "expired" => anyhow::bail!("that code expired — run `mafold login` again"),
+            _ => {} // pending — keep polling
+        }
+    }
+}
+
+/// Persist the session + report this machine's harnesses (shared by both paths).
+async fn finish_login(base: &str, token: String, uname: String) -> Result<()> {
     let prev = session::load();
     let sess = session::Session {
         token,
