@@ -24,6 +24,16 @@ echo "↓ downloading mafold ($target)…"
 curl -fsSL "$url" -o "$bin"
 chmod +x "$bin"
 
+# macOS (esp. Apple Silicon): a freshly-downloaded binary is often SIGKILL'd on
+# its FIRST exec while AMFI validates the code signature ("zsh: killed"), and
+# Sonoma+ tags it with `com.apple.provenance` which trips Gatekeeper-style
+# checks. Clearing the attrs + re-applying a LOCAL ad-hoc signature makes the
+# kernel trust it immediately, so `mafold login` runs on the first try.
+if [ "$(uname)" = "Darwin" ]; then
+  xattr -c "$bin" 2>/dev/null || true
+  codesign --force --sign - "$bin" 2>/dev/null || true
+fi
+
 # Put `mafold` on PATH. Prefer a dir that is BOTH on PATH and writable (so the
 # command works immediately); else ~/.local/bin with a one-line PATH hint.
 on_path() { case ":$PATH:" in *":$1:"*) return 0;; *) return 1;; esac; }
