@@ -37,6 +37,12 @@ pub enum AgentEvent {
     Thinking(String),
     /// End-of-turn summary.
     Done { duration_ms: Option<f64>, cost_usd: Option<f64>, tokens: Option<u64> },
+    /// (daemon-internal) The user answered the pending interactive ask — the
+    /// agent loop emits this when it routes a reply into `ask_file`, and the
+    /// renderer stamps the answer into the open `{% ask %}` card so the message
+    /// content itself records "answered" (survives reload, reaches every
+    /// client). Harnesses never emit this.
+    AskAnswered(String),
 }
 
 /// One turn to run against a harness.

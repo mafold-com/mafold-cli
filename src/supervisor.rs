@@ -126,6 +126,60 @@ pub fn add(name: String, token: String, workdir: String, harness: Option<String>
     up(base)
 }
 
+/// Tombstone a daemon writes (via `deprovision_and_exit`) when its bot was
+/// deleted server-side: "remove me from the config, don't respawn me".
+fn deprovision_path(name: &str) -> PathBuf {
+    daemons_dir().join(safe(name)).join("deprovision")
+}
+
+/// Token of a configured daemon, if any. A child uses this to verify that an
+/// (inherited) MAFOLD_DAEMON_NAME really refers to ITSELF before tombstoning —
+/// a subprocess of a daemon inherits the parent's env, and a tombstone under
+/// the parent's name would deprovision the wrong bot.
+pub fn daemon_token(name: &str) -> Option<String> {
+    load().daemons.iter().find(|d| d.name == name).map(|d| d.token.clone())
+}
+
+/// Called by a daemon child right before it exits because its bot no longer
+/// exists. The supervisor owns daemons.json, so the child only leaves this
+/// marker; the next tick removes the daemon from the config.
+pub fn request_deprovision(name: &str, reason: &str) {
+    let p = deprovision_path(name);
+    if let Some(dir) = p.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(p, reason);
+}
+
+/// Drop every tombstoned daemon from the config (and make sure it's dead).
+/// Runs at the top of each supervise tick, BEFORE the respawn pass — so a
+/// deprovisioned daemon can't be brought back by the liveness check.
+fn sweep_deprovisioned() {
+    let mut c = load();
+    let mut dropped = Vec::new();
+    c.daemons.retain(|d| {
+        let p = deprovision_path(&d.name);
+        if !p.exists() {
+            return true;
+        }
+        let reason = fs::read_to_string(&p).unwrap_or_default();
+        let _ = fs::remove_file(&p);
+        dropped.push((d.name.clone(), reason));
+        false
+    });
+    if dropped.is_empty() {
+        return;
+    }
+    if let Err(e) = store(&c) {
+        eprintln!("✗ deprovision sweep couldn't rewrite config: {e}");
+        return;
+    }
+    for (name, reason) in dropped {
+        let _ = stop_one(&name);
+        println!("✂ deprovisioned `{name}` — {}", if reason.is_empty() { "bot deleted server-side" } else { &reason });
+    }
+}
+
 /// `mafold rm <name>` — drop from config (and stop it if running).
 pub fn rm(name: &str) -> Result<()> {
     let mut c = load();
@@ -345,6 +399,9 @@ pub async fn supervise(base: String) {
     let mut ticks: u64 = 0;
     loop {
         reap(); // clear zombies so the liveness check below is accurate
+        // A daemon whose bot was deleted server-side tombstones itself and
+        // exits — drop it from the config BEFORE the respawn pass below.
+        sweep_deprovisioned();
         let cfg = load();
         // Keep every configured daemon running (start any that died / aren't up).
         for d in &cfg.daemons {

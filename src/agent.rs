@@ -158,6 +158,11 @@ struct TurnHandle {
     /// The lowercased username that triggered this turn (only they may answer its
     /// AskUserQuestion — a bystander can't answer someone else's agent question).
     owner: String,
+    /// This turn's renderer event channel — used to inject the daemon-internal
+    /// `AskAnswered` event when a reply answers the pending ask, so the renderer
+    /// stamps the answer into the ask card (the card renders as answered from
+    /// then on, on every client and across reloads).
+    events: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
 }
 
 // `model` overrides the model for this chat (`/model …`). Conversation-scoped;
@@ -434,7 +439,11 @@ fn save_sessions(map: &HashMap<String, String>) {
     }
 }
 
+/// When this daemon process started serving — `/status` uptime.
+static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 pub async fn run(client: Client, workdir: Option<String>, harness_id: String, auto_update: bool) -> Result<()> {
+    let _ = START.set(std::time::Instant::now());
     // Self-update on startup (before connecting) so a (re)started agent is
     // always current; if it updates, re-exec into the new binary.
     if auto_update {
@@ -446,7 +455,30 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
         }
     }
 
-    let me = client.me().await.context("getMe failed — check the token / --base")?;
+    // Resolve identity — but treat a REJECTED token (401/403) differently from
+    // a network/server failure: rejected means the bot was deleted or the token
+    // rotated while we were down, and erroring out here would just have the
+    // supervisor crash-loop us forever. Give the server a short grace window,
+    // then deprovision.
+    let me = {
+        const STARTUP_REJECT_LIMIT: u32 = 5;
+        let mut rejects = 0u32;
+        loop {
+            match client.me_probed().await {
+                Ok(crate::client::MeProbe::Me(v)) => break v,
+                Ok(crate::client::MeProbe::AuthRejected) => {
+                    rejects += 1;
+                    eprintln!("getMe auth-rejected ({rejects}/{STARTUP_REJECT_LIMIT}) — bot deleted or token rotated?");
+                    if rejects >= STARTUP_REJECT_LIMIT {
+                        let shown = std::env::var("MAFOLD_DAEMON_NAME").unwrap_or_else(|_| "this bot".into());
+                        deprovision_and_exit(&shown, &client.token, "token rejected at startup");
+                    }
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+                Err(e) => return Err(e).context("getMe failed — check the token / --base"),
+            }
+        }
+    };
     let my_username = me["username"].as_str().unwrap_or_default().to_string();
     anyhow::ensure!(!my_username.is_empty(), "could not resolve bot identity (bad token?)");
 
@@ -563,11 +595,28 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
 
     // Reconnect loop: a dropped WS (network blip, server restart) must NOT kill
     // the daemon. Reconnect with backoff; sessions/coord persist across it.
+    // A DELETED bot must not reconnect forever, though: botDeleted (live) or a
+    // streak of 401s (deleted while we were offline / token rotated) ends with
+    // deprovision — the daemon removes itself instead of haunting the machine.
+    const AUTH_REJECT_LIMIT: u32 = 10; // ~5 min at the 30s backoff cap
     let mut backoff = 1u64;
+    let mut auth_rejects = 0u32;
     let mut last_update_check = std::time::Instant::now();
     loop {
-        if let Err(e) = connect_and_run(&client, &workdir, &my_username, &sessions, &coord, &chat_states, &bot_msg_ids, &harness, &owner, &allow, auto_update).await {
-            eprintln!("connection error: {e}");
+        match connect_and_run(&client, &workdir, &my_username, &sessions, &coord, &chat_states, &bot_msg_ids, &harness, &owner, &allow, auto_update).await {
+            Ok(WsExit::Deprovisioned) => deprovision_and_exit(&my_username, &client.token, "bot deleted server-side"),
+            Ok(WsExit::AuthRejected) => {
+                auth_rejects += 1;
+                eprintln!("auth rejected ({auth_rejects}/{AUTH_REJECT_LIMIT}) — bot deleted or token rotated?");
+                if auth_rejects >= AUTH_REJECT_LIMIT {
+                    deprovision_and_exit(&my_username, &client.token, "token permanently rejected");
+                }
+            }
+            Ok(WsExit::Dropped) => auth_rejects = 0,
+            Err(e) => {
+                auth_rejects = 0;
+                eprintln!("connection error: {e}");
+            }
         }
         // A dropped WS is a natural idle moment → opportunistically self-update,
         // so a new release lands on reconnect (rate-limited to ≤ once / 5 min so
@@ -580,6 +629,26 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
         tokio::time::sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff * 2).min(30);
     }
+}
+
+/// The bot behind this daemon no longer exists (deleted server-side / token
+/// dead) — stop cleanly instead of reconnect-looping forever. Supervised
+/// (spawned by `mafold up`): leave a tombstone so the supervisor drops us from
+/// daemons.json and never respawns; standalone: just exit with advice.
+/// MAFOLD_DAEMON_NAME alone isn't proof we're supervised — any subprocess of a
+/// daemon (e.g. an agent testing another bot) inherits it — so only tombstone
+/// when the config entry under that name carries OUR token.
+fn deprovision_and_exit(my_username: &str, token: &str, reason: &str) -> ! {
+    let daemon_name = std::env::var("MAFOLD_DAEMON_NAME")
+        .ok()
+        .filter(|n| crate::supervisor::daemon_token(n).as_deref() == Some(token));
+    if let Some(name) = daemon_name {
+        crate::supervisor::request_deprovision(&name, reason);
+        println!("✂ @{my_username}: {reason} — daemon deprovisioned (supervisor will drop it)");
+    } else {
+        println!("✂ @{my_username}: {reason} — exiting. (If this daemon is in `mafold status`, remove it with `mafold rm`.)");
+    }
+    std::process::exit(0);
 }
 
 /// Check for a newer release; if one exists and the agent is IDLE (no turn in
@@ -613,7 +682,7 @@ fn control_commands() -> Vec<Value> {
         serde_json::json!({ "command": "stop",   "description": "Stop the reply that's currently running" }),
         serde_json::json!({ "command": "model",  "description": "Switch the model for this chat", "arg_hint": "name | reset" }),
         serde_json::json!({ "command": "think",  "description": "Toggle extended thinking for this chat", "arg_hint": "on | off | <tokens>" }),
-        serde_json::json!({ "command": "status", "description": "Is the agent busy? show the working directory" }),
+        serde_json::json!({ "command": "status", "description": "Agent, session, account & daemon info" }),
         serde_json::json!({ "command": "cwd",    "description": "Show the working directory" }),
         serde_json::json!({ "command": "help",   "description": "What this agent can do" }),
     ]
@@ -630,6 +699,20 @@ async fn publish_commands(client: &Client, workdir: &str, harness: &Arc<dyn Harn
     if client.set_commands(Value::Array(commands)).await.is_ok() {
         println!("published {n} commands (control + discovered skills) to the chat menu");
     }
+}
+
+/// Why a WS session ended — tells the reconnect loop whether to reconnect
+/// (Dropped), count a rejection (AuthRejected), or deprovision (Deprovisioned).
+enum WsExit {
+    /// Socket dropped (network blip, server restart) — reconnect as before.
+    Dropped,
+    /// Handshake rejected with 401/403: the token no longer authenticates —
+    /// the bot was deleted or the token rotated. Transient server trouble
+    /// looks different (connect error / 5xx), so the caller counts these and
+    /// deprovisions only after several in a row.
+    AuthRejected,
+    /// The server told us our bot was deleted (events.botDeleted) — stop now.
+    Deprovisioned,
 }
 
 /// One WS session: connect, keepalive-ping, dispatch incoming messages. Returns
@@ -649,10 +732,18 @@ async fn connect_and_run(
     // Standalone agent (true) self-updates on cliUpdate; a supervised child
     // (--no-auto-update → false) nudges the supervisor to update instead.
     auto_update: bool,
-) -> Result<()> {
-    let (ws, _) = tokio_tungstenite::connect_async(client.ws_request())
-        .await
-        .context("WebSocket connect failed")?;
+) -> Result<WsExit> {
+    use tokio_tungstenite::tungstenite;
+    let (ws, _) = match tokio_tungstenite::connect_async(client.ws_request()).await {
+        Ok(v) => v,
+        Err(tungstenite::Error::Http(resp))
+            if resp.status() == tungstenite::http::StatusCode::UNAUTHORIZED
+                || resp.status() == tungstenite::http::StatusCode::FORBIDDEN =>
+        {
+            return Ok(WsExit::AuthRejected);
+        }
+        Err(e) => return Err(e).context("WebSocket connect failed"),
+    };
     let (mut write, mut read) = ws.split();
     println!("listening for messages to @{my_username} …");
 
@@ -738,6 +829,18 @@ async fn connect_and_run(
                     let results = inline_results(&query);
                     let _ = client.answer_inline_query(&query_id, results).await;
                 });
+            }
+            continue;
+        }
+        // Our bot was deleted server-side (owner hit "Delete this bot") — the
+        // account and token are gone, so this daemon can never work again.
+        // Tell the caller to deprovision instead of reconnect-looping forever.
+        if method == "events.botDeleted" {
+            let gone = env["params"]["username"].as_str().unwrap_or("");
+            if gone.eq_ignore_ascii_case(my_username) {
+                println!("✂ bot @{my_username} was deleted server-side");
+                ping.abort();
+                return Ok(WsExit::Deprovisioned);
             }
             continue;
         }
@@ -833,20 +936,25 @@ async fn connect_and_run(
         // target (message_id) picks the exact turn, so two concurrent asks never
         // cross. Only the turn's own triggering sender may answer it. `/stop`
         // falls through to cancel instead.
-        let pending_ask: Option<(String, String)> = if let Some(rid) = m.reply_to_id.as_deref() {
-            let states = chat_states.lock().await;
-            states
-                .get(&m.conversation_id)
-                .and_then(|s| s.turns.get(rid))
-                .and_then(|t| match &t.ask_file {
-                    Some(f) if t.owner == sender_lc => Some((rid.to_string(), f.clone())),
-                    _ => None,
-                })
-        } else {
-            None
-        };
-        if let Some((rid, ask_file)) = pending_ask {
+        let pending_ask: Option<(String, String, tokio::sync::mpsc::UnboundedSender<AgentEvent>)> =
+            if let Some(rid) = m.reply_to_id.as_deref() {
+                let states = chat_states.lock().await;
+                states
+                    .get(&m.conversation_id)
+                    .and_then(|s| s.turns.get(rid))
+                    .and_then(|t| match &t.ask_file {
+                        Some(f) if t.owner == sender_lc => Some((rid.to_string(), f.clone(), t.events.clone())),
+                        _ => None,
+                    })
+            } else {
+                None
+            };
+        if let Some((rid, ask_file, events)) = pending_ask {
             if !(trimmed.eq_ignore_ascii_case("/stop") || trimmed.eq_ignore_ascii_case("/cancel")) {
+                // Stamp first, THEN unblock the hook: the stamp event must enter
+                // the renderer channel ahead of whatever the resumed agent
+                // streams next, so the card flips to "answered" immediately.
+                let _ = events.send(AgentEvent::AskAnswered(m.content.trim().to_string()));
                 let _ = std::fs::write(&ask_file, m.content.trim());
                 if let Some(s) = chat_states.lock().await.get_mut(&m.conversation_id) {
                     if let Some(t) = s.turns.get_mut(&rid) { t.ask_file = None; }
@@ -904,6 +1012,8 @@ async fn connect_and_run(
         // (so the re-fetched history can exclude the bot + the triggering message).
         let me_user = my_username.to_string();
         let trigger_id = m.id.clone();
+        // For stamping a text-emitted ask card the reply just answered (below).
+        let reply_to_id = m.reply_to_id.clone();
         // The (lowercased) sender that triggered this turn — only they may answer
         // its AskUserQuestion (bound into the per-chat state by `handle`).
         let turn_sender = sender_lc.clone();
@@ -941,6 +1051,14 @@ async fn connect_and_run(
                     crate::harness::CommandOutcome::Forward => {}
                 }
             }
+            // If this reply targeted one of our FINALIZED messages still showing
+            // an unanswered {% ask %} card (the model asked in its reply text —
+            // no blocking hook), stamp the answer into that card via editMessage
+            // before running the turn. Mirror of the live-turn stamp: the card
+            // becomes one-shot on every client, across reloads.
+            if let Some(rid) = &reply_to_id {
+                stamp_finalized_ask(&client, &chat_id, rid, &me_user, &content, thread_root.as_deref()).await;
+            }
             // Rebuild multi-party group context the access gate dropped (None for
             // DMs / when there's nothing the resumed session is missing).
             let group_context = recent_group_context(&client, &chat_id, &me_user, &turn_sender, &trigger_id, thread_root.as_deref()).await;
@@ -951,7 +1069,7 @@ async fn connect_and_run(
     }
     ping.abort();
     println!("disconnected.");
-    Ok(())
+    Ok(WsExit::Dropped)
 }
 
 /// Is this slash name one the daemon handles itself (vs a Claude Code skill)?
@@ -1095,11 +1213,39 @@ async fn handle_control(
                     st.and_then(|s| s.thinking),
                 )
             };
+            let session = sessions.lock().await.get(chat_id).cloned();
             let think = match thinking { Some(n) => format!("on ({n} tokens)"), None => "off".into() };
             let state = if busy { "running a reply now" } else { "idle" };
             let auth = harness.status_line().await;
-            let auth_line = if auth.is_empty() { String::new() } else { format!("\n• {}: {auth}", harness.id()) };
-            let _ = client.send(chat_id, &format!("Agent {state}.\n• harness: {}\n• workdir: {workdir}\n• model: {model}\n• thinking: {think}{auth_line}", harness.id())).await;
+            let cli_ver = crate::commands::claude_version().await;
+
+            let mut body = format!("kv|Agent|{state}\n");
+            let mut hline = harness.id().to_string();
+            if !cli_ver.is_empty() { hline.push_str(&format!(" · v{cli_ver}")); }
+            body.push_str(&format!("kv|Harness|{hline}\n"));
+            if !auth.is_empty() { body.push_str(&format!("kv|Account|{auth}\n")); }
+            body.push_str(&format!("kv|Model|{model} · thinking {think}\n"));
+            match &session {
+                Some(sid) => {
+                    let mut v = sid.get(..8).unwrap_or(sid.as_str()).to_string();
+                    if sid.len() > 8 { v.push('…'); }
+                    if let Some(ctx) = crate::commands::session_context_tokens(workdir, sid) {
+                        v.push_str(&format!(" · context ≈ {}", crate::commands::humanize(ctx)));
+                    }
+                    body.push_str(&format!("kv|Session|{v}\n"));
+                }
+                None => body.push_str("kv|Session|none — next message starts fresh\n"),
+            }
+            body.push_str(&format!("kv|Workdir|{workdir}\n"));
+            let uptime = START.get().map(|s| s.elapsed().as_secs() as i64).unwrap_or(0);
+            body.push_str(&format!(
+                "kv|Daemon|v{} · up {}\n",
+                env!("CARGO_PKG_VERSION"),
+                crate::commands::fmt_dur(uptime),
+            ));
+            let _ = client
+                .send(chat_id, &format!("{{% stats title=\"Status\" icon=\"target\" %}}\n{body}{{% /stats %}}"))
+                .await;
         }
         "cwd" => {
             let _ = client.send(chat_id, &format!("Working directory: {workdir}")).await;
@@ -1415,6 +1561,43 @@ almost certainly still running. Never claim a session or task is dead without di
 /// Returns `None` only when there's genuinely nothing recent to show (e.g. a
 /// brand-new chat). Stateless: pulls from the server every turn, so it survives
 /// daemon restarts + offline gaps.
+/// Best-effort stamp for a reply that answered a TEXT-emitted `{% ask %}` card
+/// in one of the bot's own finalized messages (the live-turn path in
+/// `render_loop` never sees these — the turn ended when the model's reply text
+/// went out). Fetches recent history (thread-aware), verifies the replied-to
+/// message is ours and its last ask card is still unanswered, then edits the
+/// answer in as `a|` rows. Any miss — history too short, not our message, no
+/// card, already stamped, edit rejected — is a silent no-op.
+async fn stamp_finalized_ask(
+    client: &Client,
+    chat_id: &str,
+    message_id: &str,
+    my_username: &str,
+    answer: &str,
+    thread_root: Option<&str>,
+) {
+    let page = match thread_root {
+        Some(root) => client.get_thread_messages(chat_id, root, 50).await,
+        None => client.get_chat_history(chat_id, 50).await,
+    };
+    let Ok(page) = page else { return };
+    let Some(items) = page.get("items").and_then(|i| i.as_array()) else { return };
+    let Some(msg) = items.iter().find(|m| m.get("id").and_then(|v| v.as_str()) == Some(message_id)) else { return };
+    let sender = msg
+        .get("sender")
+        .and_then(|s| s.get("username"))
+        .and_then(|u| u.as_str())
+        .unwrap_or("");
+    if !sender.eq_ignore_ascii_case(my_username) {
+        return;
+    }
+    let Some(content) = msg.get("content").and_then(|c| c.as_str()) else { return };
+    let Some(stamped) = crate::render::stamp_unanswered_ask(content, answer) else { return };
+    let _ = client
+        .call("editMessage", serde_json::json!({ "message_id": message_id, "text": stamped }))
+        .await;
+}
+
 async fn recent_group_context(
     client: &Client,
     chat_id: &str,
@@ -1559,14 +1742,22 @@ async fn handle(
     // Open the draft NOW (right before streaming) so a turn never shows an empty
     // bubble while it sets up. Register it keyed by its draft id, so `/stop`, the
     // Stop button, and ask-answers (reply → this draft) can target THIS turn.
+    // The renderer channel is created here (before registration) so the handle
+    // can carry its sender for the ask-answered stamp.
     let cancel = Arc::new(Notify::new());
+    let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     let msg_id = client.create_draft(chat_id, thread_root).await?;
     {
         let mut states = chat_states.lock().await;
         let st = states.entry(chat_id.to_string()).or_default();
         st.turns.insert(
             msg_id.clone(),
-            TurnHandle { cancel: cancel.clone(), ask_file: None, owner: turn_sender.to_string() },
+            TurnHandle {
+                cancel: cancel.clone(),
+                ask_file: None,
+                owner: turn_sender.to_string(),
+                events: ev_tx.clone(),
+            },
         );
     }
 
@@ -1586,7 +1777,6 @@ async fn handle(
     // markdoc deltas (text + cards), so a slow append never stalls reading. It
     // also flips this chat into "awaiting answer" when AskUserQuestion is called,
     // so the next message routes to the hook's `ask_file`.
-    let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     let renderer = {
         let client = client.clone();
         let msg_id = msg_id.clone();
@@ -1597,6 +1787,12 @@ async fn handle(
     };
 
     let result = harness.run(turn, ev_tx).await;
+    // Drop this turn's handle NOW — the run is over (no more /stop or ask-answer
+    // routing), and the handle holds a clone of the renderer's event sender: the
+    // renderer only exits once EVERY sender is gone, so removing the handle after
+    // `renderer.await` deadlocks (the renderer never sees the channel close and
+    // keeps re-pushing the generating card forever).
+    if let Some(st) = chat_states.lock().await.get_mut(chat_id) { st.turns.remove(&msg_id); }
     let _ = renderer.await;
 
     match result {
@@ -1626,9 +1822,7 @@ async fn handle(
             let _ = client.append_delta(&msg_id, &format!("⚠️ Agent error: {e}")).await;
         }
     }
-    // Drop this turn's handle (cancel + pending-ask) now the run is over; the
-    // per-chat model/gate stay. Drop the per-turn answer file.
-    if let Some(st) = chat_states.lock().await.get_mut(chat_id) { st.turns.remove(&msg_id); }
+    // (The turn handle was already dropped above, before awaiting the renderer.)
     let _ = std::fs::remove_file(&ask_file);
     let _ = client.finalize(&msg_id).await;
     println!("→ finalized reply for chat {chat_id}");
@@ -1726,6 +1920,15 @@ async fn render_loop(
                         }
                     }
                 }
+                // The pending ask was answered — stamp `a|` rows into the open
+                // ask card (it's the last one in `full`; the turn was blocked on
+                // it, so nothing streamed past it) and force-push so every
+                // client flips the card to answered right away.
+                AgentEvent::AskAnswered(answer) => {
+                    if crate::render::stamp_ask_answered(&mut full, answer) {
+                        push_running!(true);
+                    }
+                }
                 AgentEvent::Done { .. } => {
                     commit_buf!();
                     commit_group!();
@@ -1733,7 +1936,10 @@ async fn render_loop(
                         full.push_str(&s); // {% result %}
                     }
                     // Final snapshot WITHOUT the generating card; handle() finalizes.
+                    // Done is terminal: return NOW so no later timeout tick can
+                    // re-push the generating card over the finished reply.
                     let _ = client.edit_draft(&msg_id, &full).await;
+                    return;
                 }
                 AgentEvent::Session(_) => {}
                 // tool / diff / bash result / thinking → into the current group.

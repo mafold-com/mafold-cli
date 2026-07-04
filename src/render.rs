@@ -36,6 +36,52 @@ pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<St
         }
         AgentEvent::Done { duration_ms, cost_usd, tokens } => result_tag(*duration_ms, *cost_usd, *tokens),
         AgentEvent::Session(_) => None,
+        // Not rendered as new content — the render loop stamps it into the
+        // already-emitted ask card via `stamp_ask_answered`.
+        AgentEvent::AskAnswered(_) => None,
+    }
+}
+
+/// Stamp the user's answer into the pending (last unanswered) `{% ask %}` card
+/// in `full` by rewriting its opening tag to `{% ask answered="…" %}`. The
+/// message content itself is the durable record — a reloaded page or another
+/// device renders the card answered instead of re-offering the buttons. A
+/// stamped opener no longer matches the bare `{% ask %}` needle, so an
+/// already-answered card can never be re-stamped. Returns false when no
+/// unanswered ask card is present.
+pub fn stamp_ask_answered(full: &mut String, answer: &str) -> bool {
+    const OPEN: &str = "{% ask %}";
+    let Some(pos) = full.rfind(OPEN) else { return false };
+    let val = answered_attr(answer);
+    full.replace_range(pos..pos + OPEN.len(), &format!("{{% ask answered=\"{val}\" %}}"));
+    true
+}
+
+/// Finalized-message variant of [`stamp_ask_answered`] — for asks the model
+/// emitted in its reply TEXT (no blocking hook; the turn already ended when
+/// the answer arrives). Returns the stamped content, or None when the message
+/// has no unanswered ask card.
+pub fn stamp_unanswered_ask(content: &str, answer: &str) -> Option<String> {
+    let mut out = content.to_string();
+    stamp_ask_answered(&mut out, answer).then_some(out)
+}
+
+/// The `answered` attribute value: `attr_esc`'s cleanup but with a cap wide
+/// enough for a multi-question answer (headers + labels), and never empty —
+/// a blank reply still has to flip the card to answered.
+fn answered_attr(answer: &str) -> String {
+    let cleaned: String = answer
+        .chars()
+        .map(|c| match c { '"' => '\'', '\n' | '\r' | '\t' => ' ', _ => c })
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return "✓".into();
+    }
+    if cleaned.chars().count() > 300 {
+        format!("{}…", cleaned.chars().take(300).collect::<String>())
+    } else {
+        cleaned.to_string()
     }
 }
 
@@ -283,5 +329,52 @@ fn attr_esc(s: &str) -> String {
         format!("{}…", cleaned.chars().take(80).collect::<String>())
     } else {
         cleaned.to_string()
+    }
+}
+
+#[cfg(test)]
+mod stamp_tests {
+    use super::{stamp_ask_answered, stamp_unanswered_ask};
+
+    const CARD: &str = "hi\n{% ask %}\nq|Deploy|0|Ship?\no|Yes|now\no|Hold|later\n{% /ask %}\n";
+
+    #[test]
+    fn rewrites_opener_with_answered_attr() {
+        let mut full = CARD.to_string();
+        assert!(stamp_ask_answered(&mut full, "Yes"));
+        assert!(full.contains("{% ask answered=\"Yes\" %}\nq|Deploy|0|Ship?"));
+        assert!(!full.contains("{% ask %}"));
+    }
+
+    #[test]
+    fn stamps_last_ask_only_and_escapes() {
+        let mut full = format!("{CARD}text\n{CARD}");
+        assert!(stamp_ask_answered(&mut full, "Say \"go\"\nRegion: EU"));
+        // first card untouched, second stamped; quotes → ', newlines → space
+        assert!(full.starts_with(CARD));
+        assert!(full.contains("{% ask answered=\"Say 'go' Region: EU\" %}"));
+    }
+
+    #[test]
+    fn empty_answer_still_marks_answered() {
+        let mut full = CARD.to_string();
+        assert!(stamp_ask_answered(&mut full, "  \n "));
+        assert!(full.contains("{% ask answered=\"✓\" %}"));
+    }
+
+    #[test]
+    fn no_card_is_a_noop() {
+        let mut full = "plain text".to_string();
+        assert!(!stamp_ask_answered(&mut full, "Yes"));
+        assert_eq!(full, "plain text");
+    }
+
+    #[test]
+    fn finalized_stamps_once_only() {
+        let first = stamp_unanswered_ask(CARD, "Hold").expect("unanswered card should stamp");
+        assert!(first.contains("{% ask answered=\"Hold\" %}"));
+        // a stamped opener no longer matches the bare needle → never re-stamped
+        assert!(stamp_unanswered_ask(&first, "Yes").is_none());
+        assert!(stamp_unanswered_ask("no card here", "Yes").is_none());
     }
 }

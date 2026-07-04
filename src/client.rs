@@ -4,6 +4,12 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
+/// Outcome of `me_probed`: the identity, or a definitive auth rejection.
+pub enum MeProbe {
+    Me(Value),
+    AuthRejected,
+}
+
 #[derive(Clone)]
 pub struct Client {
     pub http: reqwest::Client,
@@ -39,6 +45,31 @@ impl Client {
     pub async fn call(&self, method: &str, body: Value) -> Result<Value> { self.post(method, body).await }
 
     pub async fn me(&self) -> Result<Value> { self.post("getMe", json!({})).await }
+
+    /// `getMe`, but with an AUTH REJECTION (401/403 — token revoked / bot
+    /// deleted) split out from ordinary failures, so a daemon whose bot was
+    /// deleted while it was offline can deprovision at startup instead of
+    /// crash-looping under the supervisor forever.
+    pub async fn me_probed(&self) -> Result<MeProbe> {
+        let resp = self
+            .http
+            .post(format!("{}/api/getMe", self.base))
+            .bearer_auth(&self.token)
+            .json(&json!({}))
+            .send()
+            .await
+            .context("getMe request failed")?;
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            || resp.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            return Ok(MeProbe::AuthRejected);
+        }
+        let v: Value = resp.json().await.context("getMe returned non-JSON")?;
+        if v.get("ok").and_then(Value::as_bool) == Some(false) {
+            anyhow::bail!("getMe: {}", v["description"].as_str().unwrap_or("error"));
+        }
+        Ok(MeProbe::Me(v["result"].clone()))
+    }
     pub async fn chats(&self) -> Result<Value> { self.post("getChats", json!({})).await }
 
     /// A single conversation (`{ id, kind, participants, … }`) — used to tell a
