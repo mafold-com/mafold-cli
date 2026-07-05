@@ -54,6 +54,23 @@ pub enum AppsCmd {
         #[arg(long, default_value = ".")]
         dir: String,
     },
+    /// Register a WEBVIEW app (Telegram-mini-app model): just a URL you host.
+    /// Prints the signing secret ONCE — your backend verifies launch JWTs with it.
+    Register {
+        /// App id, `owner/slug` (e.g. `ops/todo`).
+        id: String,
+        /// The externally hosted app URL (https).
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        name: Option<String>,
+        /// Lucide icon name or image URL.
+        #[arg(long)]
+        icon: Option<String>,
+        /// Capabilities, comma-separated (e.g. `room,chat.send,storage`).
+        #[arg(long, value_delimiter = ',')]
+        capabilities: Vec<String>,
+    },
     /// List the apps you can manage (own the namespace of).
     List,
     /// Take down an app you own (all versions). `id` is `owner/slug`.
@@ -93,6 +110,9 @@ pub async fn run(cmd: AppsCmd, base: String, token: Option<String>) -> Result<()
         AppsCmd::Init { id, dir } => cmd_init(&id, &dir),
         AppsCmd::Dev { dir, port } => cmd_dev(&dir, port).await,
         AppsCmd::Publish { dir } => cmd_publish(&dir, base, token).await,
+        AppsCmd::Register { id, url, name, icon, capabilities } => {
+            cmd_register(&id, &url, name, icon, capabilities, base, token).await
+        }
         AppsCmd::List => cmd_list(base, token).await,
         AppsCmd::Remove { id } => cmd_remove(&id, base, token).await,
     }
@@ -223,6 +243,38 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
 }
 
 // ───────────────────────────── list ─────────────────────────────
+
+async fn cmd_register(
+    id: &str,
+    url: &str,
+    name: Option<String>,
+    icon: Option<String>,
+    capabilities: Vec<String>,
+    base: String,
+    token: Option<String>,
+) -> Result<()> {
+    let token =
+        token.context("register needs your token — pass --token or set $MAFOLD_BOT_TOKEN")?;
+    let client = Client::new(base, token);
+    let r = client
+        .call(
+            "registerWebApp",
+            serde_json::json!({
+                "id": id, "url": url, "name": name, "icon": icon,
+                "capabilities": capabilities,
+            }),
+        )
+        .await?;
+    println!("✓ registered {} → {}", r["id"].as_str().unwrap_or(id), r["url"].as_str().unwrap_or(url));
+    match r["secret"].as_str() {
+        Some(s) => {
+            println!("\nsigning secret (shown ONCE — store it in your app's backend):\n  {s}");
+            println!("\nverify a launch: jwt.verify(Mafold.initData, secret, {{algorithms:[\"HS256\"]}})");
+        }
+        None => println!("(registration updated; existing signing secret unchanged)"),
+    }
+    Ok(())
+}
 
 async fn cmd_list(base: String, token: Option<String>) -> Result<()> {
     let token =
