@@ -32,16 +32,19 @@ const APP_EXTERNALS: &[&str] = &["@mafold/app", "@mafold/runtime-core"];
 
 #[derive(Subcommand)]
 pub enum AppsCmd {
-    /// Scaffold a new mini-app project. `id` is `owner/slug` (e.g. `ops/todo`);
-    /// the project folder is named after the slug.
+    /// Scaffold a new mini-app. Default = WEBVIEW app (one HTML file, any web
+    /// stack — the primary runtime); `--rn` = the legacy remote-ui RN app (beta).
     Init {
         /// App id, `owner/slug` (e.g. `mafold/wallet`, `ops:bot/notes`).
         id: String,
         /// Parent directory to create the project in (default: current dir).
         #[arg(long, default_value = ".")]
         dir: String,
+        /// Scaffold the legacy React-Native remote-ui app instead (BETA).
+        #[arg(long)]
+        rn: bool,
     },
-    /// Bundle + watch + serve the app locally for live preview.
+    /// (beta, remote-ui apps) Bundle + watch + serve the app locally.
     Dev {
         /// App project directory (must contain mafold.app.json).
         #[arg(long, default_value = ".")]
@@ -49,7 +52,8 @@ pub enum AppsCmd {
         #[arg(long, default_value_t = 8788)]
         port: u16,
     },
-    /// Bundle and publish the app to Mafold. Gated: you must own the namespace.
+    /// (beta, remote-ui apps) Bundle and publish the RN app to Mafold.
+    /// Webview apps don't publish — they register a URL (`apps register`).
     Publish {
         #[arg(long, default_value = ".")]
         dir: String,
@@ -119,7 +123,7 @@ fn default_entry() -> String {
 
 pub async fn run(cmd: AppsCmd, base: String, token: Option<String>) -> Result<()> {
     match cmd {
-        AppsCmd::Init { id, dir } => cmd_init(&id, &dir),
+        AppsCmd::Init { id, dir, rn } => cmd_init(&id, &dir, rn),
         AppsCmd::Dev { dir, port } => cmd_dev(&dir, port).await,
         AppsCmd::Publish { dir } => cmd_publish(&dir, base, token).await,
         AppsCmd::Register { id, url, name, icon, capabilities } => {
@@ -172,28 +176,107 @@ async fn cmd_remove_site(site: &str, base: String, token: Option<String>) -> Res
 
 // ───────────────────────────── init ─────────────────────────────
 
-fn cmd_init(id: &str, dir: &str) -> Result<()> {
+fn cmd_init(id: &str, dir: &str, rn: bool) -> Result<()> {
     let (owner, slug) = parse_app_id(id)
         .context("id must be `owner/slug` (e.g. `mafold/wallet`); reverse-DNS is no longer valid")?;
     let root = Path::new(dir).join(&slug);
     if root.exists() {
         anyhow::bail!("{} already exists", root.display());
     }
-    std::fs::create_dir_all(root.join("src"))?;
 
+    // LEGACY (beta): the remote-ui RN scaffold, kept behind --rn.
+    if rn {
+        std::fs::create_dir_all(root.join("src"))?;
+        let title = title_case(&slug);
+        write(&root.join("mafold.app.json"), &manifest_json(id, &title))?;
+        write(&root.join("src/app.tsx"), &sample_app(&slug, &title))?;
+        write(&root.join("package.json"), &package_json(&slug))?;
+        write(&root.join("README.md"), &readme(id, &slug))?;
+        write(&root.join(".gitignore"), "dist/\nnode_modules/\n")?;
+        println!("✓ created REMOTE-UI (beta) app `{owner}/{slug}` in {}", root.display());
+        println!("\nnext:");
+        println!("  cd {}", root.display());
+        println!("  mafold apps dev               # live preview at http://127.0.0.1:8788");
+        println!("  mafold apps publish           # ship it (needs your token; you must own `{owner}`)");
+        return Ok(());
+    }
+
+    // DEFAULT: a WEBVIEW app — one HTML file, any web stack, hosted anywhere
+    // (or on Mafold via deploySite). docs/webview-apps.md is the guide.
+    std::fs::create_dir_all(&root)?;
     let title = title_case(&slug);
-    write(&root.join("mafold.app.json"), &manifest_json(id, &title))?;
-    write(&root.join("src/app.tsx"), &sample_app(&slug, &title))?;
-    write(&root.join("package.json"), &package_json(&slug))?;
-    write(&root.join("README.md"), &readme(id, &slug))?;
-    write(&root.join(".gitignore"), "dist/\nnode_modules/\n")?;
-
-    println!("✓ created app `{owner}/{slug}` in {}", root.display());
+    write(&root.join("index.html"), &webview_sample(&title))?;
+    write(&root.join("README.md"), &webview_readme(id, &slug))?;
+    println!("✓ created webview app `{owner}/{slug}` in {}", root.display());
     println!("\nnext:");
-    println!("  cd {}", root.display());
-    println!("  mafold apps dev               # live preview at http://127.0.0.1:8788");
-    println!("  mafold apps publish           # ship it (needs your bot token; you must own `{owner}`)");
+    println!("  1. open {}/index.html in a browser (SDK mocks off-Mafold gracefully)", root.display());
+    println!("  2. host it anywhere with https — or let Mafold host it:");
+    println!("       POST /api/deploySite  (see docs/webview-apps.md §4)");
+    println!("  3. mafold apps register {owner}/{slug} --url https://… --capabilities room,chat.send");
+    println!("  4. install it into a conversation — the launcher icon appears");
+    println!("\n(the old React-Native remote-ui scaffold is still available as BETA: --rn)");
     Ok(())
+}
+
+fn webview_sample(title: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  body {{ font-family: -apple-system, system-ui, sans-serif; margin: 0; padding: 16px;
+         background: var(--mafold-bg, #fff); color: var(--mafold-text, #111); }}
+  button {{ padding: 10px 14px; border-radius: 10px; border: none; cursor: pointer;
+            background: var(--mafold-accent, #06f); color: #fff; font-size: 14px; }}
+</style>
+</head>
+<body>
+<h2>{title}</h2>
+<p id="who">…</p>
+<p>Shared taps: <b id="count">0</b></p>
+<button id="tap">Tap (everyone sees it)</button>
+<script src="https://mafold.com/js/mafold-webapp.js"></script>
+<script>
+  var M = window.Mafold;
+  var u = M.initDataUnsafe;
+  document.getElementById("who").textContent = u ? "hi @" + u.user.username : "(not launched from Mafold)";
+  M.room.onUpdate(function (doc) {{
+    document.getElementById("count").textContent = (doc && doc.taps && doc.taps.value) || doc && doc.taps || 0;
+  }});
+  M.room.open();
+  document.getElementById("tap").onclick = function () {{ M.room.increment("taps", 1); }};
+  M.ready();
+</script>
+</body>
+</html>
+"#
+    )
+}
+
+fn webview_readme(id: &str, slug: &str) -> String {
+    format!(
+        r#"# {slug} — a Mafold webview mini-app
+
+One HTML file, any web stack. Full guide: `docs/webview-apps.md` in the mafold repo.
+
+## Ship it
+
+1. Host `index.html` anywhere with https (Vercel, your server, …) — or let
+   Mafold host it via `POST /api/deploySite` (→ `https://<site>.mafold.app`).
+2. Register: `mafold apps register {id} --url https://… --capabilities room,chat.send,storage`
+   Keep the printed signing secret if your app has its own backend (it verifies
+   the `Mafold.initData` JWT). Pure client-side apps can ignore it.
+3. Install into a conversation → the launcher icon appears.
+
+## Iterate
+
+Redeploy/redeploy your URL — no re-registration needed. `mafold apps register`
+again only to change name/icon/capabilities (the secret is kept).
+"#
+    )
 }
 
 // ───────────────────────────── dev ─────────────────────────────
