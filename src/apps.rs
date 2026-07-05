@@ -78,6 +78,18 @@ pub enum AppsCmd {
         /// App id, `owner/slug`.
         id: String,
     },
+    /// Rotate a webview app's initData signing secret (old one stops working).
+    RotateSecret {
+        /// App id, `owner/slug`.
+        id: String,
+    },
+    /// List your hosted sites (*.mafold.app).
+    Sites,
+    /// Delete a hosted site you own.
+    RemoveSite {
+        /// Site subdomain (the `<name>` in `<name>.mafold.app`).
+        site: String,
+    },
 }
 
 /// The on-disk app manifest (`mafold.app.json`). Sent verbatim as the publish
@@ -115,7 +127,47 @@ pub async fn run(cmd: AppsCmd, base: String, token: Option<String>) -> Result<()
         }
         AppsCmd::List => cmd_list(base, token).await,
         AppsCmd::Remove { id } => cmd_remove(&id, base, token).await,
+        AppsCmd::RotateSecret { id } => cmd_rotate_secret(&id, base, token).await,
+        AppsCmd::Sites => cmd_sites(base, token).await,
+        AppsCmd::RemoveSite { site } => cmd_remove_site(&site, base, token).await,
     }
+}
+
+async fn cmd_rotate_secret(id: &str, base: String, token: Option<String>) -> Result<()> {
+    let token = token.context("needs your token — pass --token or set $MAFOLD_BOT_TOKEN")?;
+    let client = Client::new(base, token);
+    let r = client.call("rotateAppSecret", serde_json::json!({ "id": id })).await?;
+    println!("✓ rotated. NEW signing secret (shown once):\n  {}", r["secret"].as_str().unwrap_or("?"));
+    println!("\nold secret no longer verifies — update your backend now.");
+    Ok(())
+}
+
+async fn cmd_sites(base: String, token: Option<String>) -> Result<()> {
+    let token = token.context("needs your token — pass --token or set $MAFOLD_BOT_TOKEN")?;
+    let client = Client::new(base, token);
+    let r = client.call("listSites", serde_json::json!({})).await?;
+    let items = r["items"].as_array().cloned().unwrap_or_default();
+    if items.is_empty() {
+        println!("(no sites)");
+        return Ok(());
+    }
+    for s in items {
+        println!(
+            "• {}  {}  (updated {})",
+            s["site"].as_str().unwrap_or("?"),
+            s["url"].as_str().unwrap_or(""),
+            s["updated_at"].as_str().unwrap_or("?")
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_remove_site(site: &str, base: String, token: Option<String>) -> Result<()> {
+    let token = token.context("needs your token — pass --token or set $MAFOLD_BOT_TOKEN")?;
+    let client = Client::new(base, token);
+    client.call("removeSite", serde_json::json!({ "site": site })).await?;
+    println!("✓ removed {site}");
+    Ok(())
 }
 
 // ───────────────────────────── init ─────────────────────────────
