@@ -19,7 +19,15 @@ pub struct Client {
 
 impl Client {
     pub fn new(base: String, token: String) -> Self {
-        Self { http: reqwest::Client::new(), base, token }
+        // Bound only the CONNECT phase: a flaky network (observed: a local proxy
+        // resetting fresh TLS connections) otherwise leaves a POST hanging
+        // indefinitely. No overall request timeout — this client also streams the
+        // multi-MB self-update download, which a blanket timeout would cut off.
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { http, base, token }
     }
 
     /// POST /api/<method>, unwrap the `{ok, result}` envelope or bail.
@@ -175,15 +183,44 @@ impl Client {
         Ok(conv["id"].as_str().context("startChat: no conversation id")?.to_string())
     }
 
+    /// Did this request die in the CONNECT phase — i.e. it never left this
+    /// machine? Only these failures are safe to blindly retry: the server saw
+    /// nothing, so a retry can't duplicate anything. (A timeout/dropped-response
+    /// is NOT safe for non-idempotent calls like botCreateDraft — the request may
+    /// have landed, and a retry would leave an orphaned empty draft bubble.)
+    fn is_connect_error(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<reqwest::Error>().is_some_and(|re| re.is_connect())
+    }
+
     // ── bot streaming write API (used by the agent daemon) ──
     /// Open a streaming draft. When `thread_root_id` is set, the streamed reply
     /// lands in that thread instead of the main channel.
+    ///
+    /// This POST is the reply pipeline's single point of failure: it runs before
+    /// any state exists, and `handle()` propagates its error — so one flaky
+    /// connect used to silently eat the user's message (bot "online but never
+    /// replies"). Connect-phase failures are retried a couple of times (observed
+    /// real-world cause: a local proxy killing fresh TLS connections right after
+    /// the WS reconnects).
     pub async fn create_draft(&self, chat_id: &str, thread_root_id: Option<&str>) -> Result<String> {
         let mut body = json!({ "chat_id": chat_id });
         if let Some(root) = thread_root_id {
             body["thread_root_id"] = json!(root);
         }
-        let r = self.post("botCreateDraft", body).await?;
+        let mut delay = std::time::Duration::from_millis(500);
+        let mut attempt = 0;
+        let r = loop {
+            match self.post("botCreateDraft", body.clone()).await {
+                Ok(r) => break r,
+                Err(e) if attempt < 2 && Self::is_connect_error(&e) => {
+                    attempt += 1;
+                    eprintln!("botCreateDraft connect failed (attempt {attempt}/3) — retrying in {delay:?}…");
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+                Err(e) => return Err(e),
+            }
+        };
         Ok(r["id"].as_str().context("botCreateDraft: no id")?.to_string())
     }
     pub async fn append_delta(&self, message_id: &str, delta: &str) -> Result<()> {

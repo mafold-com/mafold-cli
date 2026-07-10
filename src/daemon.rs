@@ -26,7 +26,7 @@ fn alive(pid: u32) -> bool { platform::pid_alive(pid) }
 
 /// Re-exec ourselves in a new session (detached from the controlling terminal),
 /// with stdio redirected to a log file. The parent records the pid and exits.
-pub fn start_detached(base: &str, token: &str, workdir: Option<&str>, harness: &str) -> Result<u32> {
+pub fn start_detached(base: &str, token: &str, workdir: Option<&str>, harness: &str, no_auto_update: bool) -> Result<u32> {
     if let Some(pid) = read_pid() {
         if alive(pid) {
             anyhow::bail!("agent already running (pid {pid}) — run `mafold stop` first");
@@ -37,8 +37,15 @@ pub fn start_detached(base: &str, token: &str, workdir: Option<&str>, harness: &
     let err = out.try_clone()?;
 
     let mut cmd = Command::new(exe);
-    cmd.arg("agent")
-        .env("MAFOLD_BASE", base)
+    cmd.arg("agent");
+    // The child re-parses its own CLI, so a parent-only --no-auto-update used to
+    // vanish here (the flag isn't in the env set below) — the detached agent then
+    // self-updated anyway. Forward it on argv (it's a global flag, valid after
+    // the subcommand), which also makes it visible in the process list.
+    if no_auto_update {
+        cmd.arg("--no-auto-update");
+    }
+    cmd.env("MAFOLD_BASE", base)
         .env("MAFOLD_BOT_TOKEN", token)
         .env("MAFOLD_HARNESS", harness)
         .stdin(Stdio::null())

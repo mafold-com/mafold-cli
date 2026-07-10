@@ -116,14 +116,14 @@ fn reap() {
 /// `mafold add <name> --workdir … [--harness …]` (token from global --token).
 /// A daemon should simply exist — so adding one brings the boot-persistent
 /// supervisor up: it runs now AND after every reboot, no extra step.
-pub fn add(name: String, token: String, workdir: String, harness: Option<String>, base: &str) -> Result<()> {
+pub fn add(name: String, token: String, workdir: String, harness: Option<String>, base: &str, no_auto_update: bool) -> Result<()> {
     let workdir = fs::canonicalize(&workdir).map(|p| p.to_string_lossy().into_owned()).unwrap_or(workdir);
     let mut c = load();
     c.daemons.retain(|d| d.name != name);
     c.daemons.push(DaemonCfg { name: name.clone(), token, workdir, harness: harness.filter(|s| !s.is_empty()) });
     store(&c)?;
     println!("✓ added daemon `{name}`");
-    up(base)
+    up(base, no_auto_update)
 }
 
 /// Tombstone a daemon writes (via `deprovision_and_exit`) when its bot was
@@ -230,7 +230,7 @@ fn service_path() -> String {
     if base.is_empty() { extra } else { format!("{extra}:{base}") }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
@@ -241,19 +241,23 @@ fn launchagent_path() -> PathBuf {
 }
 
 #[cfg(target_os = "macos")]
-fn ensure_autostart(base: &str) -> Result<()> {
+fn ensure_autostart(base: &str, no_auto_update: bool) -> Result<()> {
     let exe = std::env::current_exe()?;
     let log = home().join(".mafold/supervisor.log");
     fs::create_dir_all(home().join(".mafold"))?;
     fs::create_dir_all(home().join("Library/LaunchAgents"))?;
     let plist = launchagent_path();
+    // Carry `--no-auto-update` into the boot-persistent service so a locally-patched
+    // install isn't clobbered by the supervisor after the next login (matches the
+    // Windows task path + the detached-fallback in start_supervisor).
+    let update_arg = if no_auto_update { "\n    <string>--no-auto-update</string>" } else { "" };
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
 <plist version=\"1.0\"><dict>\n\
   <key>Label</key><string>{label}</string>\n\
   <key>ProgramArguments</key>\n\
-  <array>\n    <string>{exe}</string>\n    <string>--base</string><string>{base}</string>\n    <string>supervise</string>\n  </array>\n\
+  <array>\n    <string>{exe}</string>\n    <string>--base</string><string>{base}</string>\n    <string>supervise</string>{update_arg}\n  </array>\n\
   <key>EnvironmentVariables</key>\n  <dict>\n    <key>PATH</key><string>{path}</string>\n  </dict>\n\
   <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>ProcessType</key><string>Background</string>\n\
   <key>StandardOutPath</key><string>{log}</string>\n  <key>StandardErrorPath</key><string>{log}</string>\n\
@@ -293,12 +297,15 @@ fn systemd_unit_path() -> PathBuf {
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_autostart(base: &str) -> Result<()> {
+fn ensure_autostart(base: &str, no_auto_update: bool) -> Result<()> {
     let exe = std::env::current_exe()?;
     fs::create_dir_all(home().join(".config/systemd/user"))?;
+    // Carry `--no-auto-update` into the boot-persistent unit (see the macOS/Windows
+    // paths) so a locally-patched install survives a reboot un-clobbered.
+    let update_arg = if no_auto_update { " --no-auto-update" } else { "" };
     let unit = format!(
         "[Unit]\nDescription=Mafold bot supervisor\nAfter=network-online.target\n\n\
-[Service]\nEnvironment=PATH={path}\nExecStart={exe} --base {base} supervise\nRestart=always\nRestartSec=3\n\n\
+[Service]\nEnvironment=PATH={path}\nExecStart={exe} --base {base} supervise{update_arg}\nRestart=always\nRestartSec=3\n\n\
 [Install]\nWantedBy=default.target\n",
         exe = exe.display(), base = base, path = service_path(),
     );
@@ -324,11 +331,258 @@ fn autostart_loaded() -> bool {
         .output().map(|o| o.status.success()).unwrap_or(false)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn ensure_autostart(_base: &str) -> Result<()> { anyhow::bail!("boot-persistence not supported on this OS") }
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+// Windows: a per-user Task Scheduler logon task. Registered from an XML file
+// (not `/TR`) because /TR mangles quoted paths AND can't express what we need:
+// no execution time limit (the default kills the supervisor after 72h!),
+// battery guards off, and a hidden task entry. There is no true launchd
+// KeepAlive / systemd Restart=always on Windows — RestartOnFailure only covers
+// the task FAILING TO START, not the process crashing later (verified on Win11)
+// — so a watchdog TimeTrigger re-fires the task every 30 minutes instead:
+// alive → IgnoreNew makes it a no-op; dead → relaunched within half an hour.
+#[cfg(windows)]
+const TASK_NAME: &str = "MafoldSupervisor";
+
+#[cfg(windows)]
+fn task_xml_path() -> PathBuf {
+    home().join(".mafold/supervisor-task.xml")
+}
+
+/// Task Scheduler requires its XML in UTF-16; write it with a BOM so schtasks
+/// accepts the file regardless of the system code page.
+#[cfg(windows)]
+fn write_utf16le(path: &PathBuf, text: &str) -> std::io::Result<()> {
+    let mut bytes = vec![0xFF_u8, 0xFE_u8]; // UTF-16LE BOM
+    for u in text.encode_utf16() {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    fs::write(path, bytes)
+}
+
+/// Decode a console tool's captured stdout. schtasks prints in the CONSOLE
+/// code page (CP936/GBK on Chinese Windows — verified on this machine), so a
+/// plain UTF-8 read garbles any non-ASCII in the task XML (e.g. an exe path
+/// under `C:\Users\中文名\…`) into U+FFFD and every `contains` check on it
+/// silently fails. Try strict UTF-8 first (covers ASCII and CP65001), then
+/// convert from the real console/OEM code page.
+#[cfg(windows)]
+fn decode_console_bytes(bytes: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    use windows_sys::Win32::Globalization::{GetOEMCP, MultiByteToWideChar};
+    use windows_sys::Win32::System::Console::GetConsoleOutputCP;
+    unsafe {
+        let mut cp = GetConsoleOutputCP();
+        if cp == 0 {
+            cp = GetOEMCP();
+        }
+        let n = MultiByteToWideChar(cp, 0, bytes.as_ptr(), bytes.len() as i32, std::ptr::null_mut(), 0);
+        if n <= 0 {
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+        let mut wide = vec![0u16; n as usize];
+        let n = MultiByteToWideChar(cp, 0, bytes.as_ptr(), bytes.len() as i32, wide.as_mut_ptr(), n);
+        if n <= 0 {
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+        String::from_utf16_lossy(&wide[..n as usize])
+    }
+}
+
+/// The registered task's XML, decoded — `None` when the task doesn't exist (or
+/// schtasks is unavailable). Shared by the "is it loaded / is it current"
+/// checks so they judge the same bytes.
+#[cfg(windows)]
+fn query_task_xml() -> Option<String> {
+    let mut cmd = Command::new("schtasks");
+    cmd.args(["/Query", "/TN", TASK_NAME, "/XML"]);
+    platform::no_window_std(&mut cmd);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(decode_console_bytes(&out.stdout))
+}
+
+/// The exact command line the logon task must run for THIS binary + settings.
+/// `--hidden` makes the supervisor hide the console window Windows hands a
+/// console binary at logon; the flag stays supported forever so a task written
+/// by an older install keeps starting newer binaries.
+#[cfg(windows)]
+fn task_arguments(base: &str, no_auto_update: bool) -> String {
+    let mut args = format!("--base {base} supervise --hidden");
+    if no_auto_update {
+        args.push_str(" --no-auto-update");
+    }
+    args
+}
+
+#[cfg(windows)]
+fn ensure_autostart(base: &str, no_auto_update: bool) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    fs::create_dir_all(home().join(".mafold"))?;
+    // Scope the logon trigger + run-as principal to the current user (the task
+    // is per-user, like a launchd gui-domain agent / systemd --user unit).
+    let username = std::env::var("USERNAME").context("USERNAME not set — can't scope the logon task")?;
+    let user = match std::env::var("USERDOMAIN") {
+        Ok(d) if !d.is_empty() => format!("{d}\\{username}"),
+        _ => username,
+    };
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
+<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
+  <RegistrationInfo>\n\
+    <Description>Mafold bot supervisor — keeps your Mafold agent daemons running and restarts them at sign-in.</Description>\n\
+    <URI>\\{task}</URI>\n\
+  </RegistrationInfo>\n\
+  <Triggers>\n\
+    <LogonTrigger>\n\
+      <Enabled>true</Enabled>\n\
+      <UserId>{user}</UserId>\n\
+    </LogonTrigger>\n\
+    <TimeTrigger>\n\
+      <StartBoundary>2020-01-01T00:00:00</StartBoundary>\n\
+      <Repetition>\n\
+        <Interval>PT30M</Interval>\n\
+        <StopAtDurationEnd>false</StopAtDurationEnd>\n\
+      </Repetition>\n\
+      <Enabled>true</Enabled>\n\
+    </TimeTrigger>\n\
+  </Triggers>\n\
+  <Principals>\n\
+    <Principal id=\"Author\">\n\
+      <UserId>{user}</UserId>\n\
+      <LogonType>InteractiveToken</LogonType>\n\
+      <RunLevel>LeastPrivilege</RunLevel>\n\
+    </Principal>\n\
+  </Principals>\n\
+  <Settings>\n\
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n\
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n\
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n\
+    <AllowHardTerminate>true</AllowHardTerminate>\n\
+    <StartWhenAvailable>true</StartWhenAvailable>\n\
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n\
+    <IdleSettings>\n\
+      <StopOnIdleEnd>false</StopOnIdleEnd>\n\
+      <RestartOnIdle>false</RestartOnIdle>\n\
+    </IdleSettings>\n\
+    <AllowStartOnDemand>true</AllowStartOnDemand>\n\
+    <Enabled>true</Enabled>\n\
+    <Hidden>true</Hidden>\n\
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>\n\
+    <WakeToRun>false</WakeToRun>\n\
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n\
+    <Priority>7</Priority>\n\
+    <RestartOnFailure>\n\
+      <Interval>PT1M</Interval>\n\
+      <Count>999</Count>\n\
+    </RestartOnFailure>\n\
+  </Settings>\n\
+  <Actions Context=\"Author\">\n\
+    <Exec>\n\
+      <Command>{exe}</Command>\n\
+      <Arguments>{args}</Arguments>\n\
+    </Exec>\n\
+  </Actions>\n\
+</Task>\n",
+        task = TASK_NAME,
+        user = xml_escape(&user),
+        exe = xml_escape(&exe.display().to_string()),
+        args = xml_escape(&task_arguments(base, no_auto_update)),
+    );
+    let xml_path = task_xml_path();
+    write_utf16le(&xml_path, &xml)?;
+    // /F re-registers in place — same idempotence as launchctl bootout→bootstrap.
+    let mut create = Command::new("schtasks");
+    create.args(["/Create", "/TN", TASK_NAME, "/XML"]).arg(&xml_path).arg("/F");
+    platform::no_window_std(&mut create);
+    let out = create.output().context("schtasks not available")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "schtasks /Create failed: {}",
+            decode_console_bytes(&out.stderr).trim()
+        );
+    }
+    // A logon task only fires at the NEXT sign-in; `up` promises a supervisor
+    // running NOW (launchctl bootstrap / systemctl enable --now semantics), so
+    // kick the task immediately. If that fails, fall back to a plain detached
+    // spawn — boot-persistence is already in place either way.
+    if !run_task() && sup_running().is_none() {
+        let _ = start_supervisor(base, no_auto_update);
+    }
+    Ok(())
+}
+
+/// Start the registered task NOW (so the supervisor runs under the task, where
+/// the watchdog trigger and restart settings govern it). True on success.
+#[cfg(windows)]
+fn run_task() -> bool {
+    let mut cmd = Command::new("schtasks");
+    cmd.args(["/Run", "/TN", TASK_NAME]);
+    platform::no_window_std(&mut cmd);
+    cmd.output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn remove_autostart() {
+    for args in [&["/End", "/TN", TASK_NAME][..], &["/Delete", "/TN", TASK_NAME, "/F"][..]] {
+        let mut cmd = Command::new("schtasks");
+        cmd.args(args);
+        platform::no_window_std(&mut cmd);
+        let _ = cmd.output();
+    }
+    let _ = fs::remove_file(task_xml_path());
+}
+
+/// Loaded = the task exists AND still points at THIS binary. The pointing check
+/// matters: a task registered by an older install keeps its old command line
+/// forever, and a binary/task drift is exactly how boot-persistence silently
+/// broke once (task said `--hidden`, the reinstalled binary didn't know the
+/// flag → exit code 2 at every logon). Any mismatch → not loaded → `up`
+/// re-registers the task against the current binary.
+#[cfg(windows)]
+fn autostart_loaded() -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let Some(xml) = query_task_xml() else { return false };
+    xml.contains(&xml_escape(&exe.display().to_string())) && xml.contains("supervise")
+}
+
+/// Current = loaded AND the task's arguments are exactly what `up` would
+/// register right now. `up`'s idempotence fast-path must use THIS, not
+/// `autostart_loaded`: the task command line encodes `--base`/`--no-auto-update`,
+/// so gating on "loaded" alone would silently ignore a re-run with changed
+/// flags (e.g. `mafold up --no-auto-update` on a machine whose task was
+/// registered without it — the user's intent would never reach the logon task).
+#[cfg(windows)]
+fn autostart_current(base: &str, no_auto_update: bool) -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let Some(xml) = query_task_xml() else { return false };
+    xml.contains(&xml_escape(&exe.display().to_string()))
+        && xml.contains(&format!("<Arguments>{}</Arguments>", xml_escape(&task_arguments(base, no_auto_update))))
+}
+
+/// The registered plist/unit now carries `--no-auto-update`, so "current" must
+/// compare that flag too — otherwise `up --no-auto-update` after a plain `up` (or
+/// vice-versa) would see a loaded service and skip re-registration, leaving the
+/// wrong update policy persisted across the next reboot.
+#[cfg(not(windows))]
+fn autostart_current(_base: &str, no_auto_update: bool) -> bool {
+    if !autostart_loaded() { return false; }
+    #[cfg(target_os = "macos")]
+    let registered = fs::read_to_string(launchagent_path()).map(|s| s.contains("--no-auto-update")).unwrap_or(false);
+    #[cfg(target_os = "linux")]
+    let registered = fs::read_to_string(systemd_unit_path()).map(|s| s.contains("--no-auto-update")).unwrap_or(false);
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let registered = no_auto_update; // unsupported OS: unreachable (autostart_loaded() == false)
+    registered == no_auto_update
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+fn ensure_autostart(_base: &str, _no_auto_update: bool) -> Result<()> { anyhow::bail!("boot-persistence not supported on this OS") }
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn remove_autostart() {}
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn autostart_loaded() -> bool { false }
 
 /// `mafold up` — bring the supervisor up as a boot-persistent service (one per
@@ -336,18 +590,30 @@ fn autostart_loaded() -> bool { false }
 /// is the default — once up, it starts on login and relaunches on crash, until
 /// `mafold down`. Idempotent: re-running just confirms (the running supervisor
 /// picks up add/rm within ~10s).
-pub fn up(base: &str) -> Result<()> {
+pub fn up(base: &str, no_auto_update: bool) -> Result<()> {
     let c = load();
     if c.daemons.is_empty() {
         println!("No daemons configured. Add one:\n  mafold --token mb_… add <bot> --workdir /path/to/repo");
         return Ok(());
     }
-    if autostart_loaded() {
+    if autostart_current(base, no_auto_update) {
+        // Registered and pointing at this binary + these flags. On Windows
+        // "registered" doesn't imply "alive" (no KeepAlive analogue — a crashed
+        // supervisor stays down until the next logon/watchdog tick), and `up` is
+        // exactly the command a user runs to fix an offline bot: revive it here
+        // instead of just claiming success.
+        #[cfg(windows)]
+        if sup_running().is_none() {
+            if !run_task() {
+                let _ = start_supervisor(base, no_auto_update);
+            }
+            println!("↑ revived the supervisor (task was registered but no process was running)");
+        }
         println!("✓ supervisor enabled (boot-persistent) — managing {} daemon(s); picks up changes within ~10s", c.daemons.len());
         return Ok(());
     }
     kill_supervisor_process(); // clear any stale detached supervisor first
-    match ensure_autostart(base) {
+    match ensure_autostart(base, no_auto_update) {
         Ok(()) => {
             println!("✓ supervisor enabled — managing {} daemon(s); starts on login + relaunches on crash", c.daemons.len());
             println!("  logs:   ~/.mafold/daemons/<name>/log  (supervisor: ~/.mafold/supervisor.log)");
@@ -357,7 +623,7 @@ pub fn up(base: &str) -> Result<()> {
             // No service manager → at least run it now (just not across reboots).
             eprintln!("note: couldn't enable autostart ({e}); running detached (won't survive reboot)");
             if sup_running().is_none() {
-                let pid = start_supervisor(base)?;
+                let pid = start_supervisor(base, no_auto_update)?;
                 println!("✓ supervisor running (pid {pid}) — managing {} daemon(s)", c.daemons.len());
             } else {
                 println!("supervisor already running (detached)");
@@ -368,14 +634,19 @@ pub fn up(base: &str) -> Result<()> {
 }
 
 /// Spawn the detached `mafold supervise` process.
-fn start_supervisor(base: &str) -> Result<u32> {
+fn start_supervisor(base: &str, no_auto_update: bool) -> Result<u32> {
     fs::create_dir_all(daemons_dir())?;
     let exe = std::env::current_exe()?;
     let out = fs::OpenOptions::new().create(true).append(true).open(home().join(".mafold/supervisor.log"))?;
     let err = out.try_clone()?;
     let mut cmd = Command::new(exe);
-    cmd.arg("--base").arg(base).arg("supervise")
-        .stdin(Stdio::null())
+    cmd.arg("--base").arg(base).arg("supervise");
+    // Carry the caller's update setting into the detached process — this is the
+    // same intent the service/task command line encodes on the managed paths.
+    if no_auto_update {
+        cmd.arg("--no-auto-update");
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err));
     platform::configure_detached(&mut cmd);
@@ -389,7 +660,7 @@ fn start_supervisor(base: &str) -> Result<u32> {
 /// updates — check hourly, replace the shared binary safely (locked + verified),
 /// then stop all daemons and re-exec self so the new supervisor respawns them on
 /// the new version.
-pub async fn supervise(base: String) {
+pub async fn supervise(base: String, auto_update: bool) {
     let _ = fs::create_dir_all(daemons_dir());
     if let Ok(mut f) = fs::File::create(sup_pid_path()) {
         let _ = writeln!(f, "{}", std::process::id());
@@ -415,24 +686,34 @@ pub async fn supervise(base: String) {
         }
         // Update check every 10 min (60 × 10s), OR immediately when an agent child
         // nudged us (it relayed an events.cliUpdate) — so a new release lands in
-        // seconds via the webhook path, not only on the 10-min poll.
+        // seconds via the webhook path, not only on the 10-min poll. Gated by
+        // `--no-auto-update` (a locally-patched install must not be clobbered by
+        // an official release; the nudge is still consumed so the file can't pile
+        // up). A version that just failed to apply (e.g. the release download is
+        // unreachable from this network) is under cooldown — retried later, not
+        // on every tick.
         ticks += 1;
         let nudged = crate::update::take_nudge();
-        if nudged || ticks % 60 == 0 {
+        if auto_update && (nudged || ticks % 60 == 0) {
             if nudged { println!("↻ update nudge from a daemon — checking now"); }
             match crate::update::check(&http).await {
+                Ok(Some(r)) if crate::update::recently_failed(&r.version) => {}
                 Ok(Some(r)) => {
                     println!("↻ update v{} available — applying + restarting daemons…", r.version);
-                    if crate::update::apply(&http, &r.url, &r.version, r.sha256.as_deref()).await.is_ok() {
-                        // Graceful drain: download is done; now let in-flight turns
-                        // finish before the kill+reexec, so a daemon watching its
-                        // own release doesn't cut off a reply. Capped so a stuck
-                        // turn can't block updates forever.
-                        drain_daemons(&cfg.daemons, std::time::Duration::from_secs(300)).await;
-                        for d in &cfg.daemons { let _ = stop_one(&d.name); }
-                        let _ = crate::update::reexec(); // new supervisor respawns daemons (new binary)
-                    } else {
-                        eprintln!("update failed — keeping the current version");
+                    match crate::update::apply(&http, &r.url, &r.version, r.sha256.as_deref()).await {
+                        Ok(()) => {
+                            // Graceful drain: download is done; now let in-flight turns
+                            // finish before the kill+reexec, so a daemon watching its
+                            // own release doesn't cut off a reply. Capped so a stuck
+                            // turn can't block updates forever.
+                            drain_daemons(&cfg.daemons, std::time::Duration::from_secs(300)).await;
+                            for d in &cfg.daemons { let _ = stop_one(&d.name); }
+                            let _ = crate::update::reexec(); // new supervisor respawns daemons (new binary)
+                        }
+                        Err(e) => {
+                            crate::update::mark_failed(&r.version);
+                            eprintln!("update to v{} failed ({e:#}) — keeping the current version, retrying in ~1h", r.version);
+                        }
                     }
                 }
                 Ok(None) => {}
@@ -443,7 +724,7 @@ pub async fn supervise(base: String) {
         // (→ add + start their daemons, no `mafold add` paste) and keep this
         // machine's harness report fresh (~every 30s) so New-Bot sees it online.
         if let Some(sess) = crate::session::load() {
-            if let Err(e) = poll_provisions(&http, &base, &sess).await {
+            if let Err(e) = poll_provisions(&http, &base, &sess, !auto_update).await {
                 eprintln!("provision poll failed: {e}");
             }
             if ticks % 3 == 0 {
@@ -456,8 +737,9 @@ pub async fn supervise(base: String) {
 
 /// Claim auto-provision requests for this device and wire each bot into the local
 /// config (the next loop tick starts its daemon). The bot's mb_ token arrives over
-/// the owner's authenticated session — no copy-paste.
-async fn poll_provisions(http: &reqwest::Client, base: &str, sess: &crate::session::Session) -> Result<()> {
+/// the owner's authenticated session — no copy-paste. `no_auto_update` carries the
+/// supervisor's own update setting into the (re)registered autostart entry.
+async fn poll_provisions(http: &reqwest::Client, base: &str, sess: &crate::session::Session, no_auto_update: bool) -> Result<()> {
     let resp: serde_json::Value = http
         .post(format!("{base}/api/claimProvisions"))
         .bearer_auth(&sess.token)
@@ -475,7 +757,7 @@ async fn poll_provisions(http: &reqwest::Client, base: &str, sess: &crate::sessi
         }
         let harness = it["harness"].as_str().map(str::to_string);
         let workdir = provision_workdir(&name);
-        match add(name.clone(), token, workdir, harness, base) {
+        match add(name.clone(), token, workdir, harness, base, no_auto_update) {
             Ok(()) => println!("⬇ provisioned @{name} — its daemon starts on the next tick"),
             Err(e) => eprintln!("provision @{name} failed: {e}"),
         }

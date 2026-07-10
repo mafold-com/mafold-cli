@@ -156,11 +156,51 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Quick "does it run?" check on the downloaded binary before swapping it in.
 fn smoke_test(path: &Path) -> bool {
-    std::process::Command::new(path)
-        .arg("--version")
-        .output()
+    let mut cmd = std::process::Command::new(path);
+    cmd.arg("--version");
+    crate::platform::no_window_std(&mut cmd); // a hidden supervisor must not flash a console
+    cmd.output()
         .map(|o| o.status.success() && !o.stdout.is_empty())
         .unwrap_or(false)
+}
+
+/// Does the on-disk binary actually report `version`? Guards the stamp early-exit
+/// in `apply`: the stamp is machine-global (`~/.mafold/installed-version`), but a
+/// machine can end up with several mafold copies (a manual install over an
+/// updated one, a second checkout's build) — then the stamp says "vX installed"
+/// while OUR file is still older. Trusting it made apply() return Ok without
+/// doing anything, and the caller's reexec respawned the same old binary forever.
+fn binary_is(bin: &Path, version: &str) -> bool {
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("--version");
+    crate::platform::no_window_std(&mut cmd); // a hidden supervisor must not flash a console
+    cmd.output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains(version))
+        .unwrap_or(false)
+}
+
+// ── auto-update failure cooldown ──
+// github may be unreachable for a long stretch (offline, or blocked networks —
+// real case: release-asset downloads reset while the API is fine). Without a
+// cooldown the agent/supervisor re-download-and-fail on every tick/cliUpdate
+// nudge, spamming the log and wasting bandwidth forever. Remember the version
+// that just failed and skip re-attempts for a while; a manual `mafold update`
+// is not throttled (it never consults this).
+static LAST_FAILED: std::sync::Mutex<Option<(String, std::time::Instant)>> = std::sync::Mutex::new(None);
+const FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Record that auto-updating to `version` just failed (starts the cooldown).
+pub fn mark_failed(version: &str) {
+    *LAST_FAILED.lock().unwrap() = Some((version.to_string(), std::time::Instant::now()));
+}
+
+/// Should the auto-updater skip `version` because it failed recently?
+pub fn recently_failed(version: &str) -> bool {
+    LAST_FAILED
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|(v, at)| v == version && at.elapsed() < FAILURE_COOLDOWN)
 }
 
 /// Is a newer release available? Returns it (no download). No-ops on platforms
@@ -178,11 +218,14 @@ pub async fn check(http: &reqwest::Client) -> Result<Option<Release>> {
 /// via flock + a version stamp (a concurrent updater either wins or no-ops).
 pub async fn apply(http: &reqwest::Client, url: &str, version: &str, sha256: Option<&str>) -> Result<()> {
     let _lock = acquire_lock()?;
-    // Someone else already installed this version while we waited on the lock.
-    if read_stamp().as_deref() == Some(version) {
+    let bin = binary_path()?;
+    // Someone else already installed this version while we waited on the lock —
+    // but only trust the stamp if OUR binary really is that version (the stamp is
+    // machine-global; a stale one from another copy/install must not short-circuit
+    // us into an eternal "apply Ok → reexec the same old exe" spin).
+    if read_stamp().as_deref() == Some(version) && binary_is(&bin, version) {
         return Ok(());
     }
-    let bin = binary_path()?;
     // Fail CLOSED: the binary we're about to swap in runs
     // `--dangerously-skip-permissions`, so a download we can't verify is never
     // applied. A missing/unfetchable `<asset>.sha256` aborts the update.

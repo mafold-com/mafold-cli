@@ -110,6 +110,26 @@ mod imp {
 
 pub use imp::*;
 
+/// Hide the console window this process owns (Windows). A supervisor launched
+/// by the Task Scheduler logon task is a console binary, so Windows hands it a
+/// fresh visible console at sign-in; it runs headless, so `supervise --hidden`
+/// hides that window right after startup. `GetConsoleWindow` returns NULL when
+/// there is no console (already detached) — nothing to hide then. No-op on Unix
+/// (launchd/systemd services never get a terminal).
+pub fn hide_console() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::GetConsoleWindow;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+        unsafe {
+            let hwnd = GetConsoleWindow();
+            if !hwnd.is_null() {
+                ShowWindow(hwnd, SW_HIDE);
+            }
+        }
+    }
+}
+
 /// Stop a spawned console child (e.g. `claude`) from popping up its own console
 /// window on Windows. The agent runs detached (no console), so a console child
 /// would otherwise be handed a fresh visible window until it produces output.
@@ -117,6 +137,24 @@ pub use imp::*;
 pub fn no_window(cmd: &mut tokio::process::Command) {
     #[cfg(windows)]
     {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
+/// Same, for `std::process::Command` — helper subprocesses (schtasks, the
+/// update smoke test's `--version` run) would each flash a visible console
+/// window when the parent runs console-less (a detached supervisor/agent).
+/// Their output is read over pipes, so hiding the window changes nothing else.
+/// No-op on Unix.
+pub fn no_window_std(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }

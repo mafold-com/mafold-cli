@@ -141,7 +141,14 @@ enum Cmd {
     Rollback,
     /// (internal) The long-lived supervisor loop — started by `up`.
     #[command(hide = true)]
-    Supervise,
+    Supervise {
+        /// Hide this process's console window (Windows: the logon task hands a
+        /// console binary a visible console at sign-in). Keep this flag forever:
+        /// registered tasks reference it, so removing it would make every
+        /// existing task fail at logon with a clap error (exit code 2).
+        #[arg(long, hide = true)]
+        hidden: bool,
+    },
     /// (internal) PreToolUse hook claude runs for AskUserQuestion — blocks until
     /// the user answers the chat card, then feeds the answer back. Not for humans.
     #[command(hide = true)]
@@ -172,12 +179,18 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     match &cli.cmd {
-        Cmd::Up => return supervisor::up(&cli.base),
+        Cmd::Up => return supervisor::up(&cli.base, cli.no_auto_update),
         Cmd::Down { name } => return supervisor::down(name.as_deref()),
         Cmd::Logs { name } => return supervisor::logs(name),
         Cmd::Rm { name } => return supervisor::rm(name),
         Cmd::Rollback => return update::rollback(),
-        Cmd::Supervise => { supervisor::supervise(cli.base).await; return Ok(()); }
+        Cmd::Supervise { hidden } => {
+            if *hidden {
+                platform::hide_console();
+            }
+            supervisor::supervise(cli.base, !cli.no_auto_update).await;
+            return Ok(());
+        }
         _ => {}
     }
     if matches!(cli.cmd, Cmd::Update) {
@@ -242,7 +255,7 @@ async fn main() -> Result<()> {
                 std::fs::canonicalize(&w).map(|p| p.to_string_lossy().into_owned()).unwrap_or(w)
             });
             if detach {
-                let pid = daemon::start_detached(&cli.base, &token, workdir.as_deref(), &harness)?;
+                let pid = daemon::start_detached(&cli.base, &token, workdir.as_deref(), &harness, cli.no_auto_update)?;
                 if let Some(w) = &workdir { println!("  workdir: {w}"); }
                 println!("✓ agent running in background (pid {pid})");
                 println!("  logs:   ~/.mafold/agent.log");
@@ -252,14 +265,14 @@ async fn main() -> Result<()> {
                 agent::run(Client::new(cli.base, token), workdir, harness, !cli.no_auto_update).await?;
             }
         }
-        Cmd::Add { name, workdir, harness } => supervisor::add(name, token, workdir, harness, &cli.base)?,
+        Cmd::Add { name, workdir, harness } => supervisor::add(name, token, workdir, harness, &cli.base, cli.no_auto_update)?,
         Cmd::Chats => chats(&Client::new(cli.base, token)).await?,
         Cmd::Send { chat, text } => send(&Client::new(cli.base, token), &chat, &text.join(" ")).await?,
         Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Install { .. } | Cmd::Cards { .. }
         | Cmd::Apps { .. } | Cmd::Room { .. }
         | Cmd::Langpack { .. } | Cmd::Login { .. } | Cmd::Report
         | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
-        | Cmd::Rollback | Cmd::Supervise | Cmd::AskHook => unreachable!(),
+        | Cmd::Rollback | Cmd::Supervise { .. } | Cmd::AskHook => unreachable!(),
     }
     Ok(())
 }

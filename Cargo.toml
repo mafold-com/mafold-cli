@@ -1,6 +1,6 @@
 [package]
 name = "mafold-cli"
-version = "0.9.32"
+version = "0.9.33"
 edition = "2021"
 description = "Mafold from your terminal — a CLI client (chats / send) + a Claude Code agent daemon."
 license = "MIT"
@@ -30,11 +30,16 @@ base64 = "0.22"
 libc = "0.2"
 
 # Native Win32 for the same primitives: OpenProcess/TerminateProcess (liveness +
-# stop), DETACHED_PROCESS creation flags (detach), and LockFileEx (update lock).
+# stop), DETACHED_PROCESS creation flags (detach), LockFileEx (update lock), and
+# GetConsoleWindow/ShowWindow (hide the console the logon task hands the
+# supervisor — see platform::hide_console).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Globalization",
 ] }
