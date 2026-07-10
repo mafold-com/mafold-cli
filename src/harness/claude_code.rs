@@ -112,6 +112,8 @@ impl Harness for ClaudeCode {
         let mut produced = false;
         let mut stopped = false;
         let mut session_id: Option<String> = None;
+        // Set when an API / execution error ends the turn — surfaced to the user.
+        let mut error: Option<String> = None;
 
         loop {
             let line = tokio::select! {
@@ -123,6 +125,19 @@ impl Harness for ClaudeCode {
             let v: Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => continue };
             if session_id.is_none() {
                 if let Some(sid) = v["session_id"].as_str() { session_id = Some(sid.to_string()); }
+            }
+            // A fatal error event (NOT a transient API blip the SDK retries away
+            // silently) — stop now and report the reason, instead of relaying an
+            // endless error/retry stream while the turn never finalizes.
+            if v["type"] == "error" {
+                error = Some(
+                    v["error"].as_str()
+                        .or_else(|| v["message"].as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| v.to_string()),
+                );
+                let _ = child.start_kill();
+                break;
             }
             // Streaming assistant text.
             if v["type"] == "stream_event"
@@ -174,6 +189,19 @@ impl Harness for ClaudeCode {
                 }
             }
             if v["type"] == "result" {
+                // A non-success result means the agent GAVE UP (API error, max
+                // turns, exec error). Surface the specific reason and stop
+                // cleanly, instead of ending as if it had succeeded (previously
+                // any `result` was reported as a normal Done — errors vanished).
+                let subtype = v["subtype"].as_str().unwrap_or("");
+                if v["is_error"].as_bool().unwrap_or(false) || (!subtype.is_empty() && subtype != "success") {
+                    error = Some(
+                        v["result"].as_str().map(str::trim).filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("agent ended with `{}`", if subtype.is_empty() { "error" } else { subtype })),
+                    );
+                    break;
+                }
                 let u = &v["usage"];
                 let toks: u64 = ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
                     .iter().filter_map(|k| u[*k].as_u64()).sum();
@@ -187,10 +215,11 @@ impl Harness for ClaudeCode {
         }
         drop(sink); // close → the renderer flushes its tail
 
-        if stopped {
-            let _ = child.wait().await; // reap the killed child; not an error
+        if stopped || error.is_some() {
+            let _ = child.start_kill(); // idempotent; ensures the error path stops it too
+            let _ = child.wait().await; // reap; the exit status is irrelevant here
             if let Some(t) = stderr_task { t.abort(); }
-            return Ok(TurnOutcome { produced, stopped, session: session_id });
+            return Ok(TurnOutcome { produced, stopped, session: session_id, error });
         }
         let status = child.wait().await?;
         if !status.success() {
@@ -204,7 +233,7 @@ impl Harness for ClaudeCode {
             bail!("claude exited unsuccessfully{}", if err.is_empty() { String::new() } else { format!(": {err}") });
         }
         if let Some(t) = stderr_task { t.abort(); }
-        Ok(TurnOutcome { produced, stopped, session: session_id })
+        Ok(TurnOutcome { produced, stopped, session: session_id, error: None })
     }
 
     fn discover(&self, workdir: &str) -> Value {

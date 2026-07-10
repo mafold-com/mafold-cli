@@ -80,6 +80,11 @@ pub struct TurnOutcome {
     pub stopped: bool,
     /// The (possibly new) session id to persist for this conversation.
     pub session: Option<String>,
+    /// Set when the agent ended on an API / execution error (an `is_error`
+    /// result, or a fatal error event mid-stream) rather than completing — the
+    /// specific reason to surface to the user. The turn stops cleanly and the
+    /// session is still persisted, so a retry resumes with context.
+    pub error: Option<String>,
 }
 
 /// Where a slash command lands when not a daemon control command.

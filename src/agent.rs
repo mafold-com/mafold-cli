@@ -1935,6 +1935,12 @@ async fn handle(
         Ok(o) => {
             if o.stopped {
                 let _ = client.append_delta(&msg_id, "\n\n⏹ Stopped.").await;
+            } else if let Some(err) = &o.error {
+                // The agent hit an API / model / exec error and gave up. Surface
+                // the specific reason and stop (instead of the old silent Done or
+                // an endless error stream); the session is still persisted below,
+                // so a retry resumes with context.
+                let _ = client.append_delta(&msg_id, &format!("\n\n⚠️ Agent stopped on an API/model error: {err}")).await;
             } else if !o.produced {
                 let _ = client.append_delta(&msg_id, "_(the agent produced no output)_").await;
             }
