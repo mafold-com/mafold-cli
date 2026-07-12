@@ -148,6 +148,16 @@ impl Client {
         self.post("sendMessage", body).await
     }
 
+    /// Send into a forum channel (None = the `#all` main timeline) — control
+    /// replies (/clear, /status, …) must answer in the channel they were asked in.
+    pub async fn send_in(&self, chat_id: &str, channel_id: Option<&str>, text: &str) -> Result<Value> {
+        let mut body = json!({ "chat_id": chat_id, "text": text });
+        if let Some(ch) = channel_id {
+            body["channel_id"] = json!(ch);
+        }
+        self.post("sendMessage", body).await
+    }
+
     /// Publish this bot's slash commands (the chat command panel).
     pub async fn set_commands(&self, commands: Value) -> Result<()> {
         self.post("setBotCommands", json!({ "commands": commands })).await?;

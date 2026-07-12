@@ -156,6 +156,17 @@ fn render_record(title: &str, entries: &[InRecordEntry], depth: usize, out: &mut
 // ── per-conversation Claude session map (persisted) ──
 type Sessions = Arc<Mutex<HashMap<String, String>>>;
 
+/// Claude context is per (conversation, forum channel): each channel gets its
+/// OWN session, so #garden work never bleeds into #general and vice versa.
+/// `#all` (no channel) keeps the bare conversation id — existing sessions.json
+/// entries stay valid. `#` can't appear in a UUID, so keys never collide.
+fn session_key(chat_id: &str, channel_id: Option<&str>) -> String {
+    match channel_id {
+        Some(ch) => format!("{chat_id}#{ch}"),
+        None => chat_id.to_string(),
+    }
+}
+
 /// Who may drive this bot at all. `claude -p … --dangerously-skip-permissions`
 /// is host code execution, so a turn must NEVER be driven by anyone outside this
 /// list — checked BEFORE the group @-mention gate, the pending-ask/login relay,
@@ -962,9 +973,14 @@ async fn connect_and_run(
             let conv_id = env["params"]["conversation_id"].as_str().unwrap_or("").to_string();
             if !conv_id.is_empty() {
                 let mut s = sessions.lock().await;
-                if s.remove(&conv_id).is_some() {
+                // Drop the #all session AND every per-channel session of this
+                // conversation (keys are `conv` or `conv#<channel>`).
+                let before = s.len();
+                let prefix = format!("{conv_id}#");
+                s.retain(|k, _| k != &conv_id && !k.starts_with(&prefix));
+                if s.len() != before {
                     save_sessions(&s);
-                    println!("← chat cleared ({conv_id}) → dropped Claude session");
+                    println!("← chat cleared ({conv_id}) → dropped Claude session(s)");
                 }
             }
             continue;
@@ -1089,7 +1105,7 @@ async fn connect_and_run(
                 continue;
             }
             if is_control(&name) {
-                handle_control(client, workdir, &m.conversation_id, &name, arg, sessions, chat_states, harness).await;
+                handle_control(client, workdir, &m.conversation_id, m.channel_id.as_deref(), &name, arg, sessions, chat_states, harness).await;
                 continue;
             }
         }
@@ -1261,33 +1277,37 @@ async fn handle_control(
     client: &Client,
     workdir: &str,
     chat_id: &str,
+    // The forum channel the command was issued in — session ops target that
+    // channel's context and replies land back in the same channel.
+    channel_id: Option<&str>,
     name: &str,
     arg: &str,
     sessions: &Sessions,
     chat_states: &ChatStates,
     harness: &Arc<dyn Harness>,
 ) {
+    let skey = session_key(chat_id, channel_id);
     match name {
         "clear" | "new" => {
             {
                 let mut s = sessions.lock().await;
-                if s.remove(chat_id).is_some() { save_sessions(&s); }
+                if s.remove(&skey).is_some() { save_sessions(&s); }
             }
-            let _ = client.send(chat_id, "🧹 Context cleared — starting fresh.").await;
+            let _ = client.send_in(chat_id, channel_id, "🧹 Context cleared — starting fresh.").await;
         }
         "compact" => {
             // Genuinely compact this conversation's Claude session (summarize the
             // prior context to free tokens, keeping continuity). Spawned so the
             // (slow) claude run never blocks the message loop.
-            let (client, workdir, chat_id, sessions) =
-                (client.clone(), workdir.to_string(), chat_id.to_string(), sessions.clone());
-            tokio::spawn(async move { compact_session(client, workdir, chat_id, sessions).await; });
+            let (client, workdir, chat_id, skey, channel, sessions) =
+                (client.clone(), workdir.to_string(), chat_id.to_string(), skey.clone(), channel_id.map(str::to_string), sessions.clone());
+            tokio::spawn(async move { compact_session(client, workdir, chat_id, skey, channel, sessions).await; });
         }
         "stop" => {
             // `/stop` stops EVERY in-flight turn in this conversation; each running
             // task finalizes its own draft with a stop notice.
             if cancel_all(chat_states, chat_id).await == 0 {
-                let _ = client.send(chat_id, "Nothing is running right now.").await;
+                let _ = client.send_in(chat_id, channel_id, "Nothing is running right now.").await;
             }
         }
         "model" => {
@@ -1295,13 +1315,13 @@ async fn handle_control(
             let st = states.entry(chat_id.to_string()).or_default();
             if arg.is_empty() {
                 let cur = st.model.clone().unwrap_or_else(|| "default".into());
-                let _ = client.send(chat_id, &format!("Model for this chat: {cur}\nSet with `/model <name>` (e.g. opus, sonnet, haiku) or `/model reset`.")).await;
+                let _ = client.send_in(chat_id, channel_id, &format!("Model for this chat: {cur}\nSet with `/model <name>` (e.g. opus, sonnet, haiku) or `/model reset`.")).await;
             } else if arg.eq_ignore_ascii_case("reset") || arg.eq_ignore_ascii_case("default") {
                 st.model = None;
-                let _ = client.send(chat_id, "Model reset to the agent default.").await;
+                let _ = client.send_in(chat_id, channel_id, "Model reset to the agent default.").await;
             } else {
                 st.model = Some(arg.to_string());
-                let _ = client.send(chat_id, &format!("Model for this chat set to `{arg}`.")).await;
+                let _ = client.send_in(chat_id, channel_id, &format!("Model for this chat set to `{arg}`.")).await;
             }
         }
         "think" => {
@@ -1316,23 +1336,23 @@ async fn handle_control(
                     Some(n) => format!("on ({n} tokens)"),
                     None => "off".into(),
                 };
-                let _ = client.send(chat_id, &format!("Extended thinking for this chat: {cur}\nSet with `/think on`, `/think off`, or `/think <tokens>` (e.g. `/think 20000`).")).await;
+                let _ = client.send_in(chat_id, channel_id, &format!("Extended thinking for this chat: {cur}\nSet with `/think on`, `/think off`, or `/think <tokens>` (e.g. `/think 20000`).")).await;
             } else if a == "off" || a == "reset" || a == "false" || a == "0" {
                 st.thinking = None;
-                let _ = client.send(chat_id, "Extended thinking turned off for this chat.").await;
+                let _ = client.send_in(chat_id, channel_id, "Extended thinking turned off for this chat.").await;
             } else if a == "on" || a == "true" {
                 st.thinking = Some(DEFAULT_THINKING);
-                let _ = client.send(chat_id, &format!("Extended thinking on ({DEFAULT_THINKING} tokens) for this chat.")).await;
+                let _ = client.send_in(chat_id, channel_id, &format!("Extended thinking on ({DEFAULT_THINKING} tokens) for this chat.")).await;
             } else if let Ok(n) = a.parse::<u32>() {
                 if n == 0 {
                     st.thinking = None;
-                    let _ = client.send(chat_id, "Extended thinking turned off for this chat.").await;
+                    let _ = client.send_in(chat_id, channel_id, "Extended thinking turned off for this chat.").await;
                 } else {
                     st.thinking = Some(n);
-                    let _ = client.send(chat_id, &format!("Extended thinking on ({n} tokens) for this chat.")).await;
+                    let _ = client.send_in(chat_id, channel_id, &format!("Extended thinking on ({n} tokens) for this chat.")).await;
                 }
             } else {
-                let _ = client.send(chat_id, "Usage: `/think on` · `/think off` · `/think <tokens>` (e.g. `/think 20000`).").await;
+                let _ = client.send_in(chat_id, channel_id, "Usage: `/think on` · `/think off` · `/think <tokens>` (e.g. `/think 20000`).").await;
             }
         }
         "status" => {
@@ -1345,7 +1365,7 @@ async fn handle_control(
                     st.and_then(|s| s.thinking),
                 )
             };
-            let session = sessions.lock().await.get(chat_id).cloned();
+            let session = sessions.lock().await.get(&skey).cloned();
             let think = match thinking { Some(n) => format!("on ({n} tokens)"), None => "off".into() };
             let state = if busy { "running a reply now" } else { "idle" };
             let auth = harness.status_line().await;
@@ -1376,14 +1396,14 @@ async fn handle_control(
                 crate::commands::fmt_dur(uptime),
             ));
             let _ = client
-                .send(chat_id, &format!("{{% stats title=\"Status\" icon=\"target\" %}}\n{body}{{% /stats %}}"))
+                .send_in(chat_id, channel_id, &format!("{{% stats title=\"Status\" icon=\"target\" %}}\n{body}{{% /stats %}}"))
                 .await;
         }
         "cwd" => {
-            let _ = client.send(chat_id, &format!("Working directory: {workdir}")).await;
+            let _ = client.send_in(chat_id, channel_id, &format!("Working directory: {workdir}")).await;
         }
         "help" => {
-            let _ = client.send(chat_id,
+            let _ = client.send_in(chat_id, channel_id,
                 "I'm a Claude Code agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /compact — summarize the context to free up room (keeps continuity)\n• /stop — stop the running reply\n• /model <name> — switch model for this chat\n• /think on|off|<tokens> — toggle extended thinking for this chat\n• /status · /cwd — agent info\n\nEverything else in the `/` menu is a Claude Code skill or command — tap one to run it.").await;
         }
         _ => {}
@@ -1394,15 +1414,16 @@ async fn handle_control(
 /// session so the prior context is summarized (frees tokens, keeps continuity),
 /// keep resuming the compacted session, and post a card. Best-effort: on any
 /// failure it tells the user and leaves the existing session untouched.
-async fn compact_session(client: Client, workdir: String, chat_id: String, sessions: Sessions) {
-    let prior = sessions.lock().await.get(&chat_id).cloned();
+async fn compact_session(client: Client, workdir: String, chat_id: String, skey: String, channel: Option<String>, sessions: Sessions) {
+    let channel_id = channel.as_deref();
+    let prior = sessions.lock().await.get(&skey).cloned();
     let Some(sid) = prior else {
         let _ = client
-            .send(&chat_id, "Nothing to compact yet — send me a task first, then /compact to summarize the context.")
+            .send_in(&chat_id, channel_id, "Nothing to compact yet — send me a task first, then /compact to summarize the context.")
             .await;
         return;
     };
-    let _ = client.send(&chat_id, "🗜️ Compacting the conversation…").await;
+    let _ = client.send_in(&chat_id, channel_id, "🗜️ Compacting the conversation…").await;
     let mut cmd = tokio::process::Command::new("claude");
     cmd.arg("-p").arg("/compact")
         .arg("--resume").arg(&sid)
@@ -1419,7 +1440,7 @@ async fn compact_session(client: Client, workdir: String, chat_id: String, sessi
             // Keep resuming the (now compacted) session for future turns.
             if let Some(new_sid) = v["session_id"].as_str() {
                 let mut s = sessions.lock().await;
-                s.insert(chat_id.clone(), new_sid.to_string());
+                s.insert(skey.clone(), new_sid.to_string());
                 save_sessions(&s);
             }
             // Token counts → a progress-bar card. The compaction turn READS the
@@ -1433,11 +1454,11 @@ async fn compact_session(client: Client, workdir: String, chat_id: String, sessi
             if before == 0 {
                 // e.g. "Not enough messages to compact." — nothing meaningful freed.
                 let _ = client
-                    .send(&chat_id, "Not much to compact yet — keep chatting, then /compact to summarize the context.")
+                    .send_in(&chat_id, channel_id, "Not much to compact yet — keep chatting, then /compact to summarize the context.")
                     .await;
             } else {
                 let card = format!("{{% compact before=\"{before}\" after=\"{after}\" /%}}");
-                let _ = client.send(&chat_id, &card).await;
+                let _ = client.send_in(&chat_id, channel_id, &card).await;
             }
         }
         Ok(o) => {
@@ -1448,10 +1469,10 @@ async fn compact_session(client: Client, workdir: String, chat_id: String, sessi
             } else {
                 format!("Compaction failed — the context is unchanged.\n{err}")
             };
-            let _ = client.send(&chat_id, &msg).await;
+            let _ = client.send_in(&chat_id, channel_id, &msg).await;
         }
         Err(e) => {
-            let _ = client.send(&chat_id, &format!("Couldn't run compaction: {e}")).await;
+            let _ = client.send_in(&chat_id, channel_id, &format!("Couldn't run compaction: {e}")).await;
         }
     }
 }
@@ -1890,11 +1911,13 @@ async fn handle(
     // turns run CONCURRENTLY — each gets its own draft, claude session, and
     // renderer, so the bot can serve several tasks/chats at once.
     let _turn = TurnGuard::new(coord);
-    // Snapshot the conversation's session to resume from (context so far). Truly
+    // Snapshot the session to resume from (context so far) — keyed per
+    // (conversation, channel) so forum channels have isolated contexts. Truly
     // concurrent turns fork from this same parent; the chat-history re-injection
     // above keeps continuity, and whichever turn finishes last advances the
     // canonical session id (below).
-    let prior = sessions.lock().await.get(chat_id).cloned();
+    let skey = session_key(chat_id, channel_id);
+    let prior = sessions.lock().await.get(&skey).cloned();
 
     // Per-turn answer file for the AskUserQuestion hook (unique → never stale).
     let ask_file = {
@@ -1978,7 +2001,7 @@ async fn handle(
             if let Some(sid) = o.session {
                 let mut s = sessions.lock().await;
                 if s.get(chat_id).map(String::as_str) != Some(sid.as_str()) {
-                    s.insert(chat_id.to_string(), sid);
+                    s.insert(skey.clone(), sid);
                     save_sessions(&s);
                 }
             }
@@ -1989,7 +2012,7 @@ async fn handle(
             // starts fresh instead of failing again.
             if prior.is_some() {
                 let mut s = sessions.lock().await;
-                if s.remove(chat_id).is_some() { save_sessions(&s); }
+                if s.remove(&skey).is_some() { save_sessions(&s); }
             }
             let _ = client.append_delta(&msg_id, &format!("⚠️ Agent error: {e}")).await;
         }
