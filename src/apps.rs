@@ -9,7 +9,7 @@
 //! Apps are the interactive counterpart to cards: full React Native screens,
 //! launched from a chat, talking to the host through the `useApp()` bridge.
 //! Ownership is by ACCOUNT and the app-id is `owner/slug` (e.g. `mafold/wallet`,
-//! `ops:bot/notes`) — reverse-DNS is dead (see docs/unified-runtime-v0.md).
+//! `ops:bot/notes`) — reverse-DNS is dead (see .docs/unified-runtime-v0.md).
 //!
 //! This mirrors the cards pipeline (`cards.rs`): the same bundled esbuild with
 //! externals injected by the host runtime, the same multipart upload, the same
@@ -202,7 +202,7 @@ fn cmd_init(id: &str, dir: &str, rn: bool) -> Result<()> {
     }
 
     // DEFAULT: a WEBVIEW app — one HTML file, any web stack, hosted anywhere
-    // (or on Mafold via deploySite). docs/webview-apps.md is the guide.
+    // (or on Mafold via deploySite). .docs/webview-apps.md is the guide.
     std::fs::create_dir_all(&root)?;
     let title = title_case(&slug);
     write(&root.join("index.html"), &webview_sample(&title))?;
@@ -211,7 +211,7 @@ fn cmd_init(id: &str, dir: &str, rn: bool) -> Result<()> {
     println!("\nnext:");
     println!("  1. open {}/index.html in a browser (SDK mocks off-Mafold gracefully)", root.display());
     println!("  2. host it anywhere with https — or let Mafold host it:");
-    println!("       POST /api/deploySite  (see docs/webview-apps.md §4)");
+    println!("       POST /api/deploySite  (see https://mafold.com/docs/apps/publishing)");
     println!("  3. mafold apps register {owner}/{slug} --url https://… --capabilities room,chat.send");
     println!("  4. install it into a conversation — the launcher icon appears");
     println!("\n(the old React-Native remote-ui scaffold is still available as BETA: --rn)");
@@ -260,7 +260,7 @@ fn webview_readme(id: &str, slug: &str) -> String {
     format!(
         r#"# {slug} — a Mafold webview mini-app
 
-One HTML file, any web stack. Full guide: `docs/webview-apps.md` in the mafold repo.
+One HTML file, any web stack. Full guide: https://mafold.com/docs/apps
 
 ## Ship it
 

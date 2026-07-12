@@ -17,7 +17,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 use crate::client::Client;
 use crate::harness::{AgentEvent, Harness, Turn};
@@ -81,6 +81,10 @@ struct IncomingMessage {
     /// bot's own messages re-engages it in a group without an @-mention.
     #[serde(default)]
     reply_to_id: Option<String>,
+    /// Set when the trigger arrived in a forum channel — the bot's reply + the
+    /// context it pulls must follow that channel. None = the `#all` main timeline.
+    #[serde(default)]
+    channel_id: Option<String>,
 }
 
 fn attachments_dir() -> PathBuf {
@@ -430,10 +434,12 @@ async fn should_respond(
 /// The bot's OWNER-set config (from the server, via `getBot`), distilled to the
 /// fields the daemon uses to drive harness defaults. Every field is OPTIONAL:
 /// a missing/empty key keeps today's built-in behavior. Unknown keys are ignored.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct OwnerConfig {
     /// Default model for turns when the chat hasn't overridden it (`/model`).
     model: Option<String>,
+    /// Reasoning-effort level (`low`…`max`) for turns. None = harness default.
+    effort: Option<String>,
     /// Default extended-thinking budget (tokens) when the chat hasn't set one
     /// (`/think`). None/0 = off.
     thinking: Option<u32>,
@@ -472,6 +478,7 @@ impl OwnerConfig {
         };
         Self {
             model: get("model"),
+            effort: get("effort"),
             thinking: get("thinking").and_then(|s| s.parse().ok()),
             system_prompt: get("system_prompt"),
             // `cwd` is the documented key; accept `workdir` as an alias.
@@ -631,7 +638,9 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     // this machine, so anyone chatting the bot can discover + tap them.
     publish_commands(&client, &workdir, &harness).await;
 
-    let owner = Arc::new(owner);
+    // RwLock so `events.botConfigUpdated` can hot-swap it live (owner changed the
+    // model/effort/prompt in Customization) without a daemon restart.
+    let owner = Arc::new(RwLock::new(owner));
     let sessions: Sessions = Arc::new(Mutex::new(load_sessions()));
     let chat_states: ChatStates = Arc::new(Mutex::new(HashMap::new()));
     // Recent ids of the bot's own messages (persist across reconnects) so a reply
@@ -810,7 +819,7 @@ async fn connect_and_run(
     chat_states: &ChatStates,
     bot_msg_ids: &BotMsgIds,
     harness: &Arc<dyn Harness>,
-    owner: &Arc<OwnerConfig>,
+    owner: &Arc<RwLock<OwnerConfig>>,
     allow: &Arc<AllowList>,
     // Standalone agent (true) self-updates on cliUpdate; a supervised child
     // (--no-auto-update → false) nudges the supervisor to update instead.
@@ -933,6 +942,17 @@ async fn connect_and_run(
                 ping.abort();
                 return Ok(WsExit::Deprovisioned);
             }
+            continue;
+        }
+        // The owner changed this bot's config in Customization (model / effort /
+        // system prompt / …). The server relays it to us; re-fetch and hot-swap
+        // the OwnerConfig so the NEXT turn uses it — no daemon restart needed.
+        if method == "events.botConfigUpdated" {
+            let fresh = OwnerConfig::fetch(client, my_username).await;
+            let model = fresh.model.clone().unwrap_or_else(|| "default".into());
+            let effort = fresh.effort.clone().unwrap_or_else(|| "default".into());
+            *owner.write().await = fresh;
+            println!("↻ config updated live — model={model} · effort={effort}");
             continue;
         }
         // "Clear chat history" from a client → drop this conversation's Claude
@@ -1110,20 +1130,26 @@ async fn connect_and_run(
         let turn_sender = sender_lc.clone();
         // If the trigger arrived in a thread, the bot replies into that thread.
         let thread_root = m.thread_root_id.clone();
+        // If it arrived in a forum channel, the reply + context follow the channel.
+        let channel_id = m.channel_id.clone();
         // Model precedence: per-chat `/model` override > owner-config default >
         // the harness default (None). `/think` budget follows the same rule.
+        // Snapshot the (live-updatable) owner config for this turn.
+        let oc = owner.read().await.clone();
         let (model, thinking) = {
             let states = chat_states.lock().await;
             let st = states.get(&chat_id);
             (
-                st.and_then(|s| s.model.clone()).or_else(|| owner.model.clone()),
-                st.and_then(|s| s.thinking).or(owner.thinking),
+                st.and_then(|s| s.model.clone()).or_else(|| oc.model.clone()),
+                st.and_then(|s| s.thinking).or(oc.thinking),
             )
         };
+        // Effort is owner-config only (no per-chat override yet).
+        let effort = oc.effort.clone();
         // mafold awareness for this turn: identity + peer + embeddable cards,
         // plus the owner's extra system prompt (if any) appended after it.
         let mut sys = mafold_preamble(my_username, &m.sender.username, &card_tags);
-        if let Some(extra) = &owner.system_prompt {
+        if let Some(extra) = &oc.system_prompt {
             sys.push_str("\n\n");
             sys.push_str(extra);
         }
@@ -1152,8 +1178,8 @@ async fn connect_and_run(
             }
             // Rebuild multi-party group context the access gate dropped (None for
             // DMs / when there's nothing the resumed session is missing).
-            let group_context = recent_group_context(&client, &chat_id, &me_user, &turn_sender, &trigger_id, thread_root.as_deref()).await;
-            if let Err(e) = handle(&client, &workdir, &chat_id, thread_root.as_deref(), &content, &attachments, &sessions, &coord, &chat_states, &harness, model, thinking, system, &turn_sender, group_context).await {
+            let group_context = recent_group_context(&client, &chat_id, &me_user, &turn_sender, &trigger_id, thread_root.as_deref(), channel_id.as_deref()).await;
+            if let Err(e) = handle(&client, &workdir, &chat_id, thread_root.as_deref(), channel_id.as_deref(), &content, &attachments, &sessions, &coord, &chat_states, &harness, model, effort, thinking, system, &turn_sender, group_context).await {
                 eprintln!("handle error: {e}");
             }
         });
@@ -1684,7 +1710,7 @@ async fn stamp_finalized_ask(
 ) {
     let page = match thread_root {
         Some(root) => client.get_thread_messages(chat_id, root, 50).await,
-        None => client.get_chat_history(chat_id, 50).await,
+        None => client.get_chat_history(chat_id, 50, None).await,
     };
     let Ok(page) = page else { return };
     let Some(items) = page.get("items").and_then(|i| i.as_array()) else { return };
@@ -1711,6 +1737,7 @@ async fn recent_group_context(
     _trigger_sender_lc: &str,
     trigger_id: &str,
     thread_root: Option<&str>,
+    channel_id: Option<&str>,
 ) -> Option<String> {
     const MAX_MSGS: usize = 30; // cap injected lines (recent-most kept)
     const MAX_CHARS: usize = 600; // cap per-message length (anti-bloat / anti-flood)
@@ -1721,7 +1748,7 @@ async fn recent_group_context(
     // replying in. Top-level turns use the channel history.
     let page = match thread_root {
         Some(root) => client.get_thread_messages(chat_id, root, 50).await.ok()?,
-        None => client.get_chat_history(chat_id, 50).await.ok()?,
+        None => client.get_chat_history(chat_id, 50, channel_id).await.ok()?,
     };
     let items = page.get("items").and_then(|i| i.as_array())?;
     let mut rows: Vec<(String, String, String)> = Vec::new(); // (created_at, who, body)
@@ -1780,6 +1807,7 @@ async fn handle(
     workdir: &str,
     chat_id: &str,
     thread_root: Option<&str>,
+    channel_id: Option<&str>,
     prompt: &str,
     attachments: &[InAttachment],
     sessions: &Sessions,
@@ -1787,6 +1815,7 @@ async fn handle(
     chat_states: &ChatStates,
     harness: &Arc<dyn Harness>,
     model: Option<String>,
+    effort: Option<String>,
     thinking: Option<u32>,
     system: Option<String>,
     turn_sender: &str,
@@ -1882,7 +1911,7 @@ async fn handle(
     // can carry its sender for the ask-answered stamp.
     let cancel = Arc::new(Notify::new());
     let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-    let msg_id = client.create_draft(chat_id, thread_root).await?;
+    let msg_id = client.create_draft(chat_id, thread_root, channel_id).await?;
     {
         let mut states = chat_states.lock().await;
         let st = states.entry(chat_id.to_string()).or_default();
@@ -1903,6 +1932,7 @@ async fn handle(
         workdir: workdir.to_string(),
         session: prior.clone(),
         model,
+        effort,
         thinking,
         cancel: cancel.clone(),
         system,

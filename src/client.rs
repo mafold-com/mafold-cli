@@ -90,8 +90,12 @@ impl Client {
     /// gate drops non-owner messages so they never reach claude's resumed
     /// session; for a group turn the daemon re-fetches history to rebuild the
     /// multi-party context (see `recent_group_context`).
-    pub async fn get_chat_history(&self, chat_id: &str, limit: usize) -> Result<Value> {
-        self.post("getChatHistory", json!({ "chat_id": chat_id, "limit": limit })).await
+    pub async fn get_chat_history(&self, chat_id: &str, limit: usize, channel_id: Option<&str>) -> Result<Value> {
+        let mut body = json!({ "chat_id": chat_id, "limit": limit });
+        if let Some(ch) = channel_id {
+            body["channel_id"] = json!(ch);
+        }
+        self.post("getChatHistory", body).await
     }
 
     /// A thread's messages (root + replies) — used to rebuild context when the
@@ -202,10 +206,13 @@ impl Client {
     /// replies"). Connect-phase failures are retried a couple of times (observed
     /// real-world cause: a local proxy killing fresh TLS connections right after
     /// the WS reconnects).
-    pub async fn create_draft(&self, chat_id: &str, thread_root_id: Option<&str>) -> Result<String> {
+    pub async fn create_draft(&self, chat_id: &str, thread_root_id: Option<&str>, channel_id: Option<&str>) -> Result<String> {
         let mut body = json!({ "chat_id": chat_id });
         if let Some(root) = thread_root_id {
             body["thread_root_id"] = json!(root);
+        }
+        if let Some(ch) = channel_id {
+            body["channel_id"] = json!(ch);
         }
         let mut delay = std::time::Duration::from_millis(500);
         let mut attempt = 0;

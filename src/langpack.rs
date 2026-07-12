@@ -7,7 +7,7 @@
 //!
 //! The official pack is first-party: publish needs the publisher token (the
 //! `mafoldcards` account). One pack covers every surface (site/web/iOS/RN);
-//! versions are integers so clients sync only the delta. See docs/i18n-v0.md.
+//! versions are integers so clients sync only the delta. See .docs/i18n-v0.md.
 
 use std::path::Path;
 
