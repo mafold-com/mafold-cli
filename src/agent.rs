@@ -169,56 +169,79 @@ fn session_key(chat_id: &str, channel_id: Option<&str>) -> String {
 
 /// Who may drive this bot at all. `claude -p … --dangerously-skip-permissions`
 /// is host code execution, so a turn must NEVER be driven by anyone outside this
-/// list — checked BEFORE the group @-mention gate, the pending-ask/login relay,
-/// and any control command. Default-allow is the bot's OWNER only (the account's
-/// `parent_username` from `getMe`); the owner can widen it via the env var
-/// `MAFOLD_ALLOWED_USERS` (comma-separated usernames that ADD to the list), and
-/// the literal `*` opts back into the old "anyone" behavior. Usernames are
-/// trimmed + lowercased for comparison (mirrors the @-mention matching).
+/// gate — checked BEFORE the group @-mention gate, the pending-ask/login relay,
+/// and any control command. Owner-authored via the bot's Customization
+/// (`config.whitelist` / `config.blacklist`, comma/space/newline-separated
+/// usernames), hot-reloaded on `events.botConfigUpdated`:
+///   - the **owner** is ALWAYS allowed (you can never lock yourself out);
+///   - a **blacklisted** user is NEVER allowed (deny wins over everything else);
+///   - a **whitelisted** user is allowed (a listed bot too — explicit opt-in);
+///   - the literal `*` in the whitelist opens the bot to ANY human;
+///   - otherwise (empty whitelist) the DEFAULT is owner-only.
+/// The legacy env var `MAFOLD_ALLOWED_USERS` still adds to the whitelist.
+/// Usernames are trimmed, `@`-stripped, lowercased (mirrors @-mention matching).
 struct AllowList {
-    /// Explicitly allowed usernames (lowercased). Includes the owner.
+    /// The bot's owner (lowercased) — always allowed. May be absent for a
+    /// top-level/ownerless bot.
+    owner: Option<String>,
+    /// Whitelisted usernames (lowercased). Non-empty → only these (+ owner) drive
+    /// the bot, unless `anyone` is set.
     users: std::collections::HashSet<String>,
-    /// `*` was given → anyone may drive the bot (still excludes bots).
+    /// Blacklisted usernames (lowercased) — denied even if whitelisted.
+    blocked: std::collections::HashSet<String>,
+    /// Whitelist contained `*` → any human may drive the bot (still excludes bots).
     anyone: bool,
 }
 
+/// Normalize a username for gate comparison: trim, strip a leading `@`, lowercase.
+fn norm_user(raw: &str) -> String {
+    raw.trim().trim_start_matches('@').trim().to_lowercase()
+}
+
 impl AllowList {
-    /// Build from the bot's owner (`getMe` → `parent_username`, may be absent for
-    /// a top-level/ownerless bot) plus the `MAFOLD_ALLOWED_USERS` env var.
-    fn build(owner: Option<&str>) -> Self {
+    /// Build from the bot's owner (`getMe` → `parent_username`) plus the
+    /// owner-authored `whitelist` / `blacklist` config lists and the legacy
+    /// `MAFOLD_ALLOWED_USERS` env var (folded into the whitelist).
+    fn build(owner: Option<&str>, whitelist: &[String], blacklist: &[String]) -> Self {
+        let owner = owner.map(norm_user).filter(|s| !s.is_empty());
         let mut users = std::collections::HashSet::new();
+        let mut blocked = std::collections::HashSet::new();
         let mut anyone = false;
-        if let Some(o) = owner {
-            let o = o.trim().to_lowercase();
-            if !o.is_empty() {
-                users.insert(o);
-            }
+        for raw in whitelist {
+            let u = norm_user(raw);
+            if u == "*" { anyone = true; } else if !u.is_empty() { users.insert(u); }
+        }
+        for raw in blacklist {
+            let u = norm_user(raw);
+            if !u.is_empty() && u != "*" { blocked.insert(u); }
         }
         if let Ok(env) = std::env::var("MAFOLD_ALLOWED_USERS") {
             for raw in env.split(',') {
-                let u = raw.trim().to_lowercase();
-                if u.is_empty() {
-                    continue;
-                }
-                if u == "*" {
-                    anyone = true;
-                } else {
-                    users.insert(u);
-                }
+                let u = norm_user(raw);
+                if u == "*" { anyone = true; } else if !u.is_empty() { users.insert(u); }
             }
         }
-        Self { users, anyone }
+        Self { owner, users, blocked, anyone }
     }
 
     /// May this sender drive the bot? Bots are NEVER implicitly allowed (don't let
-    /// bots drive bots), even when `*` is set. An allow-listed bot username still
-    /// passes, so an owner who explicitly lists a bot can opt it in.
+    /// bots drive bots) even when `*` is set, but an explicitly whitelisted bot
+    /// passes. The owner is immune to the blacklist (no self-lockout).
     fn allows(&self, username: &str, is_bot: bool) -> bool {
-        let u = username.trim().to_lowercase();
-        if self.users.contains(&u) {
-            return true;
+        let u = norm_user(username);
+        if self.owner.as_deref() == Some(u.as_str()) {
+            return true; // owner always
         }
-        self.anyone && !is_bot
+        if self.blocked.contains(&u) {
+            return false; // deny wins
+        }
+        if self.users.contains(&u) {
+            return true; // explicitly whitelisted (a listed bot too)
+        }
+        if self.anyone {
+            return !is_bot; // `*` → any human
+        }
+        false // default: owner-only
     }
 }
 
@@ -458,6 +481,23 @@ struct OwnerConfig {
     system_prompt: Option<String>,
     /// Default working directory when `--workdir` wasn't passed on the CLI.
     cwd: Option<String>,
+    /// Owner-authored allow-list: only these users (+ the owner) may drive the
+    /// bot. Empty = owner-only; a lone `*` = anyone. See AllowList.
+    whitelist: Vec<String>,
+    /// Owner-authored block-list: these users may never drive the bot.
+    blacklist: Vec<String>,
+}
+
+/// Split a config value (comma / whitespace / newline separated) into usernames.
+fn parse_user_list(v: Option<String>) -> Vec<String> {
+    v.map(|s| {
+        s.split(|c: char| c == ',' || c.is_whitespace())
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 impl OwnerConfig {
@@ -494,6 +534,8 @@ impl OwnerConfig {
             system_prompt: get("system_prompt"),
             // `cwd` is the documented key; accept `workdir` as an alias.
             cwd: get("cwd").or_else(|| get("workdir")),
+            whitelist: parse_user_list(get("whitelist")),
+            blacklist: parse_user_list(get("blacklist")),
         }
     }
 }
@@ -590,17 +632,6 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     // widened by the `MAFOLD_ALLOWED_USERS` env var (`*` = anyone). Enforced as a
     // hard gate before any turn / control / pending-ask / login relay. See AllowList.
     let owner_username = me["parent_username"].as_str().map(str::to_string);
-    let allow = Arc::new(AllowList::build(owner_username.as_deref()));
-    {
-        let mut who: Vec<String> = allow.users.iter().cloned().collect();
-        who.sort();
-        let listed = if who.is_empty() { "(none)".to_string() } else { who.join(", ") };
-        let anyone = if allow.anyone { "  ·  + anyone (MAFOLD_ALLOWED_USERS=*)" } else { "" };
-        println!("access: only these users may drive me → {listed}{anyone}");
-        if allow.users.is_empty() && !allow.anyone {
-            eprintln!("⚠️  no owner resolved and MAFOLD_ALLOWED_USERS unset — NO ONE may drive me. Set MAFOLD_ALLOWED_USERS.");
-        }
-    }
 
     // Cloud-first owner config: the bot reads its OWNER-set config from the server
     // and uses it to drive the harness defaults (model / system prompt / workdir).
@@ -608,6 +639,33 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     // default (the same rule the `harness` selection already follows). Best-effort
     // — a missing/failed config just keeps today's behavior.
     let owner = OwnerConfig::fetch(&client, &my_username).await;
+
+    // Access gate: who may DRIVE the bot (host code execution). Owner-authored
+    // via config.whitelist / config.blacklist; default owner-only; `*` = anyone.
+    // RwLock so `events.botConfigUpdated` hot-reloads it (block/allow someone
+    // takes effect immediately — no restart). See AllowList.
+    let allow = {
+        let a = AllowList::build(owner_username.as_deref(), &owner.whitelist, &owner.blacklist);
+        let mut who: Vec<String> = a.users.iter().cloned().collect();
+        who.sort();
+        let listed = if a.anyone {
+            "anyone (whitelist has *)".to_string()
+        } else if who.is_empty() {
+            "owner only".to_string()
+        } else {
+            format!("owner + {}", who.join(", "))
+        };
+        let blocked = if a.blocked.is_empty() { String::new() } else {
+            let mut b: Vec<String> = a.blocked.iter().cloned().collect();
+            b.sort();
+            format!("  ·  blocked: {}", b.join(", "))
+        };
+        println!("access: {listed}{blocked}");
+        if a.owner.is_none() && a.users.is_empty() && !a.anyone {
+            eprintln!("⚠️  no owner resolved and empty whitelist — NO ONE may drive me.");
+        }
+        Arc::new(RwLock::new(a))
+    };
 
     // Cloud-first harness: the bot's server-configured harness wins over the
     // local `--harness` flag (which is the fallback / first-run default).
@@ -831,7 +889,7 @@ async fn connect_and_run(
     bot_msg_ids: &BotMsgIds,
     harness: &Arc<dyn Harness>,
     owner: &Arc<RwLock<OwnerConfig>>,
-    allow: &Arc<AllowList>,
+    allow: &Arc<RwLock<AllowList>>,
     // Standalone agent (true) self-updates on cliUpdate; a supervised child
     // (--no-auto-update → false) nudges the supervisor to update instead.
     auto_update: bool,
@@ -912,7 +970,7 @@ async fn connect_and_run(
             if !has_turn(chat_states, &conv_id, msg_id.as_deref()).await {
                 continue;
             }
-            if allow.allows(&from, false) {
+            if allow.read().await.allows(&from, false) {
                 match &msg_id {
                     Some(mid) => { cancel_turn(chat_states, &conv_id, mid).await; }
                     None => { cancel_all(chat_states, &conv_id).await; }
@@ -962,6 +1020,13 @@ async fn connect_and_run(
             let fresh = OwnerConfig::fetch(client, my_username).await;
             let model = fresh.model.clone().unwrap_or_else(|| "default".into());
             let effort = fresh.effort.clone().unwrap_or_else(|| "default".into());
+            // Rebuild the access gate too (reusing the current owner so a bad
+            // whitelist can never lock the owner out), so block/allow is immediate.
+            {
+                let cur_owner = allow.read().await.owner.clone();
+                let rebuilt = AllowList::build(cur_owner.as_deref(), &fresh.whitelist, &fresh.blacklist);
+                *allow.write().await = rebuilt;
+            }
             *owner.write().await = fresh;
             println!("↻ config updated live — model={model} · effort={effort}");
             continue;
@@ -1009,7 +1074,7 @@ async fn connect_and_run(
         // must NEVER drive a turn, answer a pending ask, relay a login code, or
         // run a control command. Enforced BEFORE every fast-path below and before
         // the group @-mention gate. Owner / allow-listed only; bots never implicitly.
-        if !allow.allows(&m.sender.username, sender_is_bot) {
+        if !allow.read().await.allows(&m.sender.username, sender_is_bot) {
             println!("← @{} (not authorized → ignored)", m.sender.username);
             continue;
         }
@@ -1680,6 +1745,17 @@ something visual communicates better than text.\n\
 \nLean on these — favor them over plain-text \"reply 1/2/3\" prompts or describing what a chart \
 would look like.",
     );
+    // Owner-only settings can't be self-edited (setBotConfig needs the owner's
+    // session) — steer the agent to the {% customize %} card, which opens the
+    // owner's Customization editor so THEY apply it.
+    s.push_str(
+        "\n\nCHANGING YOUR OWN SETTINGS: when the OWNER asks to change one of THIS bot's settings \
+(model, effort, whitelist, blacklist, system prompt, …), you CANNOT set it yourself — it is owner-only. \
+Instead emit a `{% customize field=\"<key>\" hint=\"…\" /%}` card: it renders a button that opens the \
+owner's Customization editor for you, so they apply it in one tap (blank hint is fine). \
+Example — user: \"open the whitelist to everyone\" → reply with \
+{% customize field=\"whitelist\" hint=\"把 whitelist 设成 * 即可对所有人开放\" /%}",
+    );
     // Interactive questions + concurrency. The agent over-trusts AskUserQuestion
     // (flaky via the blocking hook) and wrongly concludes parallel sessions have
     // died — steer it to the `{% ask %}` card and reassure it about concurrency.
@@ -2185,43 +2261,56 @@ mod gate_tests {
 
     /// Build an AllowList directly (bypassing the env var) so the `allows` logic
     /// is tested deterministically regardless of the test process environment.
-    fn list(users: &[&str], anyone: bool) -> AllowList {
+    fn al(owner: Option<&str>, whitelist: &[&str], blacklist: &[&str], anyone: bool) -> AllowList {
         AllowList {
-            users: users.iter().map(|u| u.to_string()).collect::<HashSet<_>>(),
+            owner: owner.map(|o| o.to_lowercase()),
+            users: whitelist.iter().map(|u| u.to_lowercase()).collect::<HashSet<_>>(),
+            blocked: blacklist.iter().map(|u| u.to_lowercase()).collect::<HashSet<_>>(),
             anyone,
         }
     }
 
     #[test]
     fn allowlist_owner_only_default() {
-        let a = list(&["ops"], false);
-        // owner may drive (case/space-insensitive)
+        let a = al(Some("ops"), &[], &[], false);
+        // owner may drive (case/space/@-insensitive)
         assert!(a.allows("ops", false));
         assert!(a.allows("OPS", false));
-        assert!(a.allows("  ops  ", false));
-        // anyone else is denied
+        assert!(a.allows("  @ops  ", false));
+        // anyone else is denied by default
         assert!(!a.allows("mallory", false));
-        // a bot is denied even if it shares the owner-ish name unless listed
         assert!(!a.allows("eve", true));
     }
 
     #[test]
-    fn allowlist_extra_users_added() {
-        let a = list(&["ops", "ada"], false);
-        assert!(a.allows("ops", false));
-        assert!(a.allows("ada", false));
+    fn allowlist_whitelist_adds_users() {
+        let a = al(Some("ops"), &["ada"], &[], false);
+        assert!(a.allows("ops", false)); // owner
+        assert!(a.allows("ada", false)); // whitelisted
         assert!(!a.allows("bob", false));
     }
 
     #[test]
     fn allowlist_star_allows_anyone_but_not_bots() {
-        let a = list(&["ops"], true);
+        let a = al(Some("ops"), &[], &[], true);
         assert!(a.allows("ops", false));
         assert!(a.allows("anyone", false)); // `*` → any human
-        assert!(!a.allows("loopbot", true)); // but never a bot (no bot-drives-bot)
-        // an explicitly-listed bot still passes (owner opted it in)
-        let b = list(&["ops", "trustedbot"], true);
+        assert!(!a.allows("loopbot", true)); // but never a bot
+        // an explicitly-whitelisted bot still passes (owner opted it in)
+        let b = al(Some("ops"), &["trustedbot"], &[], true);
         assert!(b.allows("trustedbot", true));
+    }
+
+    #[test]
+    fn allowlist_blacklist_denies() {
+        // `*` open, but a blacklisted user is denied; deny wins over the whitelist.
+        let a = al(Some("ops"), &["ada"], &["ada", "bob"], true);
+        assert!(a.allows("carol", false)); // open to anyone
+        assert!(!a.allows("bob", false)); // blacklisted
+        assert!(!a.allows("ada", false)); // blacklist beats whitelist
+        // the owner is immune to the blacklist (never self-lock-out).
+        let b = al(Some("ops"), &[], &["ops"], false);
+        assert!(b.allows("ops", false));
     }
 
     #[test]
@@ -2229,13 +2318,17 @@ mod gate_tests {
         // With no MAFOLD_ALLOWED_USERS set in this process, build() yields the
         // owner only. (Guard against a stray env var so the assert is meaningful.)
         if std::env::var("MAFOLD_ALLOWED_USERS").is_err() {
-            let a = AllowList::build(Some("Owner"));
+            let a = AllowList::build(Some("Owner"), &[], &[]);
             assert!(a.allows("owner", false)); // lowercased
             assert!(!a.allows("stranger", false));
             assert!(!a.anyone);
-            // no owner + no env → nobody
-            let none = AllowList::build(None);
+            // no owner + empty whitelist → nobody
+            let none = AllowList::build(None, &[], &[]);
             assert!(!none.allows("anyone", false));
+            // `*` in the whitelist opens it up
+            let open = AllowList::build(Some("Owner"), &["*".to_string()], &[]);
+            assert!(open.allows("stranger", false));
+            assert!(!open.allows("stranger", true)); // still not bots
         }
     }
 
