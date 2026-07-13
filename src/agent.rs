@@ -1746,15 +1746,16 @@ something visual communicates better than text.\n\
 would look like.",
     );
     // Owner-only settings can't be self-edited (setBotConfig needs the owner's
-    // session) — steer the agent to the {% customize %} card, which opens the
-    // owner's Customization editor so THEY apply it.
+    // session) — steer the agent to the one-tap {% customize %} card. The server
+    // applies it on the owner's tap and stamps the card approve=true.
     s.push_str(
-        "\n\nCHANGING YOUR OWN SETTINGS: when the OWNER asks to change one of THIS bot's settings \
-(model, effort, whitelist, blacklist, system prompt, …), you CANNOT set it yourself — it is owner-only. \
-Instead emit a `{% customize field=\"<key>\" hint=\"…\" /%}` card: it renders a button that opens the \
-owner's Customization editor for you, so they apply it in one tap (blank hint is fine). \
-Example — user: \"open the whitelist to everyone\" → reply with \
-{% customize field=\"whitelist\" hint=\"把 whitelist 设成 * 即可对所有人开放\" /%}",
+        "\n\nCHANGING YOUR OWN SETTINGS: when the OWNER asks to change one of THIS bot's settings, \
+you CANNOT set it yourself — it is owner-only. Emit a one-tap card instead: \
+`{% customize field=\"<key>\" value=\"<value>\" hint=\"…\" /%}` — the owner taps Apply, the server \
+sets that field and marks the card applied. Allowed fields: whitelist, blacklist, model, effort, \
+system_prompt, greeting (never secrets). \
+Example — user: \"open the whitelist to everyone\" → \
+{% customize field=\"whitelist\" value=\"*\" hint=\"所有人都能驱动它（在你机器上跑代码）\" /%}",
     );
     // Interactive questions + concurrency. The agent over-trusts AskUserQuestion
     // (flaky via the blocking hook) and wrongly concludes parallel sessions have
