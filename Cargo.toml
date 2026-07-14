@@ -1,6 +1,6 @@
 [package]
 name = "mafold-cli"
-version = "0.9.38"
+version = "0.9.39"
 edition = "2021"
 description = "Mafold from your terminal — a CLI client (chats / send) + a Claude Code agent daemon."
 license = "MIT"
@@ -10,6 +10,12 @@ name = "mafold"
 path = "src/main.rs"
 
 [dependencies]
+# The shared client core: validated RPC transport (methods registry — a method-
+# name typo dies locally, not as a server 404), typed methods over the
+# mafold-types wire model (re-exported), and the pooled HTTP client every other
+# client uses. Same-language consumer: no FFI, plain crate dep.
+mafold-core = { path = "../mafold-core" }
+uuid = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "io-util"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }

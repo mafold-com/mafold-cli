@@ -2063,14 +2063,18 @@ async fn handle(
 
     match result {
         Ok(o) => {
+            // Paragraph separator ONLY after actual transcript content — on a
+            // still-empty draft a leading "\n\n" renders as blank space at the
+            // top of the bubble.
+            let sep = if o.produced { "\n\n" } else { "" };
             if o.stopped {
-                let _ = client.append_delta(&msg_id, "\n\n⏹ Stopped.").await;
+                let _ = client.append_delta(&msg_id, &format!("{sep}⏹ Stopped.")).await;
             } else if let Some(err) = &o.error {
                 // The agent hit an API / model / exec error and gave up. Surface
                 // the specific reason and stop (instead of the old silent Done or
                 // an endless error stream); the session is still persisted below,
                 // so a retry resumes with context.
-                let _ = client.append_delta(&msg_id, &format!("\n\n⚠️ Agent stopped on an API/model error: {err}")).await;
+                let _ = client.append_delta(&msg_id, &format!("{sep}⚠️ Agent stopped on an API/model error: {err}")).await;
             } else if !o.produced {
                 let _ = client.append_delta(&msg_id, "_(the agent produced no output)_").await;
             }

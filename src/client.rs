@@ -30,23 +30,22 @@ impl Client {
         Self { http, base, token }
     }
 
-    /// POST /api/<method>, unwrap the `{ok, result}` envelope or bail.
+    /// The core's typed API handle for this base+token (base gains the `/api`
+    /// prefix the core convention expects).
+    fn api(&self) -> mafold_core::methods::ApiClient {
+        mafold_core::methods::ApiClient::new(format!("{}/api", self.base), &self.token)
+    }
+
+    /// POST /api/<method> through the CORE's validated transport (method-name
+    /// registry + pooled client + envelope unwrap live there now). Result is
+    /// passed through as raw JSON — no typed round-trip, so fields the wire
+    /// model hasn't caught up with can't silently vanish. The original
+    /// `RpcError` rides along in the anyhow chain (see `is_connect_error`).
     async fn post(&self, method: &str, body: Value) -> Result<Value> {
-        let v: Value = self
-            .http
-            .post(format!("{}/api/{method}", self.base))
-            .bearer_auth(&self.token)
-            .json(&body)
-            .send()
-            .await
-            .with_context(|| format!("{method} request failed"))?
-            .json()
-            .await
-            .with_context(|| format!("{method} returned non-JSON"))?;
-        if v.get("ok").and_then(Value::as_bool) == Some(false) {
-            anyhow::bail!("{method}: {}", v["description"].as_str().unwrap_or("error"));
+        match self.api().call_raw(method, &body.to_string()).await {
+            Ok(result) => serde_json::from_str(&result).with_context(|| format!("{method} returned non-JSON")),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("{method} failed"))),
         }
-        Ok(v["result"].clone())
     }
 
     /// Generic authenticated RPC for callers outside this module (login, report…).
@@ -202,8 +201,10 @@ impl Client {
     /// nothing, so a retry can't duplicate anything. (A timeout/dropped-response
     /// is NOT safe for non-idempotent calls like botCreateDraft — the request may
     /// have landed, and a retry would leave an orphaned empty draft bubble.)
+    /// The classification now comes from the core's structured `RpcError`.
     fn is_connect_error(e: &anyhow::Error) -> bool {
-        e.downcast_ref::<reqwest::Error>().is_some_and(|re| re.is_connect())
+        e.downcast_ref::<mafold_core::RpcError>()
+            .is_some_and(|re| matches!(re, mafold_core::RpcError::Connect(_)))
     }
 
     // ── bot streaming write API (used by the agent daemon) ──
@@ -217,28 +218,34 @@ impl Client {
     /// real-world cause: a local proxy killing fresh TLS connections right after
     /// the WS reconnects).
     pub async fn create_draft(&self, chat_id: &str, thread_root_id: Option<&str>, channel_id: Option<&str>) -> Result<String> {
-        let mut body = json!({ "chat_id": chat_id });
-        if let Some(root) = thread_root_id {
-            body["thread_root_id"] = json!(root);
-        }
-        if let Some(ch) = channel_id {
-            body["channel_id"] = json!(ch);
-        }
+        // TYPED through the core: ids parse to real Uuids up front (a malformed
+        // id fails here, not as a server 400), and the result is a wire::Message.
+        let chat = uuid::Uuid::parse_str(chat_id).context("botCreateDraft: bad chat_id")?;
+        let root = thread_root_id
+            .map(uuid::Uuid::parse_str)
+            .transpose()
+            .context("botCreateDraft: bad thread_root_id")?;
+        let channel = channel_id
+            .map(uuid::Uuid::parse_str)
+            .transpose()
+            .context("botCreateDraft: bad channel_id")?;
+        let api = self.api();
         let mut delay = std::time::Duration::from_millis(500);
         let mut attempt = 0;
-        let r = loop {
-            match self.post("botCreateDraft", body.clone()).await {
-                Ok(r) => break r,
-                Err(e) if attempt < 2 && Self::is_connect_error(&e) => {
+        let draft = loop {
+            match api.bot_create_draft(chat, root, channel).await {
+                Ok(m) => break m,
+                Err(e @ mafold_core::RpcError::Connect(_)) if attempt < 2 => {
+                    let _ = e;
                     attempt += 1;
                     eprintln!("botCreateDraft connect failed (attempt {attempt}/3) — retrying in {delay:?}…");
                     tokio::time::sleep(delay).await;
                     delay *= 2;
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(anyhow::Error::new(e).context("botCreateDraft failed")),
             }
         };
-        Ok(r["id"].as_str().context("botCreateDraft: no id")?.to_string())
+        Ok(draft.id.to_string())
     }
     pub async fn append_delta(&self, message_id: &str, delta: &str) -> Result<()> {
         self.post("botAppendDelta", json!({ "message_id": message_id, "delta": delta })).await?;
