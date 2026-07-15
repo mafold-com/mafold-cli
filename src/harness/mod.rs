@@ -35,6 +35,13 @@ pub enum AgentEvent {
     ToolResult { id: String, text: String },
     /// A thinking / chain-of-thought block (collapsed in the UI).
     Thinking(String),
+    /// Streaming activity that is NOT rendered as content (thinking / tool-arg
+    /// deltas, usage updates): `chars` of raw stream progress plus, when the
+    /// harness knows it, the REAL cumulative output-token count for the turn.
+    /// Drives the `{% generating %}` card's live heartbeat (beat / elapsed /
+    /// tokens) so the indicator reflects actual model progress — never the
+    /// transcript.
+    Pulse { chars: u64, tokens: Option<u64> },
     /// End-of-turn summary.
     Done { duration_ms: Option<f64>, cost_usd: Option<f64>, tokens: Option<u64> },
     /// (daemon-internal) The user answered the pending interactive ask — the

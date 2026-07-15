@@ -2128,7 +2128,6 @@ async fn render_loop(
     // snapshot drops the card (it now ends with `{% result %}`); `handle()` then
     // finalizes. Clients are dumb renderers — the generating indicator is
     // content-driven, never synthesized from `finalized_at`.
-    const GENERATING: &str = "\n{% generating /%}\n";
     const THROTTLE: Duration = Duration::from_millis(300);
     let mut names: HashMap<String, String> = HashMap::new();
     let mut full = String::new(); // content committed to the draft so far
@@ -2137,8 +2136,28 @@ async fn render_loop(
     let mut counts: HashMap<&'static str, usize> = HashMap::new();
     let mut last_push = std::time::Instant::now();
 
+    // Live progress props on the generating card: `started` seeds the card's
+    // word + elapsed clock; `beat` bumps on EVERY harness event, so a frozen
+    // beat tells the card the stream stalled (its sparkle deflates); `tokens`
+    // prefers the harness's REAL output-token count (Pulse) with a chars/4
+    // estimate as fallback. Old cards ignore unknown attrs; old daemons emit
+    // the bare tag and the card degrades gracefully — both directions safe.
+    let started_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let mut beat: u64 = 0;
+    let mut chars: u64 = 0;
+    let mut tokens_real: Option<u64> = None;
+    macro_rules! generating_tag {
+        () => {
+            format!(
+                "\n{{% generating started={started_ms} beat={beat} tokens={} /%}}\n",
+                tokens_real.unwrap_or(chars / 4)
+            )
+        };
+    }
+
     // Show the generating card immediately (covers the model's initial latency).
-    let _ = client.edit_draft(&msg_id, GENERATING).await;
+    let _ = client.edit_draft(&msg_id, &generating_tag!()).await;
 
     macro_rules! commit_buf {
         () => {
@@ -2162,7 +2181,7 @@ async fn render_loop(
     macro_rules! push_running {
         ($force:expr) => {
             if $force || last_push.elapsed() >= THROTTLE {
-                let _ = client.edit_draft(&msg_id, &format!("{full}{GENERATING}")).await;
+                let _ = client.edit_draft(&msg_id, &format!("{full}{}", generating_tag!())).await;
                 last_push = std::time::Instant::now();
             }
         };
@@ -2172,10 +2191,23 @@ async fn render_loop(
         match tokio::time::timeout(Duration::from_millis(120), rx.recv()).await {
             Ok(Some(ev)) => match &ev {
                 AgentEvent::Text(t) => {
+                    beat += 1;
+                    chars += t.len() as u64;
                     commit_group!(); // tools so far → one run card, before this narration
                     buf.push_str(t);
                     if buf.len() >= 240 {
                         commit_buf!();
+                    }
+                    push_running!(false);
+                }
+                // Heartbeat: silent stream progress (thinking / tool-arg deltas,
+                // real usage counts). Bumps the generating card's props only —
+                // no content commit, and the 300ms throttle caps the traffic.
+                AgentEvent::Pulse { chars: n, tokens } => {
+                    beat += 1;
+                    chars += n;
+                    if let Some(t) = tokens {
+                        tokens_real = Some(*t);
                     }
                     push_running!(false);
                 }
@@ -2184,6 +2216,7 @@ async fn render_loop(
                 // draft id) awaiting an answer. The user answers by replying to this
                 // draft, so concurrent asks in one conversation never cross.
                 AgentEvent::ToolCall { name, .. } if name.eq_ignore_ascii_case("AskUserQuestion") => {
+                    beat += 1;
                     commit_buf!();
                     commit_group!();
                     if let Some(s) = crate::render::render(&ev, &mut names) {
@@ -2220,6 +2253,7 @@ async fn render_loop(
                 AgentEvent::Session(_) => {}
                 // tool / diff / bash result / thinking → into the current group.
                 _ => {
+                    beat += 1; // any harness event is stream activity
                     commit_buf!(); // any narration before this group goes out first
                     if let Some(k) = crate::render::tool_kind(&ev) {
                         *counts.entry(k).or_insert(0) += 1;

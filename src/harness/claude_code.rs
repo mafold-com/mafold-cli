@@ -119,6 +119,11 @@ impl Harness for ClaudeCode {
         let mut session_id: Option<String> = None;
         // Set when an API / execution error ends the turn — surfaced to the user.
         let mut error: Option<String> = None;
+        // Real output-token progress for the generating heartbeat: the API's
+        // `message_delta` usage is cumulative PER assistant message, so completed
+        // messages accumulate into `tokens_done` when the next one starts.
+        let mut tokens_done: u64 = 0;
+        let mut tokens_cur: u64 = 0;
 
         loop {
             let line = tokio::select! {
@@ -144,14 +149,31 @@ impl Harness for ClaudeCode {
                 let _ = child.start_kill();
                 break;
             }
-            // Streaming assistant text.
-            if v["type"] == "stream_event"
-                && v["event"]["type"] == "content_block_delta"
-                && v["event"]["delta"]["type"] == "text_delta"
-            {
-                if let Some(t) = v["event"]["delta"]["text"].as_str() {
-                    let _ = sink.send(AgentEvent::Text(t.to_string()));
-                    produced = true;
+            // Streaming assistant text — plus silent progress pulses for the
+            // deltas that are NOT rendered (thinking / tool-arg json): they keep
+            // the generating card's heartbeat honest while the model works
+            // without visible output.
+            if v["type"] == "stream_event" {
+                let ev_type = &v["event"]["type"];
+                if ev_type == "content_block_delta" {
+                    let d = &v["event"]["delta"];
+                    if d["type"] == "text_delta" {
+                        if let Some(t) = d["text"].as_str() {
+                            let _ = sink.send(AgentEvent::Text(t.to_string()));
+                            produced = true;
+                        }
+                    } else if let Some(t) = d["thinking"].as_str().or_else(|| d["partial_json"].as_str()) {
+                        let _ = sink.send(AgentEvent::Pulse { chars: t.len() as u64, tokens: None });
+                    }
+                } else if ev_type == "message_start" {
+                    // A new assistant message: bank the previous one's usage.
+                    tokens_done += std::mem::take(&mut tokens_cur);
+                } else if ev_type == "message_delta" {
+                    // Cumulative REAL output tokens for the current message.
+                    if let Some(t) = v["event"]["usage"]["output_tokens"].as_u64() {
+                        tokens_cur = t;
+                        let _ = sink.send(AgentEvent::Pulse { chars: 0, tokens: Some(tokens_done + tokens_cur) });
+                    }
                 }
             }
             // Completed assistant message → tool calls + thinking (text already streamed).

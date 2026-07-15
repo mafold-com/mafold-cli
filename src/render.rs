@@ -36,6 +36,9 @@ pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<St
         }
         AgentEvent::Done { duration_ms, cost_usd, tokens } => result_tag(*duration_ms, *cost_usd, *tokens),
         AgentEvent::Session(_) => None,
+        // Heartbeat only — consumed by the render loop's generating card, never
+        // rendered as content.
+        AgentEvent::Pulse { .. } => None,
         // Not rendered as new content — the render loop stamps it into the
         // already-emitted ask card via `stamp_ask_answered`.
         AgentEvent::AskAnswered(_) => None,
