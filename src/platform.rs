@@ -29,6 +29,20 @@ mod imp {
         }
     }
 
+    /// Stop `pid` AND its whole process group. Daemons are session leaders
+    /// (`configure_detached` calls setsid → pgid == pid), and their harness
+    /// children (claude etc.) inherit that group — a plain `terminate(pid)`
+    /// orphans an in-flight claude to ppid 1, where it burns tokens writing
+    /// the rest of the reply into a dead pipe. Falls back to a plain SIGTERM
+    /// when `pid` isn't a group leader.
+    pub fn terminate_group(pid: u32) {
+        unsafe {
+            if libc::kill(-(pid as i32), libc::SIGTERM) != 0 {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+        }
+    }
+
     /// Configure `cmd` to spawn in a new session, detached from the controlling
     /// terminal, so it survives the launching shell closing.
     pub fn configure_detached(cmd: &mut Command) {
@@ -95,6 +109,20 @@ mod imp {
                 TerminateProcess(h, 1);
                 CloseHandle(h);
             }
+        }
+    }
+
+    /// Stop `pid` and its whole process TREE (`taskkill /T` — the closest
+    /// analogue to the unix process-group SIGTERM), so an in-flight harness
+    /// child dies with its daemon instead of orphaning.
+    pub fn terminate_group(pid: u32) {
+        let ok = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            terminate(pid);
         }
     }
 

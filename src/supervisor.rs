@@ -851,7 +851,11 @@ pub fn down(only: Option<&str>) -> Result<()> {
 fn stop_one(name: &str) -> Result<()> {
     match read_pid(name) {
         Some(pid) => {
-            platform::terminate(pid);
+            // Group kill: take the daemon's harness children (claude etc.)
+            // with it — a plain pid kill orphans an in-flight claude to ppid 1,
+            // where it burns tokens streaming into a dead pipe (and its draft
+            // stays "generating" forever).
+            platform::terminate_group(pid);
             let _ = fs::remove_file(pid_path(name));
             Ok(())
         }

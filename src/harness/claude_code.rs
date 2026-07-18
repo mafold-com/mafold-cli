@@ -125,10 +125,26 @@ impl Harness for ClaudeCode {
         let mut tokens_done: u64 = 0;
         let mut tokens_cur: u64 = 0;
 
+        // Stall watchdog: a healthy turn always keeps stdout moving (text deltas,
+        // tool events, thinking) — even a long tool call is bracketed by its
+        // tool_use/tool_result events within the tool's own timeout. A child that
+        // goes fully silent longer than this is hung (the "typing forever, never
+        // sends" failure): kill it and surface the reason through the error path,
+        // which keeps the session so a resend resumes with context. Generous on
+        // purpose — the longest legitimate silence is a slow tool run.
+        const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(15 * 60);
         loop {
             let line = tokio::select! {
                 line = lines.next_line() => match line? { Some(l) => l, None => break },
                 _ = cancel.notified() => { stopped = true; let _ = child.start_kill(); break; }
+                _ = tokio::time::sleep(STALL_AFTER) => {
+                    error = Some(format!(
+                        "no output from the agent for {} minutes — the run looks stalled and was stopped. Your context is kept; just resend to retry.",
+                        STALL_AFTER.as_secs() / 60
+                    ));
+                    let _ = child.start_kill();
+                    break;
+                }
             };
             let line = line.trim();
             if line.is_empty() { continue; }

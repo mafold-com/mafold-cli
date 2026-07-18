@@ -713,6 +713,12 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     // consumes model/system_prompt/thinking/cwd. Seed those fields once.
     ensure_customize_fields(&client, &my_username, owner_username.as_deref()).await;
 
+    // A daemon killed mid-turn (update restart / crash) leaves its streaming
+    // draft unfinalized — a forever-"generating" bubble no client can dismiss,
+    // its reply tail written into a dead pipe. Sweep + finalize MY leftovers
+    // BEFORE listening (no in-flight turns yet, so a live draft can't race).
+    sweep_orphan_drafts(&client, &my_username).await;
+
     // RwLock so `events.botConfigUpdated` can hot-swap it live (owner changed the
     // model/effort/prompt in Customization) without a daemon restart.
     let owner = Arc::new(RwLock::new(owner));
@@ -865,6 +871,57 @@ async fn publish_commands(client: &Client, workdir: &str, harness: &Arc<dyn Harn
     let n = commands.len();
     if client.set_commands(Value::Array(commands)).await.is_ok() {
         println!("published {n} commands (control + discovered skills) to the chat menu");
+    }
+}
+
+/// Finalize this bot's leftover streaming drafts from a previous process (a
+/// daemon killed mid-turn — update restart, crash — leaves the draft
+/// unfinalized: a forever-"generating" bubble no client can dismiss). Sweeps
+/// the recent chats' main timelines AND each forum channel (channel drafts
+/// live in their own buckets, invisible to the #all history). Runs before the
+/// listen loop, so it can't race a live draft of THIS process. Best-effort:
+/// every failure is skipped, never fatal.
+async fn sweep_orphan_drafts(client: &Client, my_username: &str) {
+    let Ok(chats) = client.chats().await else { return };
+    let chat_ids: Vec<String> = chats["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| c["id"].as_str().map(str::to_string))
+        .take(12)
+        .collect();
+    for chat in chat_ids {
+        let mut buckets: Vec<Option<String>> = vec![None];
+        if let Ok(chs) = client.list_channels(&chat).await {
+            for ch in chs.as_array().cloned().unwrap_or_default() {
+                if let Some(id) = ch["id"].as_str() {
+                    buckets.push(Some(id.to_string()));
+                }
+            }
+        }
+        for bucket in buckets {
+            let Ok(h) = client.get_chat_history(&chat, 15, bucket.as_deref()).await else { continue };
+            for m in h["items"].as_array().cloned().unwrap_or_default() {
+                let mine = m["sender"]["username"].as_str() == Some(my_username);
+                let unfinalized = m.get("finalized_at").is_none_or(serde_json::Value::is_null);
+                if !mine || !unfinalized {
+                    continue;
+                }
+                let Some(id) = m["id"].as_str() else { continue };
+                // Keep the partial transcript; swap the generating card for an
+                // interruption stamp.
+                let content = m["content"].as_str().unwrap_or("");
+                let body = match content.find("{% generating") {
+                    Some(i) => &content[..i],
+                    None => content,
+                };
+                let note = format!("{}\n\n⏹ _(interrupted — the daemon restarted mid-turn)_", body.trim_end());
+                let _ = client.edit_draft(id, note.trim_start()).await;
+                let _ = client.finalize(id).await;
+                println!("⌫ finalized an orphaned draft ({id}) in chat {chat}");
+            }
+        }
     }
 }
 
@@ -2092,11 +2149,13 @@ async fn handle(
         conv: chat_id.to_string(),
         workdir: workdir.to_string(),
         session: prior.clone(),
-        model,
-        effort,
+        // Cloned (not moved): the empty-turn retry below rebuilds a Turn from
+        // these same settings.
+        model: model.clone(),
+        effort: effort.clone(),
         thinking,
         cancel: cancel.clone(),
-        system,
+        system: system.clone(),
         ask_file: Some(ask_file.clone()),
     };
 
@@ -2113,7 +2172,7 @@ async fn handle(
         tokio::spawn(render_loop(ev_rx, client, msg_id, chat_states, chat_id, ask_file))
     };
 
-    let result = harness.run(turn, ev_tx).await;
+    let mut result = harness.run(turn, ev_tx).await;
     // Drop this turn's handle NOW — the run is over (no more /stop or ask-answer
     // routing), and the handle holds a clone of the renderer's event sender: the
     // renderer only exits once EVERY sender is gone, so removing the handle after
@@ -2121,6 +2180,62 @@ async fn handle(
     // keeps re-pushing the generating card forever).
     if let Some(st) = chat_states.lock().await.get_mut(chat_id) { st.turns.remove(&msg_id); }
     let _ = renderer.await;
+
+    // A "successful" zero-output exit is the update-restart signature: a prior
+    // turn's background task left a notification queued in the claude session,
+    // resume consumed IT as the turn ("No response requested.", 0.1s) and the
+    // user's actual prompt got queued behind it. One retry on the same session
+    // drains the queue and answers the real message. (A stall lands in the
+    // error path — the watchdog — and an intentional /stop sets `stopped`;
+    // neither retries.)
+    if matches!(&result, Ok(o) if !o.produced && !o.stopped && o.error.is_none()) {
+        let session = match &result {
+            Ok(o) => o.session.clone().or_else(|| prior.clone()),
+            Err(_) => None,
+        };
+        if session.is_some() {
+            println!("↻ empty turn (queued-notification signature) — retrying once on the same session");
+            let (ev_tx2, ev_rx2) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+            {
+                let mut states = chat_states.lock().await;
+                let st = states.entry(chat_id.to_string()).or_default();
+                st.turns.insert(
+                    msg_id.clone(),
+                    TurnHandle {
+                        cancel: cancel.clone(),
+                        ask_file: None,
+                        owner: turn_sender.to_string(),
+                        events: ev_tx2.clone(),
+                    },
+                );
+            }
+            let renderer2 = {
+                let client = client.clone();
+                let msg_id = msg_id.clone();
+                let chat_states = chat_states.clone();
+                let chat_id = chat_id.to_string();
+                let ask_file = ask_file.clone();
+                tokio::spawn(render_loop(ev_rx2, client, msg_id, chat_states, chat_id, ask_file))
+            };
+            let retry = Turn {
+                prompt: "(your previous run exited without producing any output — a user message \
+                         may be pending in this session's queue; answer it now)"
+                    .to_string(),
+                conv: chat_id.to_string(),
+                workdir: workdir.to_string(),
+                session,
+                model: model.clone(),
+                effort: effort.clone(),
+                thinking,
+                cancel: cancel.clone(),
+                system: system.clone(),
+                ask_file: Some(ask_file.clone()),
+            };
+            result = harness.run(retry, ev_tx2).await;
+            if let Some(st) = chat_states.lock().await.get_mut(chat_id) { st.turns.remove(&msg_id); }
+            let _ = renderer2.await;
+        }
+    }
 
     match result {
         Ok(o) => {
@@ -2131,11 +2246,11 @@ async fn handle(
             if o.stopped {
                 let _ = client.append_delta(&msg_id, &format!("{sep}⏹ Stopped.")).await;
             } else if let Some(err) = &o.error {
-                // The agent hit an API / model / exec error and gave up. Surface
-                // the specific reason and stop (instead of the old silent Done or
-                // an endless error stream); the session is still persisted below,
-                // so a retry resumes with context.
-                let _ = client.append_delta(&msg_id, &format!("{sep}⚠️ Agent stopped on an API/model error: {err}")).await;
+                // The agent hit an API/model/exec error OR stalled (watchdog).
+                // Surface the specific reason and stop (instead of the old silent
+                // Done or an endless error stream); the session is still persisted
+                // below, so a retry resumes with context.
+                let _ = client.append_delta(&msg_id, &format!("{sep}⚠️ Agent stopped: {err}")).await;
             } else if !o.produced {
                 let _ = client.append_delta(&msg_id, "_(the agent produced no output)_").await;
             }

@@ -67,7 +67,9 @@ pub fn start_detached(base: &str, token: &str, workdir: Option<&str>, harness: &
 pub fn stop() -> Result<()> {
     match read_pid() {
         Some(pid) if alive(pid) => {
-            platform::terminate(pid);
+            // Group kill — take in-flight harness children (claude) along
+            // instead of orphaning them onto a dead pipe.
+            platform::terminate_group(pid);
             let _ = fs::remove_file(pid_path()?);
             println!("✓ stopped agent (pid {pid})");
         }
