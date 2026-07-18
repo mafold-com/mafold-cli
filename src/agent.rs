@@ -2453,10 +2453,16 @@ async fn render_loop(
     let mut beat: u64 = 0;
     let mut chars: u64 = 0;
     let mut tokens_real: Option<u64> = None;
+    // Background shells STARTED this turn (Bash with run_in_background) — the
+    // CLI-footer "1 shell" affordance, surfaced on the generating card while
+    // the turn runs and as a `{% bgtasks %}` notice after it. Start-count only:
+    // headless claude exposes no completion lifecycle; completions surface via
+    // the next turn's queued notification (the 0.9.46 empty-turn retry).
+    let mut shells: u64 = 0;
     macro_rules! generating_tag {
         () => {
             format!(
-                "\n{{% generating started={started_ms} beat={beat} tokens={} /%}}\n",
+                "\n{{% generating started={started_ms} beat={beat} tokens={} shells={shells} /%}}\n",
                 tokens_real.unwrap_or(chars / 4)
             )
         };
@@ -2482,12 +2488,23 @@ async fn render_loop(
             }
         };
     }
-    // Push the running snapshot (committed content + the trailing generating
-    // card), throttled. `$force` bypasses the throttle (interactive ask).
+    // Push the running snapshot, throttled. `$force` bypasses the throttle
+    // (interactive ask; every tool event — first paint must not lag). The
+    // snapshot INCLUDES the still-open tool group as a live `{% run %}` with
+    // its CURRENT counts, so the summary ticks "Read 1 file" → "Read 2 files"
+    // and tool cards stream out one by one instead of arriving as a finished
+    // block at commit time. Snapshots are full rewrites (the Telegram-draft
+    // model), so re-rendering the same group each flush is free; committing it
+    // later produces identical text — visually seamless.
     macro_rules! push_running {
         ($force:expr) => {
             if $force || last_push.elapsed() >= THROTTLE {
-                let _ = client.edit_draft(&msg_id, &format!("{full}{}", generating_tag!())).await;
+                let live_group = if group.is_empty() {
+                    String::new()
+                } else {
+                    crate::render::run_card(&crate::render::run_summary(&counts), &group)
+                };
+                let _ = client.edit_draft(&msg_id, &format!("{full}{live_group}{}", generating_tag!())).await;
                 last_push = std::time::Instant::now();
             }
         };
@@ -2547,6 +2564,13 @@ async fn render_loop(
                 AgentEvent::Done { .. } => {
                     commit_buf!();
                     commit_group!();
+                    // Background shells outlive the turn (their completion
+                    // notification lands in the NEXT turn's session queue) —
+                    // leave a visible trace instead of letting them run
+                    // invisibly (the 2026-07-18 watcher incident).
+                    if shells > 0 {
+                        full.push_str(&format!("\n{{% bgtasks n={shells} /%}}\n"));
+                    }
                     if let Some(s) = crate::render::render(&ev, &mut names) {
                         full.push_str(&s); // {% result %}
                     }
@@ -2561,13 +2585,25 @@ async fn render_loop(
                 _ => {
                     beat += 1; // any harness event is stream activity
                     commit_buf!(); // any narration before this group goes out first
+                    // A Bash started in the background = a live shell the user
+                    // should see (CC's "1 shell" footer parity).
+                    if let AgentEvent::ToolCall { name, input, .. } = &ev {
+                        if name.eq_ignore_ascii_case("Bash")
+                            && input["run_in_background"].as_bool() == Some(true)
+                        {
+                            shells += 1;
+                        }
+                    }
                     if let Some(k) = crate::render::tool_kind(&ev) {
                         *counts.entry(k).or_insert(0) += 1;
                     }
                     if let Some(s) = crate::render::render(&ev, &mut names) {
                         group.push_str(&s);
                     }
-                    push_running!(false);
+                    // Force: a tool call/result must paint NOW, not at the next
+                    // 300ms tick — this is the "middle states" the transcript
+                    // model promises (工具第一时间返回, no batching).
+                    push_running!(true);
                 }
             },
             Ok(None) => break, // harness done → channel closed
