@@ -578,12 +578,12 @@ impl ConvConfig {
     }
 }
 
-/// The working directory this TURN runs in: chat override > owner default
-/// (skipped when the daemon was pinned with an explicit --workdir/env) > the
-/// process default. Returns `(dir, is_override)` — an override that can't be
-/// created falls back to the default. `is_override` namespaces the claude
-/// session key: claude-code sessions are cwd-bound, so a chat whose workdir
-/// moved must fork its context rather than fail to resume.
+/// The working directory this TURN runs in: chat override > live owner
+/// default (the Customize sheet is authoritative) > the process default.
+/// Returns `(dir, is_override)` — an override that can't be created falls
+/// back to the default. `is_override` namespaces the claude session key:
+/// claude-code sessions are cwd-bound, so a chat whose workdir moved must
+/// fork its context rather than fail to resume.
 fn resolve_turn_workdir(conv: Option<&str>, owner: Option<&str>, default: &str) -> (String, bool) {
     let Some(want) = conv.or(owner) else { return (default.to_string(), false) };
     let expanded = if let Some(rest) = want.strip_prefix("~/") {
@@ -738,14 +738,18 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     let harness_id = me["harness"].as_str().filter(|s| !s.is_empty()).map(str::to_string).unwrap_or(harness_id);
     let harness = crate::harness::select(&harness_id);
 
-    // Working dir: an explicit `--workdir` wins; else the owner-config `cwd`
-    // (or `workdir`); else the current directory. Canonicalize so a relative
-    // server value resolves the same way an explicit flag does. Explicitness
-    // is remembered: per-turn resolution lets the live owner config move the
-    // default workdir ONLY when the daemon wasn't pinned by flag/env.
-    let workdir_explicit = workdir.is_some();
-    let workdir = workdir
-        .or_else(|| owner.cwd.clone())
+    // Working dir: the Customize sheet is AUTHORITATIVE — the owner-config
+    // `cwd` (or `workdir`) wins; `--workdir`/`MAFOLD_WORKDIR` (what the
+    // supervisor always passes from daemons.json) is only the bootstrap
+    // default when the sheet has no value; else the current directory.
+    // Canonicalize so a relative server value resolves the same way an
+    // explicit flag does. (Supervisor daemons ALWAYS carry the env var, so
+    // any flag-beats-config rule would make the sheet permanently dead
+    // for them — the 2026-07-18 "saved but /cwd unchanged" report.)
+    let workdir = owner
+        .cwd
+        .clone()
+        .or(workdir)
         .unwrap_or_else(|| ".".to_string());
     let workdir = std::fs::canonicalize(&workdir)
         .map(|p| p.to_string_lossy().into_owned())
@@ -837,7 +841,7 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     let mut auth_rejects = 0u32;
     let mut last_update_check = std::time::Instant::now();
     loop {
-        match connect_and_run(&client, &workdir, workdir_explicit, &my_username, &sessions, &coord, &chat_states, &bot_msg_ids, &harness, &owner, &allow, auto_update).await {
+        match connect_and_run(&client, &workdir, &my_username, &sessions, &coord, &chat_states, &bot_msg_ids, &harness, &owner, &allow, auto_update).await {
             Ok(WsExit::Deprovisioned) => deprovision_and_exit(&my_username, &client.token, "bot deleted server-side"),
             Ok(WsExit::AuthRejected) => {
                 auth_rejects += 1;
@@ -1094,7 +1098,6 @@ enum WsExit {
 async fn connect_and_run(
     client: &Client,
     workdir: &str,
-    workdir_explicit: bool,
     my_username: &str,
     sessions: &Sessions,
     coord: &Arc<ExecCoord>,
@@ -1383,7 +1386,7 @@ async fn connect_and_run(
                 continue;
             }
             if is_control(&name) {
-                handle_control(client, workdir, &m.conversation_id, m.channel_id.as_deref(), &name, arg, sessions, chat_states, harness).await;
+                handle_control(client, workdir, owner.read().await.cwd.clone(), &m.conversation_id, m.channel_id.as_deref(), &name, arg, sessions, chat_states, harness).await;
                 continue;
             }
         }
@@ -1478,7 +1481,7 @@ async fn connect_and_run(
             };
             let (turn_workdir, workdir_ns) = resolve_turn_workdir(
                 cc.cwd.as_deref(),
-                if workdir_explicit { None } else { oc.cwd.as_deref() },
+                oc.cwd.as_deref(),
                 &workdir,
             );
             // Rebuild multi-party group context the access gate dropped (None for
@@ -1565,6 +1568,9 @@ async fn cancel_turn(chat_states: &ChatStates, chat_id: &str, msg_id: &str) -> b
 async fn handle_control(
     client: &Client,
     workdir: &str,
+    // Live owner-config cwd (the Customize sheet's All-chats value) — /cwd
+    // must show what a turn would actually use, not the process default.
+    owner_cwd: Option<String>,
     chat_id: &str,
     // The forum channel the command was issued in — session ops target that
     // channel's context and replies land back in the same channel.
@@ -1689,11 +1695,15 @@ async fn handle_control(
                 .await;
         }
         "cwd" => {
-            // Show the EFFECTIVE dir for this chat (per-chat override aware).
+            // Show the EFFECTIVE dirs, resolved exactly like a turn would:
+            // chat override > sheet All-chats default > process default.
             let cc = ConvConfig::fetch(client, chat_id).await;
-            let text = match cc.cwd {
-                Some(dir) => format!("Working directory (this chat): {dir}\nDefault: {workdir}"),
-                None => format!("Working directory: {workdir}"),
+            let (eff, _) = resolve_turn_workdir(cc.cwd.as_deref(), owner_cwd.as_deref(), workdir);
+            let text = if cc.cwd.is_some() {
+                let (def, _) = resolve_turn_workdir(None, owner_cwd.as_deref(), workdir);
+                format!("Working directory (this chat): {eff}\nDefault: {def}")
+            } else {
+                format!("Working directory: {eff}")
             };
             let _ = client.send_in(chat_id, channel_id, &text).await;
         }
