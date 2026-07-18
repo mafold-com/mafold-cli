@@ -707,6 +707,12 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     // this machine, so anyone chatting the bot can discover + tap them.
     publish_commands(&client, &workdir, &harness).await;
 
+    // Make sure the Customization sheet has something to render: agent bots are
+    // created template-less, so their schema is empty and the sheet shows an
+    // empty state — the owner can't pick a model even though the daemon fully
+    // consumes model/system_prompt/thinking/cwd. Seed those fields once.
+    ensure_customize_fields(&client, &my_username, owner_username.as_deref()).await;
+
     // RwLock so `events.botConfigUpdated` can hot-swap it live (owner changed the
     // model/effort/prompt in Customization) without a daemon restart.
     let owner = Arc::new(RwLock::new(owner));
@@ -859,6 +865,61 @@ async fn publish_commands(client: &Client, workdir: &str, harness: &Arc<dyn Harn
     let n = commands.len();
     if client.set_commands(Value::Array(commands)).await.is_ok() {
         println!("published {n} commands (control + discovered skills) to the chat menu");
+    }
+}
+
+/// Seed the bot's Customization schema when it's EMPTY, so the sheet renders the
+/// fields this daemon actually consumes (model / system_prompt / thinking / cwd)
+/// instead of an empty state. Agent bots are created template-less, and the
+/// schema is owner-writable only (`setBotConfig`) — the bot token can't publish
+/// it — so this borrows the owner's stored `mafold login` session on this
+/// machine. Best-effort and seed-once: a non-empty schema (owner-authored, or a
+/// prior seed) is NEVER touched, and every failure is a hint, not an error.
+async fn ensure_customize_fields(client: &Client, my_username: &str, owner_username: Option<&str>) {
+    // Already declared (owner-authored or previously seeded) → hands off.
+    match client.bot(my_username).await {
+        Ok(d) => {
+            if d["config_schema"].as_array().map(|a| !a.is_empty()).unwrap_or(false) {
+                return;
+            }
+        }
+        Err(_) => return, // can't read own detail — don't guess
+    }
+    let Some(owner) = owner_username else { return };
+    let Some(sess) = crate::session::load() else {
+        println!("note: Customize sheet is empty for @{my_username} — run `mafold login` once as @{owner} and restart, and I'll publish the model/prompt fields.");
+        return;
+    };
+    if !sess.username.eq_ignore_ascii_case(owner) {
+        println!("note: Customize sheet is empty for @{my_username}, but this machine is logged in as @{} (owner is @{owner}) — fields not published.", sess.username);
+        return;
+    }
+    // Field kinds are limited to string|number|bool|secret|select (validate_schema).
+    // The empty-value option on `model` maps to "unset" — OwnerConfig drops empty
+    // strings, so picking it falls back to the agent default.
+    let fields = serde_json::json!([
+        { "key": "model", "label": "Model", "kind": "select", "default": "",
+          "options": [
+            { "label": "Agent default", "value": "" },
+            { "label": "Fable",  "value": "fable" },
+            { "label": "Opus",   "value": "opus" },
+            { "label": "Sonnet", "value": "sonnet" },
+            { "label": "Haiku",  "value": "haiku" }
+          ] },
+        { "key": "system_prompt", "label": "System prompt", "kind": "string",
+          "placeholder": "Extra instructions appended for every reply" },
+        { "key": "thinking", "label": "Thinking budget (tokens)", "kind": "number",
+          "placeholder": "10000" },
+        { "key": "cwd", "label": "Working directory", "kind": "string",
+          "placeholder": "~/project" }
+    ]);
+    let owner_client = Client::new(client.base.clone(), sess.token.clone());
+    match owner_client
+        .call("setBotConfig", serde_json::json!({ "username": my_username, "config_schema": fields }))
+        .await
+    {
+        Ok(_) => println!("✓ published Customize fields for @{my_username} (model / system prompt / thinking / cwd)"),
+        Err(e) => println!("note: couldn't publish Customize fields for @{my_username}: {e}"),
     }
 }
 
