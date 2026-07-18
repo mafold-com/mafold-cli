@@ -181,10 +181,16 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
     let r = client.publish_card(&meta, bundle).await?;
     let scope = r["scope"].as_str().unwrap_or("?");
     let url = r["url"].as_str().unwrap_or("?");
+    // The server owns the stored version: it may auto-bump past the manifest
+    // label when the content drifted, or return an older label as a no-op.
+    let version = r["version"].as_str().unwrap_or(&manifest.version);
     println!(
         "\n✓ published {}@{} ({} scope)\n  url:   {}\n  use:   {{% {} /%}}",
-        manifest.tag, manifest.version, scope, url, manifest.tag
+        manifest.tag, version, scope, url, manifest.tag
     );
+    if version != manifest.version {
+        println!("  note: server stored {version} (manifest says {}) — content-drift auto-bump", manifest.version);
+    }
     Ok(())
 }
 
