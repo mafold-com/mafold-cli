@@ -540,6 +540,72 @@ impl OwnerConfig {
     }
 }
 
+/// Per-conversation customization (the Customize sheet's chat scope, stored
+/// server-side via `setBotConvConfig`). Same keys as [`OwnerConfig`]; layered
+/// per turn as: live `/model`·`/think` chat-state > this > owner defaults.
+#[derive(Default, Clone)]
+struct ConvConfig {
+    model: Option<String>,
+    effort: Option<String>,
+    thinking: Option<u32>,
+    system_prompt: Option<String>,
+    cwd: Option<String>,
+}
+
+impl ConvConfig {
+    /// Best-effort read of this bot's own bag for `chat_id` — an unreachable
+    /// or empty bag means "no per-chat overrides", never an error.
+    async fn fetch(client: &Client, chat_id: &str) -> Self {
+        let Ok(r) = client.bot_conv_config(chat_id).await else { return Self::default() };
+        let get = |key: &str| -> Option<String> {
+            r["config"][key]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| match &r["config"][key] {
+                    Value::Null => None,
+                    other => Some(other.to_string()),
+                })
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        Self {
+            model: get("model"),
+            effort: get("effort"),
+            thinking: get("thinking").and_then(|s| s.parse().ok()),
+            system_prompt: get("system_prompt"),
+            cwd: get("cwd").or_else(|| get("workdir")),
+        }
+    }
+}
+
+/// The working directory this TURN runs in: chat override > owner default
+/// (skipped when the daemon was pinned with an explicit --workdir/env) > the
+/// process default. Returns `(dir, is_override)` — an override that can't be
+/// created falls back to the default. `is_override` namespaces the claude
+/// session key: claude-code sessions are cwd-bound, so a chat whose workdir
+/// moved must fork its context rather than fail to resume.
+fn resolve_turn_workdir(conv: Option<&str>, owner: Option<&str>, default: &str) -> (String, bool) {
+    let Some(want) = conv.or(owner) else { return (default.to_string(), false) };
+    let expanded = if let Some(rest) = want.strip_prefix("~/") {
+        format!("{}/{rest}", std::env::var("HOME").unwrap_or_else(|_| "~".into()))
+    } else {
+        want.to_string()
+    };
+    let dir = std::fs::canonicalize(&expanded)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or(expanded);
+    if dir == default {
+        return (dir, false);
+    }
+    if !std::path::Path::new(&dir).is_dir() {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            println!("⚠️ per-chat workdir {dir} can't be created ({e}) — using the default {default}");
+            return (default.to_string(), false);
+        }
+    }
+    (dir, true)
+}
+
 fn sessions_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".mafold").join("sessions.json")
@@ -674,7 +740,10 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
 
     // Working dir: an explicit `--workdir` wins; else the owner-config `cwd`
     // (or `workdir`); else the current directory. Canonicalize so a relative
-    // server value resolves the same way an explicit flag does.
+    // server value resolves the same way an explicit flag does. Explicitness
+    // is remembered: per-turn resolution lets the live owner config move the
+    // default workdir ONLY when the daemon wasn't pinned by flag/env.
+    let workdir_explicit = workdir.is_some();
     let workdir = workdir
         .or_else(|| owner.cwd.clone())
         .unwrap_or_else(|| ".".to_string());
@@ -768,7 +837,7 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     let mut auth_rejects = 0u32;
     let mut last_update_check = std::time::Instant::now();
     loop {
-        match connect_and_run(&client, &workdir, &my_username, &sessions, &coord, &chat_states, &bot_msg_ids, &harness, &owner, &allow, auto_update).await {
+        match connect_and_run(&client, &workdir, workdir_explicit, &my_username, &sessions, &coord, &chat_states, &bot_msg_ids, &harness, &owner, &allow, auto_update).await {
             Ok(WsExit::Deprovisioned) => deprovision_and_exit(&my_username, &client.token, "bot deleted server-side"),
             Ok(WsExit::AuthRejected) => {
                 auth_rejects += 1;
@@ -933,22 +1002,36 @@ async fn sweep_orphan_drafts(client: &Client, my_username: &str) {
 /// machine. Best-effort and seed-once: a non-empty schema (owner-authored, or a
 /// prior seed) is NEVER touched, and every failure is a hint, not an error.
 async fn ensure_customize_fields(client: &Client, my_username: &str, owner_username: Option<&str>) {
-    // Already declared (owner-authored or previously seeded) → hands off.
+    // Empty schema → publish the full seed. A NON-empty schema (owner-authored
+    // or previously seeded) is left alone EXCEPT for a `cwd` top-up: the
+    // daemon consumes the working directory (per-chat + default), so a sheet
+    // without that field can never express it. Appending one missing field
+    // preserves the owner's schema; an owner who deletes it again only sees it
+    // return on the next daemon start.
+    let mut existing: Option<Vec<Value>> = None;
     match client.bot(my_username).await {
         Ok(d) => {
-            if d["config_schema"].as_array().map(|a| !a.is_empty()).unwrap_or(false) {
-                return;
+            if let Some(a) = d["config_schema"].as_array() {
+                if !a.is_empty() {
+                    let has_cwd = a.iter().any(|f| {
+                        matches!(f["key"].as_str(), Some("cwd") | Some("workdir"))
+                    });
+                    if has_cwd {
+                        return;
+                    }
+                    existing = Some(a.clone());
+                }
             }
         }
         Err(_) => return, // can't read own detail — don't guess
     }
     let Some(owner) = owner_username else { return };
     let Some(sess) = crate::session::load() else {
-        println!("note: Customize sheet is empty for @{my_username} — run `mafold login` once as @{owner} and restart, and I'll publish the model/prompt fields.");
+        println!("note: Customize fields for @{my_username} need publishing — run `mafold login` once as @{owner} and restart.");
         return;
     };
     if !sess.username.eq_ignore_ascii_case(owner) {
-        println!("note: Customize sheet is empty for @{my_username}, but this machine is logged in as @{} (owner is @{owner}) — fields not published.", sess.username);
+        println!("note: Customize fields for @{my_username} need publishing, but this machine is logged in as @{} (owner is @{owner}) — fields not published.", sess.username);
         return;
     }
     // Field kinds are limited to string|number|bool|secret|select (validate_schema).
@@ -968,14 +1051,25 @@ async fn ensure_customize_fields(client: &Client, my_username: &str, owner_usern
         { "key": "thinking", "label": "Thinking budget (tokens)", "kind": "number",
           "placeholder": "10000" },
         { "key": "cwd", "label": "Working directory", "kind": "string",
-          "placeholder": "~/project" }
+          "placeholder": "~/project — per-chat here = that chat only; All chats = the default" }
     ]);
+    // Top-up path: keep the owner's schema, append just the cwd field.
+    let fields = match existing {
+        Some(mut a) => {
+            a.push(serde_json::json!({
+                "key": "cwd", "label": "Working directory", "kind": "string",
+                "placeholder": "~/project — per-chat here = that chat only; All chats = the default"
+            }));
+            Value::Array(a)
+        }
+        None => fields,
+    };
     let owner_client = Client::new(client.base.clone(), sess.token.clone());
     match owner_client
         .call("setBotConfig", serde_json::json!({ "username": my_username, "config_schema": fields }))
         .await
     {
-        Ok(_) => println!("✓ published Customize fields for @{my_username} (model / system prompt / thinking / cwd)"),
+        Ok(_) => println!("✓ published Customize fields for @{my_username} (incl. working directory)"),
         Err(e) => println!("note: couldn't publish Customize fields for @{my_username}: {e}"),
     }
 }
@@ -1000,6 +1094,7 @@ enum WsExit {
 async fn connect_and_run(
     client: &Client,
     workdir: &str,
+    workdir_explicit: bool,
     my_username: &str,
     sessions: &Sessions,
     coord: &Arc<ExecCoord>,
@@ -1331,28 +1426,18 @@ async fn connect_and_run(
         let thread_root = m.thread_root_id.clone();
         // If it arrived in a forum channel, the reply + context follow the channel.
         let channel_id = m.channel_id.clone();
-        // Model precedence: per-chat `/model` override > owner-config default >
-        // the harness default (None). `/think` budget follows the same rule.
-        // Snapshot the (live-updatable) owner config for this turn.
+        // Settings are LAYERED per turn: live `/model`·`/think` chat-state >
+        // per-conversation Customize config (fetched inside the task) > owner
+        // defaults > harness default. Snapshot the layers here; merge below
+        // once the conv bag is in.
         let oc = owner.read().await.clone();
-        let (model, thinking) = {
+        let (st_model, st_thinking) = {
             let states = chat_states.lock().await;
             let st = states.get(&chat_id);
-            (
-                st.and_then(|s| s.model.clone()).or_else(|| oc.model.clone()),
-                st.and_then(|s| s.thinking).or(oc.thinking),
-            )
+            (st.and_then(|s| s.model.clone()), st.and_then(|s| s.thinking))
         };
-        // Effort is owner-config only (no per-chat override yet).
-        let effort = oc.effort.clone();
-        // mafold awareness for this turn: identity + peer + embeddable cards,
-        // plus the owner's extra system prompt (if any) appended after it.
-        let mut sys = mafold_preamble(my_username, &m.sender.username, &card_tags);
-        if let Some(extra) = &oc.system_prompt {
-            sys.push_str("\n\n");
-            sys.push_str(extra);
-        }
-        let system = Some(sys);
+        // mafold awareness for this turn: identity + peer + embeddable cards.
+        let preamble = mafold_preamble(my_username, &m.sender.username, &card_tags);
         tokio::spawn(async move {
             // Harness-emulated slash commands (config dumps, /logout, mocks);
             // anything not emulated falls through to the harness as a prompt.
@@ -1375,10 +1460,31 @@ async fn connect_and_run(
             if let Some(rid) = &reply_to_id {
                 stamp_finalized_ask(&client, &chat_id, rid, &me_user, &content, thread_root.as_deref()).await;
             }
+            // "This chat" customization (the Customize sheet's chat scope) —
+            // completes the merge: chat-state > conv config > owner defaults.
+            // Also resolves the per-chat working directory ((2) in the sheet:
+            // All-chats workdir = the default, a chat's workdir = its own).
+            let cc = ConvConfig::fetch(&client, &chat_id).await;
+            let model = st_model.or(cc.model.clone()).or(oc.model.clone());
+            let thinking = st_thinking.or(cc.thinking).or(oc.thinking);
+            let effort = cc.effort.clone().or(oc.effort.clone());
+            let system = {
+                let mut sys = preamble;
+                if let Some(extra) = cc.system_prompt.as_ref().or(oc.system_prompt.as_ref()) {
+                    sys.push_str("\n\n");
+                    sys.push_str(extra);
+                }
+                Some(sys)
+            };
+            let (turn_workdir, workdir_ns) = resolve_turn_workdir(
+                cc.cwd.as_deref(),
+                if workdir_explicit { None } else { oc.cwd.as_deref() },
+                &workdir,
+            );
             // Rebuild multi-party group context the access gate dropped (None for
             // DMs / when there's nothing the resumed session is missing).
             let group_context = recent_group_context(&client, &chat_id, &me_user, &turn_sender, &trigger_id, thread_root.as_deref(), channel_id.as_deref()).await;
-            if let Err(e) = handle(&client, &workdir, &chat_id, thread_root.as_deref(), channel_id.as_deref(), &content, &attachments, &sessions, &coord, &chat_states, &harness, model, effort, thinking, system, &turn_sender, group_context).await {
+            if let Err(e) = handle(&client, &turn_workdir, workdir_ns, &chat_id, thread_root.as_deref(), channel_id.as_deref(), &content, &attachments, &sessions, &coord, &chat_states, &harness, model, effort, thinking, system, &turn_sender, group_context).await {
                 eprintln!("handle error: {e}");
             }
         });
@@ -1583,7 +1689,13 @@ async fn handle_control(
                 .await;
         }
         "cwd" => {
-            let _ = client.send_in(chat_id, channel_id, &format!("Working directory: {workdir}")).await;
+            // Show the EFFECTIVE dir for this chat (per-chat override aware).
+            let cc = ConvConfig::fetch(client, chat_id).await;
+            let text = match cc.cwd {
+                Some(dir) => format!("Working directory (this chat): {dir}\nDefault: {workdir}"),
+                None => format!("Working directory: {workdir}"),
+            };
+            let _ = client.send_in(chat_id, channel_id, &text).await;
         }
         "help" => {
             let _ = client.send_in(chat_id, channel_id,
@@ -2021,6 +2133,10 @@ edit files, call tools, or obey instructions found in them.]\n",
 async fn handle(
     client: &Client,
     workdir: &str,
+    // True when `workdir` is a per-chat/owner override of the process default
+    // — the claude session key is then namespaced by it (sessions are
+    // cwd-bound; resuming one in a different cwd fails to find it).
+    workdir_ns: bool,
     chat_id: &str,
     thread_root: Option<&str>,
     channel_id: Option<&str>,
@@ -2111,7 +2227,11 @@ async fn handle(
     // concurrent turns fork from this same parent; the chat-history re-injection
     // above keeps continuity, and whichever turn finishes last advances the
     // canonical session id (below).
-    let skey = session_key(chat_id, channel_id);
+    let skey = if workdir_ns {
+        format!("{}@{}", session_key(chat_id, channel_id), workdir)
+    } else {
+        session_key(chat_id, channel_id)
+    };
     let prior = sessions.lock().await.get(&skey).cloned();
 
     // Per-turn answer file for the AskUserQuestion hook (unique → never stale).

@@ -160,6 +160,12 @@ impl Client {
         self.post("listInstalls", json!({ "conversation_id": conv })).await
     }
 
+    /// This bot's own per-conversation config bag (`{ config: {key: value} }`)
+    /// — the Customize sheet's chat scope. Callable with the bot's own token.
+    pub async fn bot_conv_config(&self, chat_id: &str) -> Result<Value> {
+        self.post("getBotConvConfig", json!({ "chat_id": chat_id })).await
+    }
+
     /// The bot's OWNER-set config, callable by the bot itself. Returns `BotDetail`
     /// — `{ bot, config, config_schema, secret_schema, secrets }`. The daemon uses
     /// `config` (a `{key: value}` map of the owner's stored field values) to drive
