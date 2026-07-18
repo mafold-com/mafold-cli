@@ -114,6 +114,41 @@ impl Client {
         self.post("getGroupBots", json!({ "chat_id": chat_id })).await
     }
 
+    // ── forum channels (Telegram-Topics-style; see channels.rs) ──
+    /// The forum's channels (`[Channel]`), decorated for the caller. `#all` is
+    /// implicit (channel_id NULL) and never in this list.
+    pub async fn list_channels(&self, chat_id: &str) -> Result<Value> {
+        self.post("listChannels", json!({ "chat_id": chat_id })).await
+    }
+    pub async fn create_channel(&self, chat_id: &str, name: &str, icon: Option<&str>) -> Result<Value> {
+        let mut body = json!({ "chat_id": chat_id, "name": name });
+        if let Some(i) = icon {
+            body["icon"] = json!(i);
+        }
+        self.post("createChannel", body).await
+    }
+    /// Partial edit: absent = unchanged; `icon: Some("")` clears the icon.
+    pub async fn edit_channel(&self, chat_id: &str, channel_id: &str, name: Option<&str>, icon: Option<&str>) -> Result<Value> {
+        let mut body = json!({ "chat_id": chat_id, "channel_id": channel_id });
+        if let Some(n) = name {
+            body["name"] = json!(n);
+        }
+        if let Some(i) = icon {
+            body["icon"] = json!(i);
+        }
+        self.post("editChannel", body).await
+    }
+    /// Removes the channel AND its contents (messages, threads, read state).
+    pub async fn delete_channel(&self, chat_id: &str, channel_id: &str) -> Result<Value> {
+        self.post("deleteChannel", json!({ "chat_id": chat_id, "channel_id": channel_id })).await
+    }
+    pub async fn set_channel_closed(&self, chat_id: &str, channel_id: &str, closed: bool) -> Result<Value> {
+        self.post("setChannelClosed", json!({ "chat_id": chat_id, "channel_id": channel_id, "closed": closed })).await
+    }
+    pub async fn set_channel_pinned(&self, chat_id: &str, channel_id: &str, pinned: bool) -> Result<Value> {
+        self.post("setChannelPinned", json!({ "chat_id": chat_id, "channel_id": channel_id, "pinned": pinned })).await
+    }
+
     // ── shared-room CRDT relay (the AI's room peer; see room.rs) ──
     pub async fn room_changes(&self, conv: &str, app: &str) -> Result<Value> {
         self.post("roomChanges", json!({ "conv": conv, "app": app })).await

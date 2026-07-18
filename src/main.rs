@@ -10,6 +10,7 @@ mod agent;
 mod apps;
 mod ask_hook;
 mod cards;
+mod channels;
 mod client;
 mod commands;
 mod daemon;
@@ -80,8 +81,16 @@ enum Cmd {
     /// Send a message. <chat> is a conversation id or a @username.
     Send {
         chat: String,
+        /// Send into a forum channel (id or #name) instead of the main timeline.
+        #[arg(long)]
+        channel: Option<String>,
         #[arg(trailing_var_arg = true, required = true)]
         text: Vec<String>,
+    },
+    /// Manage a forum's channels (list/create/rename/close/pin/delete).
+    Channels {
+        #[command(subcommand)]
+        cmd: channels::ChannelsCmd,
     },
     /// Author, preview, and publish developer cards.
     Cards {
@@ -267,7 +276,10 @@ async fn main() -> Result<()> {
         }
         Cmd::Add { name, workdir, harness } => supervisor::add(name, token, workdir, harness, &cli.base, cli.no_auto_update)?,
         Cmd::Chats => chats(&Client::new(cli.base, token)).await?,
-        Cmd::Send { chat, text } => send(&Client::new(cli.base, token), &chat, &text.join(" ")).await?,
+        Cmd::Send { chat, channel, text } => {
+            send(&Client::new(cli.base, token), &chat, channel.as_deref(), &text.join(" ")).await?
+        }
+        Cmd::Channels { cmd } => channels::run(cmd, &Client::new(cli.base, token)).await?,
         Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Install { .. } | Cmd::Cards { .. }
         | Cmd::Apps { .. } | Cmd::Room { .. }
         | Cmd::Langpack { .. } | Cmd::Login { .. } | Cmd::Report
@@ -440,9 +452,19 @@ async fn chats(client: &Client) -> Result<()> {
     Ok(())
 }
 
-async fn send(client: &Client, chat: &str, text: &str) -> Result<()> {
-    let chat_id = client.resolve_chat(chat).await?;
-    client.send(&chat_id, text).await?;
-    println!("✓ sent to {chat}");
+async fn send(client: &Client, chat: &str, channel: Option<&str>, text: &str) -> Result<()> {
+    match channel {
+        Some(ch) => {
+            let (chat_id, ch) = channels::resolve(client, chat, ch).await?;
+            let name = ch["name"].as_str().unwrap_or("?");
+            client.send_in(&chat_id, ch["id"].as_str(), text).await?;
+            println!("✓ sent to {chat} #{name}");
+        }
+        None => {
+            let chat_id = client.resolve_chat(chat).await?;
+            client.send(&chat_id, text).await?;
+            println!("✓ sent to {chat}");
+        }
+    }
     Ok(())
 }
