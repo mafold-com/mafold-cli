@@ -851,11 +851,12 @@ pub fn down(only: Option<&str>) -> Result<()> {
 fn stop_one(name: &str) -> Result<()> {
     match read_pid(name) {
         Some(pid) => {
-            // Group kill: take the daemon's harness children (claude etc.)
-            // with it — a plain pid kill orphans an in-flight claude to ppid 1,
-            // where it burns tokens streaming into a dead pipe (and its draft
-            // stays "generating" forever).
-            platform::terminate_group(pid);
+            // Plain SIGTERM: the DAEMON's own shutdown handler kills its
+            // in-flight claude children precisely (harness::live_children).
+            // Never group-kill here — the agent's legitimate background tasks
+            // share the daemon's pgroup and must survive a restart (the
+            // 2026-07-19 bg-task regression).
+            platform::terminate(pid);
             let _ = fs::remove_file(pid_path(name));
             Ok(())
         }

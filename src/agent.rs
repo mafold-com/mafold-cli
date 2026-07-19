@@ -831,6 +831,73 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
         });
     }
 
+    // Shutdown discipline: on SIGTERM/SIGINT kill exactly the IN-FLIGHT claude
+    // children (the live-children registry), then exit. Never the process
+    // group — legitimate background tasks the agent left running share our
+    // pgroup and must survive a daemon restart (the 2026-07-19 bg-task
+    // regression). An interrupted turn's draft is finalized by the next
+    // start's orphan-draft sweep.
+    #[cfg(unix)]
+    {
+        tokio::spawn(async {
+            use tokio::signal::unix::{signal, SignalKind};
+            let (Ok(mut term), Ok(mut int)) =
+                (signal(SignalKind::terminate()), signal(SignalKind::interrupt()))
+            else {
+                return;
+            };
+            tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+            let pids: Vec<u32> = crate::harness::live_children().lock().unwrap().iter().copied().collect();
+            for p in pids {
+                crate::platform::terminate(p);
+            }
+            std::process::exit(0);
+        });
+    }
+
+    // Re-arm completion wakeups lost to a restart: detached background tasks
+    // (bash-hook registry) run on across daemon restarts, but the armed monitor
+    // lived in the old process. Every conversation with leftover registrations
+    // — live OR finished-but-unreported — gets a fresh monitor (tag == chat id;
+    // uuids survive the sanitization unchanged). Config layering is skipped
+    // here (defaults); the wrap-up resumes an existing session anyway.
+    #[cfg(unix)]
+    {
+        let mut tags: HashMap<String, u64> = HashMap::new();
+        if let Ok(home) = std::env::var("HOME") {
+            let dir = PathBuf::from(home).join(".mafold").join("bgtasks");
+            for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if let Some(stem) = name.strip_suffix(".pid") {
+                    let tag = stem.rsplit_once('.').map(|(t, _)| t).unwrap_or(stem);
+                    *tags.entry(tag.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+        let stopper = owner_username.clone().unwrap_or_else(|| my_username.clone());
+        for (tag, n) in tags {
+            println!("↻ re-arming background-task wakeup for chat {tag} ({n} registration(s))");
+            arm_bg_wakeup(
+                client.clone(),
+                workdir.clone(),
+                false,
+                tag,
+                None,
+                None,
+                sessions.clone(),
+                coord.clone(),
+                chat_states.clone(),
+                harness.clone(),
+                None,
+                None,
+                None,
+                None,
+                stopper.clone(),
+                n,
+            );
+        }
+    }
+
     // Reconnect loop: a dropped WS (network blip, server restart) must NOT kill
     // the daemon. Reconnect with backoff; sessions/coord persist across it.
     // A DELETED bot must not reconnect forever, though: botDeleted (live) or a
@@ -2275,7 +2342,9 @@ async fn handle(
     }
 
     let turn = Turn {
-        prompt: full_prompt,
+        // Cloned: the empty-turn retry re-carries the user's message verbatim
+        // (relying on it still being queued in the session lost it sometimes).
+        prompt: full_prompt.clone(),
         conv: chat_id.to_string(),
         workdir: workdir.to_string(),
         session: prior.clone(),
@@ -2293,13 +2362,17 @@ async fn handle(
     // markdoc deltas (text + cards), so a slow append never stalls reading. It
     // also flips this chat into "awaiting answer" when AskUserQuestion is called,
     // so the next message routes to the hook's `ask_file`.
+    // Background shells started this turn (either attempt) — read after the
+    // turn to arm the completion-wakeup monitor.
+    let bg_shells = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let renderer = {
         let client = client.clone();
         let msg_id = msg_id.clone();
         let chat_states = chat_states.clone();
         let chat_id = chat_id.to_string();
         let ask_file = ask_file.clone();
-        tokio::spawn(render_loop(ev_rx, client, msg_id, chat_states, chat_id, ask_file))
+        let bg_shells = bg_shells.clone();
+        tokio::spawn(render_loop(ev_rx, client, msg_id, chat_states, chat_id, ask_file, bg_shells))
     };
 
     let mut result = harness.run(turn, ev_tx).await;
@@ -2345,12 +2418,20 @@ async fn handle(
                 let chat_states = chat_states.clone();
                 let chat_id = chat_id.to_string();
                 let ask_file = ask_file.clone();
-                tokio::spawn(render_loop(ev_rx2, client, msg_id, chat_states, chat_id, ask_file))
+                let bg_shells = bg_shells.clone();
+                tokio::spawn(render_loop(ev_rx2, client, msg_id, chat_states, chat_id, ask_file, bg_shells))
             };
             let retry = Turn {
-                prompt: "(your previous run exited without producing any output — a user message \
-                         may be pending in this session's queue; answer it now)"
-                    .to_string(),
+                // Re-carry the user's message VERBATIM: the first attempt's
+                // resume consumed a queued notification as the whole turn, and
+                // whether the real message is still queued behind it is not
+                // guaranteed — retries that just said "answer it now" sometimes
+                // answered nothing (the user saw the bot go silent).
+                prompt: format!(
+                    "(your previous run exited without producing any output — a queued \
+                     notification likely consumed the turn. The message you must answer \
+                     is repeated below; answer it now.)\n\n{full_prompt}"
+                ),
                 conv: chat_id.to_string(),
                 workdir: workdir.to_string(),
                 session,
@@ -2367,6 +2448,9 @@ async fn handle(
         }
     }
 
+    // Completion-wakeup eligibility: only a CLEAN end (not /stop, not an error
+    // path) with background shells left running arms the monitor below.
+    let clean_end = matches!(&result, Ok(o) if !o.stopped && o.error.is_none());
     match result {
         Ok(o) => {
             // Paragraph separator ONLY after actual transcript content — on a
@@ -2408,7 +2492,182 @@ async fn handle(
     let _ = std::fs::remove_file(&ask_file);
     let _ = client.finalize(&msg_id).await;
     println!("→ finalized reply for chat {chat_id}");
+
+    // Completion wakeup: the turn ended cleanly but left background shells
+    // running (they survive — nothing sweeps them any more). Watch for them to
+    // finish, then resume this session for a wrap-up reply — the `{% bgtasks %}`
+    // card's "结果会出现在下一条回复里" promise.
+    #[cfg(unix)]
+    if clean_end {
+        let shells = bg_shells.load(std::sync::atomic::Ordering::Relaxed);
+        if shells > 0 {
+            arm_bg_wakeup(
+                client.clone(),
+                workdir.to_string(),
+                workdir_ns,
+                chat_id.to_string(),
+                thread_root.map(str::to_string),
+                channel_id.map(str::to_string),
+                sessions.clone(),
+                coord.clone(),
+                chat_states.clone(),
+                harness.clone(),
+                model,
+                effort,
+                thinking,
+                system,
+                turn_sender.to_string(),
+                shells,
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = clean_end;
     Ok(())
+}
+
+/// Scan `~/.mafold/bgtasks` for this conversation's detached-task pid files
+/// (written by `mafold bash-hook`, keyed by the sanitized conversation id).
+/// Returns (live count, finished tasks' log paths); a dead task's `.pid` file
+/// is consumed here (its `.log`/`.sh` stay for the wrap-up turn to read).
+#[cfg(unix)]
+fn bgtasks_scan(tag: &str) -> (usize, Vec<String>) {
+    let mut live = 0usize;
+    let mut finished: Vec<String> = vec![];
+    let Ok(home) = std::env::var("HOME") else { return (0, finished) };
+    let dir = PathBuf::from(home).join(".mafold").join("bgtasks");
+    let prefix = format!("{tag}.");
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with(&prefix) && name.ends_with(".pid")) {
+            continue;
+        }
+        let Some(pid) = std::fs::read_to_string(e.path())
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        else {
+            let _ = std::fs::remove_file(e.path());
+            continue;
+        };
+        if crate::platform::pid_alive(pid) {
+            live += 1;
+        } else {
+            let _ = std::fs::remove_file(e.path());
+            finished.push(e.path().with_extension("log").to_string_lossy().into_owned());
+        }
+    }
+    (live, finished)
+}
+
+/// Watch this turn's surviving background tasks and, once they have ALL exited,
+/// resume the session for a wrap-up turn that reports their results.
+///
+/// Detection is the bash-hook's pid registry (`bgtasks_scan`) — the hook
+/// detached each task into its own session and recorded its pid, so liveness
+/// is an exact `kill(pid, 0)` probe, not process-tree guesswork. If the turn
+/// claimed background shells but nothing got registered (hook missed — e.g. an
+/// older claude that ignores `updatedInput`), the monitor stands down rather
+/// than fire a bogus wrap-up.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn arm_bg_wakeup(
+    client: Client,
+    workdir: String,
+    workdir_ns: bool,
+    chat_id: String,
+    thread_root: Option<String>,
+    channel_id: Option<String>,
+    sessions: Sessions,
+    coord: Arc<ExecCoord>,
+    chat_states: ChatStates,
+    harness: Arc<dyn Harness>,
+    model: Option<String>,
+    effort: Option<String>,
+    thinking: Option<u32>,
+    system: Option<String>,
+    turn_sender: String,
+    shells: u64,
+) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex as StdMutex, OnceLock};
+    // One monitor per (conv, channel, workdir): a later turn that starts more
+    // shells while one is armed rides the existing monitor's wrap-up. Disarmed
+    // BEFORE the wrap-up turn runs, so shells started by the wrap-up itself
+    // can arm a fresh monitor.
+    static ARMED: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+    let armed = || ARMED.get_or_init(|| StdMutex::new(HashSet::new()));
+    let key = format!("{chat_id}#{}@{workdir}", channel_id.as_deref().unwrap_or(""));
+    if !armed().lock().unwrap().insert(key.clone()) {
+        return;
+    }
+    // Registry tag — MUST mirror bash_hook's sanitization of MAFOLD_CONV.
+    let tag: String = chat_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .collect();
+    println!("⏳ {shells} background task(s) outlive the turn in chat {chat_id} — wakeup armed");
+    tokio::spawn(async move {
+        let mut quiet = false;
+        let mut logs: Vec<String> = vec![];
+        for i in 0..720 {
+            // 10s cadence, 2h cap
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let (live, done) = bgtasks_scan(&tag);
+            logs.extend(done);
+            if live == 0 {
+                if logs.is_empty() && i == 0 {
+                    // The turn claimed background shells but nothing registered
+                    // — the bash-hook didn't run (older claude?). Stand down.
+                    println!("⚠ no detached-task registrations for chat {chat_id} — wakeup skipped");
+                    armed().lock().unwrap().remove(&key);
+                    return;
+                }
+                quiet = true;
+                break;
+            }
+        }
+        armed().lock().unwrap().remove(&key);
+        if !quiet {
+            println!("⏳ background tasks in chat {chat_id} still running after 2h — wakeup abandoned");
+            return;
+        }
+        println!("✓ background tasks finished — waking chat {chat_id} for the wrap-up reply");
+        let logs_note = if logs.is_empty() {
+            String::new()
+        } else {
+            format!(" Their output logs:\n{}\n", logs.join("\n"))
+        };
+        let prompt = format!(
+            "(the background task(s) you started earlier have finished.{logs_note} Read \
+             their output now and report the outcome to the user, who was promised the \
+             results would appear in this reply.)"
+        );
+        let prompt = prompt.as_str();
+        if let Err(e) = handle(
+            &client,
+            &workdir,
+            workdir_ns,
+            &chat_id,
+            thread_root.as_deref(),
+            channel_id.as_deref(),
+            prompt,
+            &[],
+            &sessions,
+            &coord,
+            &chat_states,
+            &harness,
+            model,
+            effort,
+            thinking,
+            system,
+            &turn_sender,
+            None,
+        )
+        .await
+        {
+            eprintln!("bg wakeup turn failed for chat {chat_id}: {e}");
+        }
+    });
 }
 
 /// Drains a harness's `AgentEvent` stream → ordered markdoc deltas, with
@@ -2427,6 +2686,10 @@ async fn render_loop(
     chat_states: ChatStates,
     chat_id: String,
     ask_file: String,
+    // Out-param: background shells started this turn — `handle()` reads it
+    // after the renderer exits to decide whether to arm the completion-wakeup
+    // monitor (the `{% bgtasks %}` promise).
+    bg_shells: Arc<std::sync::atomic::AtomicU64>,
 ) {
     // Telegram `sendMessageDraft` model: keep the running FULL markdoc content
     // locally and push the whole snapshot (throttled ~300ms) via editDraft, with
@@ -2592,6 +2855,7 @@ async fn render_loop(
                             && input["run_in_background"].as_bool() == Some(true)
                         {
                             shells += 1;
+                            bg_shells.store(shells, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                     if let Some(k) = crate::render::tool_kind(&ev) {

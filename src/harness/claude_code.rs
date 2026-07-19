@@ -78,6 +78,13 @@ impl Harness for ClaudeCode {
                 "hooks": { "PreToolUse": [{
                     "matcher": "AskUserQuestion",
                     "hooks": [{ "type": "command", "command": format!("\"{exe}\" ask-hook") }]
+                }, {
+                    // Detach run_in_background Bash tasks into their own session
+                    // (registered under ~/.mafold/bgtasks by MAFOLD_CONV) — claude
+                    // kills its own background shells the moment it exits, so
+                    // without this they can never outlive the turn. See bash_hook.
+                    "matcher": "Bash",
+                    "hooks": [{ "type": "command", "command": format!("\"{exe}\" bash-hook") }]
                 }]}
             });
             cmd.arg("--settings").arg(settings.to_string());
@@ -96,6 +103,10 @@ impl Harness for ClaudeCode {
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("couldn't run `claude` in {workdir} — is Claude Code installed and on PATH?"))?;
+        // Register this run in the live-children set so a daemon shutdown kills
+        // exactly THIS process (see harness::live_children); RAII — deregisters
+        // on every exit path.
+        let _child_guard = crate::harness::ChildGuard::new(child.id());
 
         let stdout = child.stdout.take().context("no stdout")?;
         let mut lines = BufReader::new(stdout).lines();

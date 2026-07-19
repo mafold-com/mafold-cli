@@ -13,10 +13,40 @@ pub mod claude_code;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{mpsc::UnboundedSender, Notify};
 
 use crate::client::Client;
+
+/// PIDs of harness child processes (claude runs) currently IN FLIGHT. The
+/// daemon's shutdown handler kills exactly these — never the process group:
+/// legitimate background tasks the agent left running (run_in_background
+/// shells) share the daemon's pgroup and MUST survive a daemon restart
+/// (0.9.46's group kill wrongly took them down — the 2026-07-19 regression).
+pub fn live_children() -> &'static Mutex<HashSet<u32>> {
+    static LIVE: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// RAII registration of a harness child pid in [`live_children`] — deregisters
+/// on drop, so every exit path (clean, error, panic) cleans up.
+pub struct ChildGuard(Option<u32>);
+impl ChildGuard {
+    pub fn new(pid: Option<u32>) -> Self {
+        if let Some(p) = pid {
+            live_children().lock().unwrap().insert(p);
+        }
+        Self(pid)
+    }
+}
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0 {
+            live_children().lock().unwrap().remove(&p);
+        }
+    }
+}
 
 /// One normalized event from a harness turn. Harness-specific output formats
 /// (Claude Code stream-json, etc.) are parsed down to this common shape.

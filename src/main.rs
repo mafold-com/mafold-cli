@@ -9,6 +9,7 @@
 mod agent;
 mod apps;
 mod ask_hook;
+mod bash_hook;
 mod cards;
 mod channels;
 mod client;
@@ -162,6 +163,11 @@ enum Cmd {
     /// the user answers the chat card, then feeds the answer back. Not for humans.
     #[command(hide = true)]
     AskHook,
+    /// (internal) PreToolUse hook claude runs for Bash — detaches
+    /// run_in_background tasks into their own session so they survive the turn
+    /// (claude kills its background shells at exit). Not for humans.
+    #[command(hide = true)]
+    BashHook,
 }
 
 #[tokio::main]
@@ -179,6 +185,7 @@ async fn main() -> Result<()> {
     // The AskUserQuestion hook is invoked by claude (a child of the daemon) and
     // needs no auth — it just bridges stdin/the answer file. Handle it first.
     if matches!(cli.cmd, Cmd::AskHook) { return ask_hook::run(); }
+    if matches!(cli.cmd, Cmd::BashHook) { return bash_hook::run(); }
 
     // Daemon control + self-update need no auth.
     if matches!(cli.cmd, Cmd::Stop) { return daemon::stop(); }
@@ -284,7 +291,7 @@ async fn main() -> Result<()> {
         | Cmd::Apps { .. } | Cmd::Room { .. }
         | Cmd::Langpack { .. } | Cmd::Login { .. } | Cmd::Report
         | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
-        | Cmd::Rollback | Cmd::Supervise { .. } | Cmd::AskHook => unreachable!(),
+        | Cmd::Rollback | Cmd::Supervise { .. } | Cmd::AskHook | Cmd::BashHook => unreachable!(),
     }
     Ok(())
 }
