@@ -96,7 +96,7 @@ pub fn tool_kind(ev: &AgentEvent) -> Option<&'static str> {
         AgentEvent::ToolCall { name, .. } => Some(match name.to_lowercase().as_str() {
             "bash" => "shell",
             "read" | "notebookedit" => "read",
-            "edit" | "write" | "multiedit" => "edit",
+            "edit" | "write" | "multiedit" | "apply_patch" => "edit",
             "glob" | "grep" => "search",
             "webfetch" | "websearch" => "web",
             "task" => "task",
@@ -277,7 +277,7 @@ fn result_tag(dur: Option<f64>, cost: Option<f64>, tokens: Option<u64>) -> Optio
 fn tool_detail(name: &str, input: &Value) -> String {
     let raw = match name.to_lowercase().as_str() {
         "bash" => input["command"].as_str(),
-        "edit" | "write" | "multiedit" | "read" | "notebookedit" => input["file_path"].as_str(),
+        "edit" | "write" | "multiedit" | "read" | "notebookedit" | "apply_patch" => input["file_path"].as_str(),
         "glob" | "grep" => input["pattern"].as_str(),
         "webfetch" => input["url"].as_str(),
         "task" => input["description"].as_str(),

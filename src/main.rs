@@ -31,7 +31,7 @@ use clap::{Parser, Subcommand};
 use client::Client;
 
 #[derive(Parser)]
-#[command(name = "mafold", version, about = "Mafold from your terminal — CLI client + Claude Code agent")]
+#[command(name = "mafold", version, about = "Mafold from your terminal — CLI client + coding-agent daemon (Claude Code, Codex, …)")]
 struct Cli {
     #[arg(long, env = "MAFOLD_BASE", default_value = "https://api.mafold.com", global = true)]
     base: String,

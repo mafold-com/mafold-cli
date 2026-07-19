@@ -784,7 +784,7 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     // created template-less, so their schema is empty and the sheet shows an
     // empty state — the owner can't pick a model even though the daemon fully
     // consumes model/system_prompt/thinking/cwd. Seed those fields once.
-    ensure_customize_fields(&client, &my_username, owner_username.as_deref()).await;
+    ensure_customize_fields(&client, &my_username, owner_username.as_deref(), harness.id()).await;
 
     // A daemon killed mid-turn (update restart / crash) leaves its streaming
     // draft unfinalized — a forever-"generating" bubble no client can dismiss,
@@ -986,25 +986,33 @@ async fn maybe_update(http: &reqwest::Client, coord: &Arc<ExecCoord>) {
     }
 }
 
-/// The daemon's own control commands — handled locally, never forwarded to
-/// `claude`. Listed first in the menu; see `handle_control`.
-fn control_commands() -> Vec<Value> {
-    vec![
+/// The daemon's own control commands — handled locally, never forwarded to the
+/// harness CLI. Listed first in the menu; see `handle_control`. Harness-aware:
+/// `/think` (extended-thinking budget) is a Claude Code feature, so a codex bot
+/// — whose depth is the owner-set Reasoning effort, not a per-chat budget —
+/// doesn't advertise it.
+fn control_commands(harness_id: &str) -> Vec<Value> {
+    let mut cmds = vec![
         serde_json::json!({ "command": "clear",  "description": "Start a fresh conversation (clear context)" }),
         serde_json::json!({ "command": "new",    "description": "Alias for /clear" }),
         serde_json::json!({ "command": "stop",   "description": "Stop the reply that's currently running" }),
         serde_json::json!({ "command": "model",  "description": "Switch the model for this chat", "arg_hint": "name | reset" }),
-        serde_json::json!({ "command": "think",  "description": "Toggle extended thinking for this chat", "arg_hint": "on | off | <tokens>" }),
+    ];
+    if harness_id != "codex" {
+        cmds.push(serde_json::json!({ "command": "think", "description": "Toggle extended thinking for this chat", "arg_hint": "on | off | <tokens>" }));
+    }
+    cmds.extend([
         serde_json::json!({ "command": "status", "description": "Agent, session, account & daemon info" }),
         serde_json::json!({ "command": "cwd",    "description": "Show the working directory" }),
         serde_json::json!({ "command": "help",   "description": "What this agent can do" }),
-    ]
+    ]);
+    cmds
 }
 
 /// Build the full command panel (control commands + discovered skills/commands)
 /// and publish it. Best-effort — a failure just leaves the previous menu.
 async fn publish_commands(client: &Client, workdir: &str, harness: &Arc<dyn Harness>) {
-    let mut commands = control_commands();
+    let mut commands = control_commands(harness.id());
     if let Value::Array(discovered) = harness.discover(workdir) {
         commands.extend(discovered);
     }
@@ -1065,32 +1073,47 @@ async fn sweep_orphan_drafts(client: &Client, my_username: &str) {
     }
 }
 
-/// Seed the bot's Customization schema when it's EMPTY, so the sheet renders the
-/// fields this daemon actually consumes (model / system_prompt / thinking / cwd)
-/// instead of an empty state. Agent bots are created template-less, and the
-/// schema is owner-writable only (`setBotConfig`) — the bot token can't publish
-/// it — so this borrows the owner's stored `mafold login` session on this
-/// machine. Best-effort and seed-once: a non-empty schema (owner-authored, or a
-/// prior seed) is NEVER touched, and every failure is a hint, not an error.
-async fn ensure_customize_fields(client: &Client, my_username: &str, owner_username: Option<&str>) {
-    // Empty schema → publish the full seed. A NON-empty schema (owner-authored
-    // or previously seeded) is left alone EXCEPT for a `cwd` top-up: the
-    // daemon consumes the working directory (per-chat + default), so a sheet
-    // without that field can never express it. Appending one missing field
-    // preserves the owner's schema; an owner who deletes it again only sees it
-    // return on the next daemon start.
-    let mut existing: Option<Vec<Value>> = None;
+/// Seed the bot's Customization schema so the sheet renders the fields this
+/// daemon actually consumes, PER HARNESS (a codex bot must not offer the Claude
+/// model menu or a thinking budget it ignores). Agent bots are created
+/// template-less, and the schema is owner-writable only (`setBotConfig`) — the
+/// bot token can't publish it — so this borrows the owner's stored `mafold
+/// login` session on this machine. Best-effort. Ownership rules:
+/// - empty sheet → publish this harness's stock seed;
+/// - OUR stock seed (any harness / revision) that's stale for this harness →
+///   republish (a claude-code-fallback daemon can mis-seed a codex bot's sheet
+///   with the Claude fields; that mistake must not stick forever);
+/// - owner-authored schema → never replaced, only topped up with a missing
+///   `cwd` field (the daemon consumes the working directory, and a sheet
+///   without that field can never express it).
+async fn ensure_customize_fields(client: &Client, my_username: &str, owner_username: Option<&str>, harness_id: &str) {
+    let (stock, stock_desc) = customize_fields(harness_id);
+    let mut fields = stock.clone();
+    let mut desc = stock_desc.to_string();
     match client.bot(my_username).await {
         Ok(d) => {
-            if let Some(a) = d["config_schema"].as_array() {
-                if !a.is_empty() {
-                    let has_cwd = a.iter().any(|f| {
+            let schema = d["config_schema"].as_array().cloned().unwrap_or_default();
+            if !schema.is_empty() {
+                if is_our_stock_seed(&schema) {
+                    if *stock.as_array().unwrap() == schema {
+                        return; // current stock already published
+                    }
+                    // Stale / mis-seeded stock → republish this harness's stock.
+                } else {
+                    // Owner-authored: preserve it; only top up a missing cwd.
+                    let has_cwd = schema.iter().any(|f| {
                         matches!(f["key"].as_str(), Some("cwd") | Some("workdir"))
                     });
                     if has_cwd {
                         return;
                     }
-                    existing = Some(a.clone());
+                    let mut a = schema;
+                    a.push(serde_json::json!({
+                        "key": "cwd", "label": "Working directory", "kind": "string",
+                        "placeholder": "~/project — per-chat here = that chat only; All chats = the default"
+                    }));
+                    fields = Value::Array(a);
+                    desc = "incl. working directory".into();
                 }
             }
         }
@@ -1105,43 +1128,91 @@ async fn ensure_customize_fields(client: &Client, my_username: &str, owner_usern
         println!("note: Customize fields for @{my_username} need publishing, but this machine is logged in as @{} (owner is @{owner}) — fields not published.", sess.username);
         return;
     }
-    // Field kinds are limited to string|number|bool|secret|select (validate_schema).
-    // The empty-value option on `model` maps to "unset" — OwnerConfig drops empty
-    // strings, so picking it falls back to the agent default.
-    let fields = serde_json::json!([
-        { "key": "model", "label": "Model", "kind": "select", "default": "",
-          "options": [
-            { "label": "Agent default", "value": "" },
-            { "label": "Fable",  "value": "fable" },
-            { "label": "Opus",   "value": "opus" },
-            { "label": "Sonnet", "value": "sonnet" },
-            { "label": "Haiku",  "value": "haiku" }
-          ] },
-        { "key": "system_prompt", "label": "System prompt", "kind": "string",
-          "placeholder": "Extra instructions appended for every reply" },
-        { "key": "thinking", "label": "Thinking budget (tokens)", "kind": "number",
-          "placeholder": "10000" },
-        { "key": "cwd", "label": "Working directory", "kind": "string",
-          "placeholder": "~/project — per-chat here = that chat only; All chats = the default" }
-    ]);
-    // Top-up path: keep the owner's schema, append just the cwd field.
-    let fields = match existing {
-        Some(mut a) => {
-            a.push(serde_json::json!({
-                "key": "cwd", "label": "Working directory", "kind": "string",
-                "placeholder": "~/project — per-chat here = that chat only; All chats = the default"
-            }));
-            Value::Array(a)
-        }
-        None => fields,
-    };
     let owner_client = Client::new(client.base.clone(), sess.token.clone());
     match owner_client
         .call("setBotConfig", serde_json::json!({ "username": my_username, "config_schema": fields }))
         .await
     {
-        Ok(_) => println!("✓ published Customize fields for @{my_username} (incl. working directory)"),
+        Ok(_) => println!("✓ published Customize fields for @{my_username} ({desc})"),
         Err(e) => println!("note: couldn't publish Customize fields for @{my_username}: {e}"),
+    }
+}
+
+/// Is this schema one of OUR stock seeds (any harness, any revision) — as
+/// opposed to owner-authored? Fingerprint: one of the seeded key sequences.
+/// An owner editing even one key/label makes it theirs and we never touch it
+/// again; matching a stock shape only makes it *eligible* for a re-seed when
+/// it differs from the current stock for the daemon's harness.
+fn is_our_stock_seed(schema: &[serde_json::Value]) -> bool {
+    let keys: Vec<&str> = schema.iter().filter_map(|f| f["key"].as_str()).collect();
+    // claude-code stock (with the stock Claude model menu)…
+    (keys == ["model", "system_prompt", "thinking", "cwd"]
+        && schema[0]["options"]
+            .as_array()
+            .is_some_and(|o| o.iter().any(|x| x["value"] == "fable")))
+        // …or codex stock: v1 (free-text model) / v2 (a gpt-* model menu).
+        || (keys == ["model", "effort", "system_prompt", "cwd"]
+            && (schema[0]["kind"] == "string"
+                || schema[0]["options"].as_array().is_some_and(|o| {
+                    o.iter().any(|x| x["value"].as_str().is_some_and(|v| v.starts_with("gpt-")))
+                })))
+}
+
+/// The Customization fields a harness's daemon actually consumes. Field kinds are
+/// limited to string|number|bool|secret|select (validate_schema). An empty value
+/// maps to "unset" — OwnerConfig drops empty strings, so it falls back to the
+/// agent default.
+fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
+    match harness_id {
+        // Codex: a real model menu — the ids are the roster EMBEDDED in the
+        // installed codex CLI (current gpt-5.6 line), so every option is one the
+        // binary actually accepts; `/model <name>` still takes anything newer.
+        // Reasoning effort IS its thinking depth, so it gets the effort select
+        // and NO extended-thinking budget field.
+        "codex" => (
+            serde_json::json!([
+                { "key": "model", "label": "Model", "kind": "select", "default": "",
+                  "options": [
+                    { "label": "Agent default", "value": "" },
+                    { "label": "gpt-5.6-sol",   "value": "gpt-5.6-sol" },
+                    { "label": "gpt-5.6-luna",  "value": "gpt-5.6-luna" },
+                    { "label": "gpt-5.6-terra", "value": "gpt-5.6-terra" },
+                    { "label": "gpt-5.6-pro",   "value": "gpt-5.6-pro" }
+                  ] },
+                { "key": "effort", "label": "Reasoning effort", "kind": "select", "default": "",
+                  "options": [
+                    { "label": "Agent default", "value": "" },
+                    { "label": "Minimal", "value": "minimal" },
+                    { "label": "Low",     "value": "low" },
+                    { "label": "Medium",  "value": "medium" },
+                    { "label": "High",    "value": "high" }
+                  ] },
+                { "key": "system_prompt", "label": "System prompt", "kind": "string",
+                  "placeholder": "Extra instructions appended for every reply" },
+                { "key": "cwd", "label": "Working directory", "kind": "string",
+                  "placeholder": "~/project — per-chat here = that chat only; All chats = the default" }
+            ]),
+            "model / effort / system prompt / cwd",
+        ),
+        _ => (
+            serde_json::json!([
+                { "key": "model", "label": "Model", "kind": "select", "default": "",
+                  "options": [
+                    { "label": "Agent default", "value": "" },
+                    { "label": "Fable",  "value": "fable" },
+                    { "label": "Opus",   "value": "opus" },
+                    { "label": "Sonnet", "value": "sonnet" },
+                    { "label": "Haiku",  "value": "haiku" }
+                  ] },
+                { "key": "system_prompt", "label": "System prompt", "kind": "string",
+                  "placeholder": "Extra instructions appended for every reply" },
+                { "key": "thinking", "label": "Thinking budget (tokens)", "kind": "number",
+                  "placeholder": "10000" },
+                { "key": "cwd", "label": "Working directory", "kind": "string",
+                  "placeholder": "~/project — per-chat here = that chat only; All chats = the default" }
+            ]),
+            "model / system prompt / thinking / cwd",
+        ),
     }
 }
 
@@ -1658,12 +1729,21 @@ async fn handle_control(
             let _ = client.send_in(chat_id, channel_id, "🧹 Context cleared — starting fresh.").await;
         }
         "compact" => {
-            // Genuinely compact this conversation's Claude session (summarize the
-            // prior context to free tokens, keeping continuity). Spawned so the
-            // (slow) claude run never blocks the message loop.
-            let (client, workdir, chat_id, skey, channel, sessions) =
-                (client.clone(), workdir.to_string(), chat_id.to_string(), skey.clone(), channel_id.map(str::to_string), sessions.clone());
-            tokio::spawn(async move { compact_session(client, workdir, chat_id, skey, channel, sessions).await; });
+            // `/compact` runs Claude Code's own `/compact` on the resumed session —
+            // it's a Claude-Code-specific mechanic. Codex manages its own context
+            // (thread rollout) and has no headless compaction verb, so a codex bot
+            // must NOT spawn the `claude` binary here; tell the user instead.
+            if harness.id() == "codex" {
+                let _ = client.send_in(chat_id, channel_id,
+                    "Codex manages its own context automatically — there's no `/compact` for it. Use `/clear` to start a fresh conversation when you want to reset.").await;
+            } else {
+                // Genuinely compact this conversation's Claude session (summarize the
+                // prior context to free tokens, keeping continuity). Spawned so the
+                // (slow) claude run never blocks the message loop.
+                let (client, workdir, chat_id, skey, channel, sessions) =
+                    (client.clone(), workdir.to_string(), chat_id.to_string(), skey.clone(), channel_id.map(str::to_string), sessions.clone());
+                tokio::spawn(async move { compact_session(client, workdir, chat_id, skey, channel, sessions).await; });
+            }
         }
         "stop" => {
             // `/stop` stops EVERY in-flight turn in this conversation; each running
@@ -1677,7 +1757,8 @@ async fn handle_control(
             let st = states.entry(chat_id.to_string()).or_default();
             if arg.is_empty() {
                 let cur = st.model.clone().unwrap_or_else(|| "default".into());
-                let _ = client.send_in(chat_id, channel_id, &format!("Model for this chat: {cur}\nSet with `/model <name>` (e.g. opus, sonnet, haiku) or `/model reset`.")).await;
+                let example = if harness.id() == "codex" { "gpt-5.6-sol" } else { "opus, sonnet, haiku" };
+                let _ = client.send_in(chat_id, channel_id, &format!("Model for this chat: {cur}\nSet with `/model <name>` (e.g. {example}) or `/model reset`.")).await;
             } else if arg.eq_ignore_ascii_case("reset") || arg.eq_ignore_ascii_case("default") {
                 st.model = None;
                 let _ = client.send_in(chat_id, channel_id, "Model reset to the agent default.").await;
@@ -1687,6 +1768,15 @@ async fn handle_control(
             }
         }
         "think" => {
+            // Extended thinking is a Claude Code budget (`MAX_THINKING_TOKENS`).
+            // Codex has no per-chat thinking budget — its depth is the owner-set
+            // Reasoning effort — so accepting `/think` would set a value the codex
+            // daemon silently ignores. Redirect instead.
+            if harness.id() == "codex" {
+                let _ = client.send_in(chat_id, channel_id,
+                    "Codex has no per-chat thinking budget. Its reasoning depth is set by **Reasoning effort** (minimal/low/medium/high) in this bot's Customize sheet.").await;
+                return;
+            }
             // Default budget for a bare `/think on` — enough for visible reasoning
             // without burning the whole turn on thinking.
             const DEFAULT_THINKING: u32 = 10_000;
@@ -1728,17 +1818,25 @@ async fn handle_control(
                 )
             };
             let session = sessions.lock().await.get(&skey).cloned();
-            let think = match thinking { Some(n) => format!("on ({n} tokens)"), None => "off".into() };
             let state = if busy { "running a reply now" } else { "idle" };
             let auth = harness.status_line().await;
-            let cli_ver = crate::commands::claude_version().await;
+            // Each harness reports ITS OWN CLI version — a codex bot must not show
+            // the `claude` version (this used to call claude_version() for all).
+            let cli_ver = harness.cli_version().await;
 
             let mut body = format!("kv|Agent|{state}\n");
             let mut hline = harness.id().to_string();
             if !cli_ver.is_empty() { hline.push_str(&format!(" · v{cli_ver}")); }
             body.push_str(&format!("kv|Harness|{hline}\n"));
             if !auth.is_empty() { body.push_str(&format!("kv|Account|{auth}\n")); }
-            body.push_str(&format!("kv|Model|{model} · thinking {think}\n"));
+            // The `/think` budget is Claude-Code-only; omit the meaningless
+            // "thinking off" for codex, whose depth is the owner-set effort.
+            if harness.id() == "codex" {
+                body.push_str(&format!("kv|Model|{model}\n"));
+            } else {
+                let think = match thinking { Some(n) => format!("on ({n} tokens)"), None => "off".into() };
+                body.push_str(&format!("kv|Model|{model} · thinking {think}\n"));
+            }
             match &session {
                 Some(sid) => {
                     let mut v = sid.get(..8).unwrap_or(sid.as_str()).to_string();
@@ -1775,8 +1873,14 @@ async fn handle_control(
             let _ = client.send_in(chat_id, channel_id, &text).await;
         }
         "help" => {
-            let _ = client.send_in(chat_id, channel_id,
-                "I'm a Claude Code agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /compact — summarize the context to free up room (keeps continuity)\n• /stop — stop the running reply\n• /model <name> — switch model for this chat\n• /think on|off|<tokens> — toggle extended thinking for this chat\n• /status · /cwd — agent info\n\nEverything else in the `/` menu is a Claude Code skill or command — tap one to run it.").await;
+            // Harness-aware: codex has no /compact, no /think, and its headless
+            // menu carries no discovered skills — so its help omits all three.
+            let text = if harness.id() == "codex" {
+                "I'm a Codex agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /stop — stop the running reply\n• /model <name> — switch model for this chat\n• /status · /cwd — agent info\n\nReasoning depth is set by the **Reasoning effort** field in this bot's Customize sheet."
+            } else {
+                "I'm a Claude Code agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /compact — summarize the context to free up room (keeps continuity)\n• /stop — stop the running reply\n• /model <name> — switch model for this chat\n• /think on|off|<tokens> — toggle extended thinking for this chat\n• /status · /cwd — agent info\n\nEverything else in the `/` menu is a Claude Code skill or command — tap one to run it."
+            };
+            let _ = client.send_in(chat_id, channel_id, text).await;
         }
         _ => {}
     }
@@ -2902,6 +3006,27 @@ mod gate_tests {
         assert!(!mentions_me("ping @claude", "ops:claude"));                 // partial ≠ full handle
         assert!(!mentions_me("just chatting, no mention", "ops:claude"));
         assert!(!mentions_me("@opsclaudex", "ops:claude"));                  // longer handle ≠
+    }
+
+    #[test]
+    fn control_commands_are_harness_aware() {
+        let names = |id: &str| {
+            super::control_commands(id)
+                .iter()
+                .filter_map(|c| c["command"].as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        };
+        let cc = names("claude-code");
+        let cx = names("codex");
+        // `/think` is a Claude Code budget (MAX_THINKING_TOKENS) — offered to
+        // claude-code, hidden from codex (its depth is the owner-set effort).
+        assert!(cc.contains(&"think".to_string()));
+        assert!(!cx.contains(&"think".to_string()));
+        // Every other control command is offered to both harnesses.
+        for cmd in ["clear", "new", "stop", "model", "status", "cwd", "help"] {
+            assert!(cc.contains(&cmd.to_string()), "claude-code missing /{cmd}");
+            assert!(cx.contains(&cmd.to_string()), "codex missing /{cmd}");
+        }
     }
 
     /// Build an AllowList directly (bypassing the env var) so the `allows` logic

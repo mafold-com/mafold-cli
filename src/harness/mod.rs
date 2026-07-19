@@ -1,6 +1,6 @@
 //! Harness abstraction — the pluggable coding-agent backend a daemon drives.
 //!
-//! Today the only harness is **Claude Code**; planned: `opencode`, `codex`,
+//! Implemented harnesses: **Claude Code** and **Codex**; planned: `opencode`,
 //! `openclaw`. Each harness knows how to invoke its CLI headlessly and normalize
 //! that CLI's output into [`AgentEvent`]s. The renderer (`crate::render`) turns
 //! those events into chat text + cards, so card rendering is identical across
@@ -10,6 +10,7 @@
 //! supervisor runs many daemons, one process per bot.
 
 pub mod claude_code;
+pub mod codex;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -164,6 +165,14 @@ pub trait Harness: Send + Sync {
     async fn status_line(&self) -> String {
         String::new()
     }
+
+    /// The harness CLI's own version string (e.g. Claude Code `2.1.198`, Codex
+    /// `0.5.0`), shown on the `/status` Harness line. Empty = unknown / the CLI
+    /// isn't installed. Each harness probes ITS binary — a codex bot must never
+    /// report the `claude` version (and vice-versa).
+    async fn cli_version(&self) -> String {
+        String::new()
+    }
 }
 
 /// Every harness id the CLI knows about (installed or not) — for menus / docs.
@@ -180,7 +189,8 @@ pub const DEFAULT: &str = "claude-code";
 pub fn select(id: &str) -> Arc<dyn Harness> {
     match id.trim().to_lowercase().as_str() {
         "claude-code" | "claude" | "claudecode" | "" => Arc::new(claude_code::ClaudeCode),
-        // opencode / codex / openclaw plug in here as they're implemented.
+        "codex" | "codex-cli" => Arc::new(codex::Codex),
+        // opencode / openclaw plug in here as they're implemented.
         _ => Arc::new(claude_code::ClaudeCode),
     }
 }
@@ -199,8 +209,30 @@ pub fn probe() -> Vec<(&'static str, bool)> {
     BINS.iter().map(|(id, bin)| (*id, on_path(bin))).collect()
 }
 
+/// Is `bin` resolvable on `$PATH`? Windows-aware: also tries each `PATHEXT`
+/// extension (`codex.exe` / `claude.cmd` / …) — checking only the bare name made
+/// `probe()` report every harness unavailable on Windows, so this machine never
+/// showed up as a capable host.
 pub(crate) fn on_path(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|p| p.join(bin).is_file()))
-        .unwrap_or(false)
+    let names = exe_candidates(bin);
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| names.iter().any(|name| dir.join(name).is_file()))
+    })
+}
+
+/// Filenames to look for on `$PATH` for a program. On Unix that's just the bare
+/// name; on Windows the executable is `codex.exe` / `claude.cmd` / …, so we also
+/// try the bare name with each `PATHEXT` extension appended.
+#[cfg(not(windows))]
+fn exe_candidates(bin: &str) -> Vec<String> {
+    vec![bin.to_string()]
+}
+#[cfg(windows)]
+fn exe_candidates(bin: &str) -> Vec<String> {
+    let mut names = vec![bin.to_string()];
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    for ext in pathext.split(';').filter(|e| !e.is_empty()) {
+        names.push(format!("{bin}{}", ext.to_ascii_lowercase()));
+    }
+    names
 }

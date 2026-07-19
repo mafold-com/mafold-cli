@@ -23,7 +23,7 @@ impl Harness for ClaudeCode {
     }
 
     fn available(&self) -> bool {
-        on_path("claude")
+        super::on_path("claude")
     }
 
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
@@ -304,6 +304,10 @@ impl Harness for ClaudeCode {
     async fn status_line(&self) -> String {
         crate::commands::auth_status_line().await
     }
+
+    async fn cli_version(&self) -> String {
+        crate::commands::claude_version().await
+    }
 }
 
 /// A tool_result's `content` can be a string or an array of `{type:text,text}`.
@@ -313,34 +317,4 @@ fn tool_result_text(b: &Value) -> String {
         Value::Array(items) => items.iter().filter_map(|i| i["text"].as_str()).collect::<Vec<_>>().join("\n"),
         _ => String::new(),
     }
-}
-
-/// Is `bin` resolvable on `$PATH`? (cheap availability check, no spawn)
-fn on_path(bin: &str) -> bool {
-    let names = exe_candidates(bin);
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| {
-            names.iter().any(|name| {
-                let p = dir.join(name);
-                p.is_file() || std::fs::metadata(&p).map(|m| m.is_file()).unwrap_or(false)
-            })
-        })
-    })
-}
-
-/// Filenames to look for on `$PATH` for a program. On Unix that's just the bare
-/// name; on Windows the executable is `claude.exe` / `claude.cmd` / …, so we also
-/// try the bare name with each `PATHEXT` extension appended.
-#[cfg(not(windows))]
-fn exe_candidates(bin: &str) -> Vec<String> {
-    vec![bin.to_string()]
-}
-#[cfg(windows)]
-fn exe_candidates(bin: &str) -> Vec<String> {
-    let mut names = vec![bin.to_string()];
-    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
-    for ext in pathext.split(';').filter(|e| !e.is_empty()) {
-        names.push(format!("{bin}{}", ext.to_ascii_lowercase()));
-    }
-    names
 }
