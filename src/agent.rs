@@ -2630,14 +2630,18 @@ async fn handle(
     Ok(())
 }
 
-/// Scan `~/.mafold/bgtasks` for this conversation's detached-task pid files
-/// (written by `mafold bash-hook`, keyed by the sanitized conversation id).
-/// Returns (live count, finished tasks' log paths); a dead task's `.pid` file
-/// is consumed here (its `.log`/`.sh` stay for the wrap-up turn to read).
+/// NON-DESTRUCTIVE scan of `~/.mafold/bgtasks` for this conversation's
+/// detached-task pid files (written by `mafold bash-hook`, keyed by the
+/// sanitized conversation id). Returns (live count, finished tasks as
+/// (pid_path, log_path)). Nothing is removed except a corrupt/unparseable pid
+/// file — the wrap-up reply must be DELIVERED first (`bgtasks_cleanup`), so a
+/// blip on the link to the api leaves the registration on disk for the next
+/// daemon restart's re-arm to retry. (Deleting on scan — before delivery — was
+/// the silent-loss bug: a failed wrap-up dropped the promise with no recovery.)
 #[cfg(unix)]
-fn bgtasks_scan(tag: &str) -> (usize, Vec<String>) {
+fn bgtasks_scan(tag: &str) -> (usize, Vec<(PathBuf, String)>) {
     let mut live = 0usize;
-    let mut finished: Vec<String> = vec![];
+    let mut finished: Vec<(PathBuf, String)> = vec![];
     let Ok(home) = std::env::var("HOME") else { return (0, finished) };
     let dir = PathBuf::from(home).join(".mafold").join("bgtasks");
     let prefix = format!("{tag}.");
@@ -2650,17 +2654,29 @@ fn bgtasks_scan(tag: &str) -> (usize, Vec<String>) {
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())
         else {
-            let _ = std::fs::remove_file(e.path());
+            let _ = std::fs::remove_file(e.path()); // corrupt → unrecoverable
             continue;
         };
         if crate::platform::pid_alive(pid) {
             live += 1;
         } else {
-            let _ = std::fs::remove_file(e.path());
-            finished.push(e.path().with_extension("log").to_string_lossy().into_owned());
+            let log = e.path().with_extension("log").to_string_lossy().into_owned();
+            finished.push((e.path(), log));
         }
     }
     (live, finished)
+}
+
+/// Remove delivered tasks' registry files (`.pid` + sibling `.log`/`.sh`).
+/// Called ONLY after the wrap-up reply is confirmed sent, so an undelivered
+/// promise stays on disk for the next restart's re-arm.
+#[cfg(unix)]
+fn bgtasks_cleanup(pid_paths: &[PathBuf]) {
+    for p in pid_paths {
+        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(p.with_extension("log"));
+        let _ = std::fs::remove_file(p.with_extension("sh"));
+    }
 }
 
 /// Watch this turn's surviving background tasks and, once they have ALL exited,
@@ -2711,65 +2727,75 @@ fn arm_bg_wakeup(
         .collect();
     println!("⏳ {shells} background task(s) outlive the turn in chat {chat_id} — wakeup armed");
     tokio::spawn(async move {
+        // Wait until EVERY detached task for this chat has exited (10s cadence,
+        // 2h cap). The scan is non-destructive now, so `finished` is collected
+        // from the final all-quiet scan (not accumulated as we go).
+        let mut finished: Vec<(PathBuf, String)> = vec![];
         let mut quiet = false;
-        let mut logs: Vec<String> = vec![];
         for i in 0..720 {
-            // 10s cadence, 2h cap
             tokio::time::sleep(Duration::from_secs(10)).await;
             let (live, done) = bgtasks_scan(&tag);
-            logs.extend(done);
             if live == 0 {
-                if logs.is_empty() && i == 0 {
+                if done.is_empty() && i == 0 {
                     // The turn claimed background shells but nothing registered
                     // — the bash-hook didn't run (older claude?). Stand down.
                     println!("⚠ no detached-task registrations for chat {chat_id} — wakeup skipped");
                     armed().lock().unwrap().remove(&key);
                     return;
                 }
+                finished = done;
                 quiet = true;
                 break;
             }
         }
-        armed().lock().unwrap().remove(&key);
         if !quiet {
+            armed().lock().unwrap().remove(&key);
             println!("⏳ background tasks in chat {chat_id} still running after 2h — wakeup abandoned");
             return;
         }
         println!("✓ background tasks finished — waking chat {chat_id} for the wrap-up reply");
-        let logs_note = if logs.is_empty() {
+        let logs_note = if finished.is_empty() {
             String::new()
         } else {
-            format!(" Their output logs:\n{}\n", logs.join("\n"))
+            let logs = finished.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
+            format!(" Their output logs:\n{logs}\n")
         };
         let prompt = format!(
             "(the background task(s) you started earlier have finished.{logs_note} Read \
              their output now and report the outcome to the user, who was promised the \
              results would appear in this reply.)"
         );
-        let prompt = prompt.as_str();
-        if let Err(e) = handle(
-            &client,
-            &workdir,
-            workdir_ns,
-            &chat_id,
-            thread_root.as_deref(),
-            channel_id.as_deref(),
-            prompt,
-            &[],
-            &sessions,
-            &coord,
-            &chat_states,
-            &harness,
-            model,
-            effort,
-            thinking,
-            system,
-            &turn_sender,
-            None,
-        )
-        .await
-        {
-            eprintln!("bg wakeup turn failed for chat {chat_id}: {e}");
+
+        // Deliver-then-delete WITH RETRY. The promise is fire-once with no user
+        // to re-trigger it, and this daemon's link to the api can blip mid-turn
+        // (WS/TLS reset). Retry a few times with backoff; only on a delivered
+        // reply do we remove the registry files. A persistent failure leaves
+        // them on disk so the next daemon restart's re-arm retries — the promise
+        // survives an outage instead of silently dying.
+        let pid_paths: Vec<PathBuf> = finished.iter().map(|(p, _)| p.clone()).collect();
+        let mut delivered = false;
+        for attempt in 0..3u32 {
+            match handle(
+                &client, &workdir, workdir_ns, &chat_id,
+                thread_root.as_deref(), channel_id.as_deref(), &prompt, &[],
+                &sessions, &coord, &chat_states, &harness,
+                model.clone(), effort.clone(), thinking, system.clone(),
+                &turn_sender, None,
+            )
+            .await
+            {
+                Ok(()) => { delivered = true; break; }
+                Err(e) => {
+                    eprintln!("bg wakeup turn failed for chat {chat_id} (attempt {}/3): {e}", attempt + 1);
+                    tokio::time::sleep(Duration::from_secs(30 * (attempt as u64 + 1))).await;
+                }
+            }
+        }
+        armed().lock().unwrap().remove(&key);
+        if delivered {
+            bgtasks_cleanup(&pid_paths);
+        } else {
+            println!("⏳ wrap-up for chat {chat_id} undelivered after 3 tries — kept for restart re-arm");
         }
     });
 }
