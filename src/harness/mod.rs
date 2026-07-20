@@ -1,8 +1,8 @@
 //! Harness abstraction — the pluggable coding-agent backend a daemon drives.
 //!
-//! Implemented harnesses: **Claude Code** and **Codex**; planned: `opencode`,
-//! `openclaw`. Each harness knows how to invoke its CLI headlessly and normalize
-//! that CLI's output into [`AgentEvent`]s. The renderer (`crate::render`) turns
+//! Implemented harnesses: **Claude Code**, **Codex**, and **Kimi Code**; planned:
+//! `opencode`, `openclaw`. Each harness knows how to invoke its CLI headlessly and
+//! normalize that CLI's output into [`AgentEvent`]s. The renderer (`crate::render`) turns
 //! those events into chat text + cards, so card rendering is identical across
 //! harnesses — a new harness only has to emit the common event stream.
 //!
@@ -11,6 +11,7 @@
 
 pub mod claude_code;
 pub mod codex;
+pub mod kimi_code;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -178,7 +179,7 @@ pub trait Harness: Send + Sync {
 /// Every harness id the CLI knows about (installed or not) — for menus / docs.
 /// (Used by the supervisor to list/validate harnesses — Phase 2.)
 #[allow(dead_code)]
-pub const KNOWN: &[&str] = &["claude-code", "opencode", "codex", "openclaw"];
+pub const KNOWN: &[&str] = &["claude-code", "opencode", "codex", "openclaw", "kimi-code"];
 
 /// The default when a bot doesn't specify one.
 #[allow(dead_code)]
@@ -190,6 +191,7 @@ pub fn select(id: &str) -> Arc<dyn Harness> {
     match id.trim().to_lowercase().as_str() {
         "claude-code" | "claude" | "claudecode" | "" => Arc::new(claude_code::ClaudeCode),
         "codex" | "codex-cli" => Arc::new(codex::Codex),
+        "kimi-code" | "kimi" | "kimi-cli" | "kimicode" => Arc::new(kimi_code::KimiCode),
         // opencode / openclaw plug in here as they're implemented.
         _ => Arc::new(claude_code::ClaudeCode),
     }
@@ -205,6 +207,7 @@ pub fn probe() -> Vec<(&'static str, bool)> {
         ("opencode", "opencode"),
         ("codex", "codex"),
         ("openclaw", "openclaw"),
+        ("kimi-code", "kimi"),
     ];
     BINS.iter().map(|(id, bin)| (*id, on_path(bin))).collect()
 }

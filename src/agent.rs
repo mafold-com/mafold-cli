@@ -1156,6 +1156,12 @@ fn is_our_stock_seed(schema: &[serde_json::Value]) -> bool {
                 || schema[0]["options"].as_array().is_some_and(|o| {
                     o.iter().any(|x| x["value"].as_str().is_some_and(|v| v.starts_with("gpt-")))
                 })))
+        // …or Kimi Code stock: same key shape as claude-code, but a `kimi-code/*`
+        // model menu (so a claude-fallback mis-seed is still eligible for re-seed).
+        || (keys == ["model", "system_prompt", "thinking", "cwd"]
+            && schema[0]["options"].as_array().is_some_and(|o| {
+                o.iter().any(|x| x["value"].as_str().is_some_and(|v| v.starts_with("kimi-code/")))
+            }))
 }
 
 /// The Customization fields a harness's daemon actually consumes. Field kinds are
@@ -1193,6 +1199,29 @@ fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
                   "placeholder": "~/project — per-chat here = that chat only; All chats = the default" }
             ]),
             "model / effort / system prompt / cwd",
+        ),
+        // Kimi Code: a model menu of the ids the installed `kimi` CLI ships (the
+        // k3 / K2.7 line), so every option is one the binary accepts; `/model
+        // <name>` still takes anything newer. Thinking is a boolean toggle (Kimi
+        // has no reasoning-effort tiers and no token budget): any number here = on,
+        // 0 = off, empty = the agent's own default.
+        "kimi-code" | "kimi" => (
+            serde_json::json!([
+                { "key": "model", "label": "Model", "kind": "select", "default": "",
+                  "options": [
+                    { "label": "Agent default",           "value": "" },
+                    { "label": "K3 (1M context)",         "value": "kimi-code/k3" },
+                    { "label": "K2.7 Coding",             "value": "kimi-code/kimi-for-coding" },
+                    { "label": "K2.7 Coding · Highspeed", "value": "kimi-code/kimi-for-coding-highspeed" }
+                  ] },
+                { "key": "system_prompt", "label": "System prompt", "kind": "string",
+                  "placeholder": "Extra instructions appended for every reply" },
+                { "key": "thinking", "label": "Thinking (0 = off, any number = on)", "kind": "number",
+                  "placeholder": "on" },
+                { "key": "cwd", "label": "Working directory", "kind": "string",
+                  "placeholder": "~/project — per-chat here = that chat only; All chats = the default" }
+            ]),
+            "model / system prompt / thinking / cwd",
         ),
         _ => (
             serde_json::json!([
