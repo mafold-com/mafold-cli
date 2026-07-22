@@ -2606,6 +2606,64 @@ async fn handle(
         }
     }
 
+    // Stale-resume recovery: a RESUMED turn that ends in an error is the
+    // signature of a corrupt/expired Claude Code session — it fails IDENTICALLY
+    // on every resume, so `error_during_execution` (surfaced as Ok+error, which
+    // otherwise re-persists the same session below) would leave the bot broken
+    // on every future message until the session is cleared by hand. Drop the
+    // stale session NOW and retry ONCE on a FRESH one so THIS message is still
+    // answered; the fresh session then replaces the bad one. Skip when we didn't
+    // resume (nothing to blame), when the user stopped it, or when nothing was
+    // produced (that's the empty-turn path above, retried on the same session).
+    let resumed_errored = prior.is_some()
+        && matches!(&result, Ok(o) if o.error.is_some() && !o.stopped && !o.produced);
+    if resumed_errored {
+        let why = result.as_ref().ok().and_then(|o| o.error.clone()).unwrap_or_default();
+        println!("↻ resumed session errored ({why}) — dropping it + retrying once on a FRESH session");
+        {
+            let mut s = sessions.lock().await;
+            if s.remove(&skey).is_some() { save_sessions(&s); }
+        }
+        let (ev_tx3, ev_rx3) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        {
+            let mut states = chat_states.lock().await;
+            let st = states.entry(chat_id.to_string()).or_default();
+            st.turns.insert(
+                msg_id.clone(),
+                TurnHandle {
+                    cancel: cancel.clone(),
+                    ask_file: None,
+                    owner: turn_sender.to_string(),
+                    events: ev_tx3.clone(),
+                },
+            );
+        }
+        let renderer3 = {
+            let client = client.clone();
+            let msg_id = msg_id.clone();
+            let chat_states = chat_states.clone();
+            let chat_id = chat_id.to_string();
+            let ask_file = ask_file.clone();
+            let bg_shells = bg_shells.clone();
+            tokio::spawn(render_loop(ev_rx3, client, msg_id, chat_states, chat_id, ask_file, bg_shells))
+        };
+        let fresh = Turn {
+            prompt: full_prompt.clone(),
+            conv: chat_id.to_string(),
+            workdir: workdir.to_string(),
+            session: None, // ← FRESH: no --resume, so the corrupt session can't poison it
+            model: model.clone(),
+            effort: effort.clone(),
+            thinking,
+            cancel: cancel.clone(),
+            system: system.clone(),
+            ask_file: Some(ask_file.clone()),
+        };
+        result = harness.run(fresh, ev_tx3).await;
+        if let Some(st) = chat_states.lock().await.get_mut(chat_id) { st.turns.remove(&msg_id); }
+        let _ = renderer3.await;
+    }
+
     // Completion-wakeup eligibility: only a CLEAN end (not /stop, not an error
     // path) with background shells left running arms the monitor below.
     let clean_end = matches!(&result, Ok(o) if !o.stopped && o.error.is_none());
@@ -2626,10 +2684,17 @@ async fn handle(
             } else if !o.produced {
                 let _ = client.append_delta(&msg_id, "_(the agent produced no output)_").await;
             }
-            // Persist the (possibly new) session so the next message resumes it.
-            if let Some(sid) = o.session {
+            // Persist the new session on a clean turn. But if the turn ERRORED on
+            // a session we RESUMED, DROP it instead of re-arming it — a corrupt/
+            // expired session fails identically on every resume, so persisting it
+            // is what leaves the bot stuck (the bug this fixes). Next message then
+            // starts fresh. (A fresh-session error keeps its sid: nothing to blame.)
+            if o.error.is_some() && prior.is_some() {
                 let mut s = sessions.lock().await;
-                if s.get(chat_id).map(String::as_str) != Some(sid.as_str()) {
+                if s.remove(&skey).is_some() { save_sessions(&s); }
+            } else if let Some(sid) = o.session {
+                let mut s = sessions.lock().await;
+                if s.get(&skey).map(String::as_str) != Some(sid.as_str()) {
                     s.insert(skey.clone(), sid);
                     save_sessions(&s);
                 }
