@@ -206,7 +206,7 @@ pub async fn run(cmd: RoomCmd, base: String, token: Option<String>) -> Result<()
         }
         RoomCmd::Set { app, key, value, conv } => {
             let schema = room_schema(&client, &conv, &app).await?;
-            let mode = schema.get(&key).map(String::as_str).unwrap_or("read");
+            let mode = schema_mode(&schema, &key);
             if mode != "write" {
                 let cols: Vec<String> = schema.iter().map(|(k, m)| format!("{k}:{m}")).collect();
                 anyhow::bail!(
@@ -258,6 +258,83 @@ async fn room_schema(client: &Client, conv: &str, app: &str) -> Result<std::coll
         .ok_or_else(|| anyhow::anyhow!("app `{app}` isn't installed here, or declares no room"))
 }
 
+/// The declared mode for `key`. An EXACT schema entry wins; otherwise a
+/// `prefix:*` wildcard entry matches (so `issue:*` covers `issue:abc`, and a
+/// bare `*` covers everything). Default `read` when nothing matches — apps that
+/// use per-entity keys (e.g. `issue:<id>`) can't enumerate ids up front, so the
+/// wildcard is how they mark a whole family editable.
+fn schema_mode<'a>(schema: &'a std::collections::BTreeMap<String, String>, key: &str) -> &'a str {
+    if let Some(m) = schema.get(key) {
+        return m.as_str();
+    }
+    for (k, m) in schema {
+        if let Some(prefix) = k.strip_suffix('*') {
+            if key.starts_with(prefix) {
+                return m.as_str();
+            }
+        }
+    }
+    "read"
+}
+
+/// A compact per-turn context block: the apps installed in THIS conversation
+/// and, for each that declares one, its room + editable schema. Injected into
+/// the bot's prompt so it knows what it can operate via `mafold room`. GENERIC —
+/// it reflects whatever is installed and whatever each app declares, with zero
+/// per-app knowledge. `None` when nothing is installed (no prompt overhead).
+pub async fn context_block(client: &Client, conv: &str) -> Result<Option<String>> {
+    let resp = client.list_installs(conv).await?;
+    let items = match resp.get("items").and_then(|i| i.as_array()) {
+        Some(a) if !a.is_empty() => a,
+        _ => return Ok(None),
+    };
+    let mut apps: Vec<String> = Vec::new();
+    let mut rooms: Vec<String> = Vec::new();
+    for it in items {
+        let id = it.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if id.is_empty() {
+            continue;
+        }
+        let manifest = it.get("manifest");
+        let name = manifest.and_then(|m| m.get("name")).and_then(|v| v.as_str()).unwrap_or(id);
+        apps.push(format!("• {name} ({id})"));
+        if let Some(room) = manifest.and_then(|m| m.get("room")).and_then(|r| r.as_object()) {
+            let cols: Vec<String> = room
+                .iter()
+                .map(|(k, v)| format!("{k}:{}", v.as_str().unwrap_or("read")))
+                .collect();
+            rooms.push(format!("• {id}   {{ {} }}", cols.join(", ")));
+        }
+    }
+    if apps.is_empty() {
+        return Ok(None);
+    }
+    let mut s = String::from(
+        "[AVAILABLE APPS & ROOMS — mini-apps installed in THIS conversation. Their shared \
+state lives in a co-edited room you can read/write with the `mafold room` CLI (the \
+conversation is preset via MAFOLD_CONV). Reach for it when the user asks to view or \
+change one of these apps' data.]\nApps:\n",
+    );
+    for a in &apps {
+        s.push_str(a);
+        s.push('\n');
+    }
+    if rooms.is_empty() {
+        s.push_str("Rooms: (none of these apps declares a co-editable room)\n");
+    } else {
+        s.push_str(
+            "Rooms — `id { variable:mode }`; only `write` variables are editable, and a `key:*` \
+entry matches any key with that prefix (e.g. `issue:*` covers `issue:abc`):\n",
+        );
+        for r in &rooms {
+            s.push_str(r);
+            s.push('\n');
+        }
+    }
+    s.push_str("[END AVAILABLE APPS & ROOMS]");
+    Ok(Some(s))
+}
+
 async fn resolve_app(client: &Client, conv: &str, app: Option<String>) -> Result<String> {
     if let Some(a) = app {
         return Ok(a);
@@ -305,6 +382,9 @@ Prints each installed app's room + its variable schema, e.g.
 `acme/todo   { todolist:write, archived:read }`.
 - `write` — you (and participants) may change this variable.
 - `read`  — only the app itself writes it; you can read but NOT change it.
+- A key ending in `*` is a wildcard: `issue:*:write` means every `issue:<id>`
+  key (e.g. `issue:abc`) is writable. Apps with many items use this so each
+  item is its own key — edit ONE item without rewriting the others.
 
 ## 2. Read current state
 ```

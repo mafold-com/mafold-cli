@@ -2211,6 +2211,23 @@ going on their own. If the user mentions \"the other session\" or work happening
 assume it crashed, stalled, or was interrupted just because you can't see it from here — it is \
 almost certainly still running. Never claim a session or task is dead without direct evidence.",
     );
+    // Generic room mechanism (NOT any specific app). A conversation may have
+    // mini-apps installed whose shared state lives in a co-edited CRDT "room";
+    // the bot is a peer that can read and write it. Which apps/rooms exist is
+    // injected per-turn into the prompt (dynamic), so this only teaches the tool.
+    s.push_str(
+        "\n\nAPP ROOMS: a conversation can have mini-apps installed (a board, a todo list, a \
+counter…). Each keeps shared state in a co-edited **room** — variables that the app AND \
+everyone here, including you, edit together. You touch a room with the `mafold room` CLI \
+(the current conversation is preset in MAFOLD_CONV, so never pass it):\n\
+  • `mafold room list` — the installed apps' rooms + each variable's read/write mode\n\
+  • `mafold room get <app>` — an app's room state as JSON\n\
+  • `mafold room set <app> <key> <json>` — change a `write` variable (read-only keys are refused)\n\
+Only variables the schema marks `write` are editable; a `key:*` schema entry is a wildcard \
+(e.g. `issue:*` ⇒ any `issue:<id>` key). To edit an item: `get` it, change the JSON, `set` it \
+back. When the user asks to view or change an installed app's data, use this — a per-turn \
+block below lists exactly which apps + rooms are available right now.",
+    );
     s
 }
 
@@ -2369,6 +2386,14 @@ async fn handle(
         Some(ctx) => format!("{ctx}\n\n{prompt}"),
         None => prompt.to_string(),
     };
+    // Available apps + rooms in THIS conversation (dynamic, per-turn) so the bot
+    // knows what it can operate via `mafold room` — generic, reflects whatever
+    // is installed, zero per-app hardcoding. One list_installs call; None (and
+    // no injection) when nothing is installed. Best-effort: a fetch error never
+    // blocks the turn.
+    if let Ok(Some(block)) = crate::room::context_block(client, chat_id).await {
+        full_prompt = format!("{block}\n\n{full_prompt}");
+    }
     // Photos → downloaded so the agent can Read them. Forwarded chat records
     // (WeChat 合并转发, kind `chat_record`) → flattened into transcript text
     // injected below, with any inline photos downloaded too. Collect photo URLs

@@ -74,6 +74,11 @@ pub enum AppsCmd {
         /// Capabilities, comma-separated (e.g. `room,chat.send,storage`).
         #[arg(long, value_delimiter = ',')]
         capabilities: Vec<String>,
+        /// Room schema as a JSON object `{"<key>":"read"|"write"}` (a `key:*`
+        /// wildcard is allowed, e.g. `{"issue:*":"write"}`). Declares which room
+        /// variables participants — including the bot via `mafold room` — edit.
+        #[arg(long)]
+        room_schema: Option<String>,
     },
     /// List the apps you can manage (own the namespace of).
     List,
@@ -126,8 +131,8 @@ pub async fn run(cmd: AppsCmd, base: String, token: Option<String>) -> Result<()
         AppsCmd::Init { id, dir, rn } => cmd_init(&id, &dir, rn),
         AppsCmd::Dev { dir, port } => cmd_dev(&dir, port).await,
         AppsCmd::Publish { dir } => cmd_publish(&dir, base, token).await,
-        AppsCmd::Register { id, url, name, icon, capabilities } => {
-            cmd_register(&id, &url, name, icon, capabilities, base, token).await
+        AppsCmd::Register { id, url, name, icon, capabilities, room_schema } => {
+            cmd_register(&id, &url, name, icon, capabilities, room_schema, base, token).await
         }
         AppsCmd::List => cmd_list(base, token).await,
         AppsCmd::Remove { id } => cmd_remove(&id, base, token).await,
@@ -385,18 +390,32 @@ async fn cmd_register(
     name: Option<String>,
     icon: Option<String>,
     capabilities: Vec<String>,
+    room_schema: Option<String>,
     base: String,
     token: Option<String>,
 ) -> Result<()> {
     let token =
         token.context("register needs your token — pass --token or set $MAFOLD_BOT_TOKEN")?;
+    // Parse --room-schema into a JSON object once, so a typo fails fast instead
+    // of registering an app with no room.
+    let room = match room_schema {
+        Some(s) => {
+            let v: Value = serde_json::from_str(&s)
+                .with_context(|| format!("--room-schema must be a JSON object (got `{s}`)"))?;
+            match v {
+                Value::Object(m) => Some(m),
+                _ => anyhow::bail!("--room-schema must be a JSON object, e.g. '{{\"issue:*\":\"write\"}}'"),
+            }
+        }
+        None => None,
+    };
     let client = Client::new(base, token);
     let r = client
         .call(
             "registerWebApp",
             serde_json::json!({
                 "id": id, "url": url, "name": name, "icon": icon,
-                "capabilities": capabilities,
+                "capabilities": capabilities, "room": room,
             }),
         )
         .await?;
