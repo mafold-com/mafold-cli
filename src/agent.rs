@@ -1306,6 +1306,11 @@ async fn connect_and_run(
     // into the mafold preamble each turn.
     let card_tags = available_card_tags(client).await;
 
+    // Per-(conversation, requester) dedup for the {% gate %} access-request card,
+    // so a non-whitelisted user @-mentioning me repeatedly gets ONE card, not a
+    // flood. Per-connection (resets on reconnect — at most one extra card then).
+    let mut gate_carded: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+
     while let Some(frame) = read.next().await {
         let frame = match frame { Ok(f) => f, Err(e) => { eprintln!("ws error: {e}"); break; } };
         let text = match frame.into_text() { Ok(t) => t, Err(_) => continue };
@@ -1458,7 +1463,34 @@ async fn connect_and_run(
         // run a control command. Enforced BEFORE every fast-path below and before
         // the group @-mention gate. Owner / allow-listed only; bots never implicitly.
         if !allow.read().await.allows(&m.sender.username, sender_is_bot) {
-            println!("← @{} (not authorized → ignored)", m.sender.username);
+            // Non-whitelisted sender. If a HUMAN @-mentioned me (directed at me,
+            // not just chatting) and isn't blacklisted, post an owner-gated
+            // {% gate %} card ONCE per (conversation, user) instead of silently
+            // dropping — the owner taps 放行 (whitelists them + I auto-answer
+            // this message, via the server re-delivering it) or 忽略. The card +
+            // its actions are enforced server-side (owner-only); we only propose.
+            let is_blocked = allow.read().await.blocked.contains(&sender_lc);
+            if !sender_is_bot
+                && !is_blocked
+                && mentions_me(&m.content, my_username)
+                && gate_carded.insert((m.conversation_id.clone(), sender_lc.clone()))
+            {
+                let content = format!("{{% gate user=\"{}\" msg=\"{}\" /%}}", m.sender.username, m.id);
+                let _ = client
+                    .call(
+                        "sendMessage",
+                        serde_json::json!({
+                            "conversation_id": m.conversation_id,
+                            "content": content,
+                            "reply_to_id": m.id,
+                            "channel_id": m.channel_id,
+                        }),
+                    )
+                    .await;
+                println!("← @{} (not authorized → posted access-request card for owner)", m.sender.username);
+            } else {
+                println!("← @{} (not authorized → ignored)", m.sender.username);
+            }
             continue;
         }
 
