@@ -2684,7 +2684,8 @@ async fn handle(
             let chat_id = chat_id.to_string();
             let ask_file = ask_file.clone();
             let bg_shells = bg_shells.clone();
-            tokio::spawn(render_loop(ev_rx3, client, msg_id, chat_states, chat_id, ask_file, bg_shells))
+            let final_md = final_md.clone();
+            tokio::spawn(render_loop(ev_rx3, client, msg_id, chat_states, chat_id, ask_file, bg_shells, final_md))
         };
         let fresh = Turn {
             prompt: full_prompt.clone(),
