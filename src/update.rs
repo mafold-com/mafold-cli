@@ -17,7 +17,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-const REPO: &str = "mafold-com/mafold-cli";
+const REPO: &str = "mafold-lab/mafold-cli";
 
 pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")

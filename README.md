@@ -16,7 +16,7 @@ Auth is a **bot token** (`mb_…`) — create a bot in the Mafold app — via
 
 ```sh
 cd ~/your-project   # the folder the agent should work in
-bash <(curl -fsSL https://raw.githubusercontent.com/mafold-com/mafold-cli/main/install.sh) \
+bash <(curl -fsSL https://raw.githubusercontent.com/mafold-lab/mafold-cli/main/install.sh) \
   agent --detach --token mb_xxxx
 ```
 

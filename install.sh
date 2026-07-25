@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Install + run mafold (Mafold terminal client + Claude Code agent).
 #   cd ~/your-project
-#   bash <(curl -fsSL https://raw.githubusercontent.com/mafold-com/mafold-cli/main/install.sh) \
+#   bash <(curl -fsSL https://raw.githubusercontent.com/mafold-lab/mafold-cli/main/install.sh) \
 #     agent --detach --token mb_xxxx
 # Any args after the script are forwarded to mafold (working dir = where you run this).
 set -euo pipefail
-REPO="mafold-com/mafold-cli"
+REPO="mafold-lab/mafold-cli"
 
 os="$(uname -s)"; arch="$(uname -m)"
 case "$os-$arch" in
