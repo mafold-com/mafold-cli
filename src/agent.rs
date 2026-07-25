@@ -894,6 +894,8 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
                 None,
                 stopper.clone(),
                 n,
+                // The card-carrying reply predates this process — wake-up only.
+                None,
             );
         }
     }
@@ -2555,6 +2557,9 @@ async fn handle(
     // Background shells started this turn (either attempt) — read after the
     // turn to arm the completion-wakeup monitor.
     let bg_shells = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // The reply's final markdoc (set at Done) — the monitor live-edits its
+    // `{% bgtasks %}` card in place while detached tasks keep running.
+    let final_md = Arc::new(std::sync::Mutex::new(String::new()));
     let renderer = {
         let client = client.clone();
         let msg_id = msg_id.clone();
@@ -2562,7 +2567,8 @@ async fn handle(
         let chat_id = chat_id.to_string();
         let ask_file = ask_file.clone();
         let bg_shells = bg_shells.clone();
-        tokio::spawn(render_loop(ev_rx, client, msg_id, chat_states, chat_id, ask_file, bg_shells))
+        let final_md = final_md.clone();
+        tokio::spawn(render_loop(ev_rx, client, msg_id, chat_states, chat_id, ask_file, bg_shells, final_md))
     };
 
     let mut result = harness.run(turn, ev_tx).await;
@@ -2609,7 +2615,8 @@ async fn handle(
                 let chat_id = chat_id.to_string();
                 let ask_file = ask_file.clone();
                 let bg_shells = bg_shells.clone();
-                tokio::spawn(render_loop(ev_rx2, client, msg_id, chat_states, chat_id, ask_file, bg_shells))
+                let final_md = final_md.clone();
+                tokio::spawn(render_loop(ev_rx2, client, msg_id, chat_states, chat_id, ask_file, bg_shells, final_md))
             };
             let retry = Turn {
                 // Re-carry the user's message VERBATIM: the first attempt's
@@ -2699,6 +2706,9 @@ async fn handle(
     // Completion-wakeup eligibility: only a CLEAN end (not /stop, not an error
     // path) with background shells left running arms the monitor below.
     let clean_end = matches!(&result, Ok(o) if !o.stopped && o.error.is_none());
+    // A post-renderer append makes the stored final markdoc stale — a live card
+    // edit would drop that trailing text, so such turns arm without live edits.
+    let mut post_appended = false;
     match result {
         Ok(o) => {
             // Paragraph separator ONLY after actual transcript content — on a
@@ -2715,6 +2725,7 @@ async fn handle(
                 let _ = client.append_delta(&msg_id, &format!("{sep}⚠️ Agent stopped: {err}")).await;
             } else if !o.produced {
                 let _ = client.append_delta(&msg_id, "_(the agent produced no output)_").await;
+                post_appended = true;
             }
             // Persist the new session on a clean turn. But if the turn ERRORED on
             // a session we RESUMED, DROP it instead of re-arming it — a corrupt/
@@ -2756,6 +2767,10 @@ async fn handle(
     if clean_end {
         let shells = bg_shells.load(std::sync::atomic::Ordering::Relaxed);
         if shells > 0 {
+            // The reply that carries the `{% bgtasks %}` card, for live edits.
+            let snapshot = final_md.lock().unwrap().clone();
+            let live_msg = (!post_appended && snapshot.contains("{% bgtasks"))
+                .then(|| (msg_id.clone(), snapshot));
             arm_bg_wakeup(
                 client.clone(),
                 workdir.to_string(),
@@ -2773,11 +2788,12 @@ async fn handle(
                 system,
                 turn_sender.to_string(),
                 shells,
+                live_msg,
             );
         }
     }
     #[cfg(not(unix))]
-    let _ = clean_end;
+    let _ = (clean_end, post_appended);
     Ok(())
 }
 
@@ -2830,6 +2846,180 @@ fn bgtasks_cleanup(pid_paths: &[PathBuf]) {
     }
 }
 
+/// The `~/.mafold/bgtasks` registry key for a conversation — MUST mirror
+/// `bash_hook`'s sanitization of `MAFOLD_CONV` (uuids pass through unchanged).
+fn conv_tag(chat_id: &str) -> String {
+    chat_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .collect()
+}
+
+/// One detached task's registry entry, snapshotted for the `{% bgtasks %}` card:
+/// what command runs, since when, whether it still lives, and its log tail.
+#[cfg(unix)]
+struct BgTask {
+    started_ms: u64,
+    running: bool,
+    cmd: String,
+    tail: Vec<String>,
+}
+
+/// Drop ANSI escape sequences (CSI/OSC) and stray control chars from a log
+/// line — build/test output is full of color codes that would render as
+/// garbage inside the card.
+#[cfg(unix)]
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\u{1b}' {
+            match it.peek() {
+                Some('[') => {
+                    it.next();
+                    for n in it.by_ref() {
+                        if ('@'..='~').contains(&n) { break; }
+                    }
+                }
+                Some(']') => {
+                    it.next();
+                    for n in it.by_ref() {
+                        if n == '\u{7}' || n == '\u{1b}' { break; }
+                    }
+                }
+                _ => {}
+            }
+        } else if !c.is_control() || c == '\t' {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Squash text to ONE display line for the card body (the `t|`/`o|` line
+/// encoding is newline-delimited) and keep markdoc inert (`{%` / `%}`).
+#[cfg(unix)]
+fn card_line(s: &str, max: usize) -> String {
+    // Progress-bar lines rewrite themselves with `\r` — keep the last segment.
+    let s = s.rsplit('\r').next().unwrap_or(s);
+    let one = strip_ansi(s).replace("{%", "{ %").replace("%}", "% }");
+    let one = one.trim_end();
+    if one.chars().count() > max {
+        format!("{}…", one.chars().take(max).collect::<String>())
+    } else {
+        one.to_string()
+    }
+}
+
+/// Snapshot this conversation's detached tasks for display: command from the
+/// registered `.sh`, start time from the filename's nanosecond stamp, liveness
+/// from the pid probe, and the last few lines of the `.log`. Oldest first,
+/// capped at 8 (matches the card's own cap). Non-destructive.
+#[cfg(unix)]
+fn bgtasks_snapshot(tag: &str) -> Vec<BgTask> {
+    const MAX_TASKS: usize = 8;
+    const MAX_TAIL: usize = 6;
+    let Ok(home) = std::env::var("HOME") else { return vec![] };
+    let dir = PathBuf::from(home).join(".mafold").join("bgtasks");
+    let prefix = format!("{tag}.");
+    let mut tasks: Vec<BgTask> = vec![];
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(stem) = name.strip_prefix(&prefix).and_then(|s| s.strip_suffix(".pid")) else {
+            continue;
+        };
+        let Some(pid) = std::fs::read_to_string(e.path())
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let started_ms = stem.parse::<u128>().map(|ns| (ns / 1_000_000) as u64).unwrap_or(0);
+        // The registered script is `#!/bin/bash\n<command>\n` — show the command.
+        let cmd = std::fs::read_to_string(e.path().with_extension("sh"))
+            .map(|s| {
+                let joined = s
+                    .lines()
+                    .filter(|l| !l.starts_with("#!") && !l.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ; ");
+                card_line(&joined, 160)
+            })
+            .unwrap_or_default();
+        // Tail of the log: read the last few KB only (logs can be huge).
+        let mut tail: Vec<String> = vec![];
+        if let Ok(mut f) = std::fs::File::open(e.path().with_extension("log")) {
+            use std::io::{Read, Seek, SeekFrom};
+            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+            let back = len.min(4096);
+            let mut buf = Vec::with_capacity(back as usize);
+            if f.seek(SeekFrom::Start(len - back)).is_ok() && f.read_to_end(&mut buf).is_ok() {
+                let text = String::from_utf8_lossy(&buf);
+                let lines: Vec<&str> = text.lines().collect();
+                // Skip the first line when we started mid-line.
+                let start = usize::from(back == 4096 && len > 4096 && lines.len() > 1);
+                tail = lines[start..]
+                    .iter()
+                    .map(|l| card_line(l, 160))
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                if tail.len() > MAX_TAIL {
+                    tail.drain(..tail.len() - MAX_TAIL);
+                }
+            }
+        }
+        tasks.push(BgTask { started_ms, running: crate::platform::pid_alive(pid), cmd, tail });
+    }
+    tasks.sort_by_key(|t| t.started_ms);
+    tasks.truncate(MAX_TASKS);
+    tasks
+}
+
+/// Render a snapshot as the container-form `{% bgtasks %}` card block (no outer
+/// newlines). Body lines: `t|<started_ms>|<running|done>|<command>` followed by
+/// that task's `o|<log line>` tail. Old cards ignore the body and keep showing
+/// the `n=` pill; the new card parses it into the expandable live view.
+#[cfg(unix)]
+fn bgtasks_block(tasks: &[BgTask]) -> String {
+    let live = tasks.iter().filter(|t| t.running).count();
+    let n = if live > 0 { live } else { tasks.len().max(1) };
+    let mut s = format!("{{% bgtasks n={n} %}}\n");
+    for t in tasks {
+        s.push_str(&format!(
+            "t|{}|{}|{}\n",
+            t.started_ms,
+            if t.running { "running" } else { "done" },
+            t.cmd
+        ));
+        for l in &t.tail {
+            s.push_str("o|");
+            s.push_str(l);
+            s.push('\n');
+        }
+    }
+    s.push_str("{% /bgtasks %}");
+    s
+}
+
+/// Replace the `{% bgtasks %}` occurrence in `content` (self-closing or
+/// container form) with `block`. None when the message carries no such card.
+#[cfg(unix)]
+fn splice_bgtasks(content: &str, block: &str) -> Option<String> {
+    let open = content.find("{% bgtasks")?;
+    let open_end = open + content[open..].find("%}")? + 2;
+    let end = if content[open..open_end].ends_with("/%}") {
+        open_end
+    } else {
+        const CLOSE: &str = "{% /bgtasks %}";
+        open_end + content[open_end..].find(CLOSE)? + CLOSE.len()
+    };
+    let mut out = String::with_capacity(content.len() + block.len());
+    out.push_str(&content[..open]);
+    out.push_str(block);
+    out.push_str(&content[end..]);
+    Some(out)
+}
+
 /// Watch this turn's surviving background tasks and, once they have ALL exited,
 /// resume the session for a wrap-up turn that reports their results.
 ///
@@ -2839,6 +3029,14 @@ fn bgtasks_cleanup(pid_paths: &[PathBuf]) {
 /// claimed background shells but nothing got registered (hook missed — e.g. an
 /// older claude that ignores `updatedInput`), the monitor stands down rather
 /// than fire a bogus wrap-up.
+///
+/// `live_msg` = (message id, final markdoc) of the reply that carries this
+/// turn's `{% bgtasks %}` card. While the tasks run, every poll tick refreshes
+/// that card in place (statuses + log tails) via `botEditDraft` — it works on
+/// finalized messages and stamps no "edited" mark — and on completion the card
+/// is stamped done right before the wrap-up turn. None (restart re-arm, or a
+/// turn whose reply got post-finalize error appends) keeps the old static
+/// behavior: wake-up only, no live card.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn arm_bg_wakeup(
@@ -2858,24 +3056,30 @@ fn arm_bg_wakeup(
     system: Option<String>,
     turn_sender: String,
     shells: u64,
+    live_msg: Option<(String, String)>,
 ) {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::{Mutex as StdMutex, OnceLock};
     // One monitor per (conv, channel, workdir): a later turn that starts more
     // shells while one is armed rides the existing monitor's wrap-up. Disarmed
     // BEFORE the wrap-up turn runs, so shells started by the wrap-up itself
     // can arm a fresh monitor.
     static ARMED: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+    // key → the `{% bgtasks %}`-carrying replies this monitor live-edits, as
+    // (msg_id, current content). A riding turn APPENDS its reply here, so every
+    // card for the conversation stays fresh, not just the first one's.
+    static LIVE: OnceLock<StdMutex<HashMap<String, Vec<(String, String)>>>> = OnceLock::new();
     let armed = || ARMED.get_or_init(|| StdMutex::new(HashSet::new()));
+    let live_slot = || LIVE.get_or_init(|| StdMutex::new(HashMap::new()));
     let key = format!("{chat_id}#{}@{workdir}", channel_id.as_deref().unwrap_or(""));
+    if let Some(lm) = live_msg {
+        live_slot().lock().unwrap().entry(key.clone()).or_default().push(lm);
+    }
     if !armed().lock().unwrap().insert(key.clone()) {
-        return;
+        return; // rides the existing monitor (which now edits this reply too)
     }
     // Registry tag — MUST mirror bash_hook's sanitization of MAFOLD_CONV.
-    let tag: String = chat_id
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
-        .collect();
+    let tag = conv_tag(&chat_id);
     println!("⏳ {shells} background task(s) outlive the turn in chat {chat_id} — wakeup armed");
     tokio::spawn(async move {
         // Wait until EVERY detached task for this chat has exited (10s cadence,
@@ -2883,15 +3087,48 @@ fn arm_bg_wakeup(
         // from the final all-quiet scan (not accumulated as we go).
         let mut finished: Vec<(PathBuf, String)> = vec![];
         let mut quiet = false;
+        let mut last_block = String::new();
         for i in 0..720 {
             tokio::time::sleep(Duration::from_secs(10)).await;
             let (live, done) = bgtasks_scan(&tag);
+            // Keep the `{% bgtasks %}` card(s) showing the live动态: rebuild the
+            // block from the registry (statuses, elapsed baselines, log tails)
+            // and splice it into each registered reply — only when it actually
+            // changed. The all-quiet pass runs this too, so the card flips to
+            // its done state before the wrap-up turn starts.
+            let snap = bgtasks_snapshot(&tag);
+            if !snap.is_empty() {
+                let block = bgtasks_block(&snap);
+                if block != last_block {
+                    last_block = block.clone();
+                    // Collect edits under the lock, await them after (std mutex
+                    // guards must not live across an await).
+                    let edits: Vec<(String, String)> = {
+                        let mut slot = live_slot().lock().unwrap();
+                        match slot.get_mut(&key) {
+                            Some(targets) => targets
+                                .iter_mut()
+                                .filter_map(|(mid, content)| {
+                                    let next = splice_bgtasks(content, &block)?;
+                                    *content = next.clone();
+                                    Some((mid.clone(), next))
+                                })
+                                .collect(),
+                            None => vec![],
+                        }
+                    };
+                    for (mid, content) in edits {
+                        let _ = client.edit_draft(&mid, &content).await;
+                    }
+                }
+            }
             if live == 0 {
                 if done.is_empty() && i == 0 {
                     // The turn claimed background shells but nothing registered
                     // — the bash-hook didn't run (older claude?). Stand down.
                     println!("⚠ no detached-task registrations for chat {chat_id} — wakeup skipped");
                     armed().lock().unwrap().remove(&key);
+                    live_slot().lock().unwrap().remove(&key);
                     return;
                 }
                 finished = done;
@@ -2900,7 +3137,10 @@ fn arm_bg_wakeup(
             }
         }
         if !quiet {
+            // Still running after 2h: stop editing (the card truthfully says
+            // "running"), keep the registrations for the restart re-arm.
             armed().lock().unwrap().remove(&key);
+            live_slot().lock().unwrap().remove(&key);
             println!("⏳ background tasks in chat {chat_id} still running after 2h — wakeup abandoned");
             return;
         }
@@ -2943,6 +3183,7 @@ fn arm_bg_wakeup(
             }
         }
         armed().lock().unwrap().remove(&key);
+        live_slot().lock().unwrap().remove(&key);
         if delivered {
             bgtasks_cleanup(&pid_paths);
         } else {
@@ -2971,6 +3212,9 @@ async fn render_loop(
     // after the renderer exits to decide whether to arm the completion-wakeup
     // monitor (the `{% bgtasks %}` promise).
     bg_shells: Arc<std::sync::atomic::AtomicU64>,
+    // Out-param: the reply's final markdoc — the completion-wakeup monitor
+    // splices live `{% bgtasks %}` refreshes into it after finalize.
+    final_md: Arc<std::sync::Mutex<String>>,
 ) {
     // Telegram `sendMessageDraft` model: keep the running FULL markdoc content
     // locally and push the whole snapshot (throttled ~300ms) via editDraft, with
@@ -3110,9 +3354,23 @@ async fn render_loop(
                     commit_group!();
                     // Background shells outlive the turn (their completion
                     // notification lands in the NEXT turn's session queue) —
-                    // leave a visible trace instead of letting them run
-                    // invisibly (the 2026-07-18 watcher incident).
+                    // leave a visible, EXPANDABLE trace instead of letting them
+                    // run invisibly (the 2026-07-18 watcher incident): the card
+                    // body carries each detached task's command, start time and
+                    // log tail, and the completion-wakeup monitor keeps it
+                    // fresh after finalize. Bare-tag fallback when the registry
+                    // has nothing (hook missed) or off-unix.
                     if shells > 0 {
+                        #[cfg(unix)]
+                        {
+                            let snap = bgtasks_snapshot(&conv_tag(&chat_id));
+                            if snap.is_empty() {
+                                full.push_str(&format!("\n{{% bgtasks n={shells} /%}}\n"));
+                            } else {
+                                full.push_str(&format!("\n{}\n", bgtasks_block(&snap)));
+                            }
+                        }
+                        #[cfg(not(unix))]
                         full.push_str(&format!("\n{{% bgtasks n={shells} /%}}\n"));
                     }
                     if let Some(s) = crate::render::render(&ev, &mut names) {
@@ -3122,6 +3380,7 @@ async fn render_loop(
                     // Done is terminal: return NOW so no later timeout tick can
                     // re-push the generating card over the finished reply.
                     let _ = client.edit_draft(&msg_id, &full).await;
+                    *final_md.lock().unwrap() = full;
                     return;
                 }
                 AgentEvent::Session(_) => {}
@@ -3163,6 +3422,53 @@ async fn render_loop(
     commit_buf!();
     commit_group!();
     let _ = client.edit_draft(&msg_id, &full).await;
+    *final_md.lock().unwrap() = full;
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod bgtasks_tests {
+    use super::{bgtasks_block, card_line, splice_bgtasks, strip_ansi, BgTask};
+
+    #[test]
+    fn block_and_splice_container_form() {
+        let tasks = vec![
+            BgTask { started_ms: 1000, running: true, cmd: "cargo build".into(), tail: vec!["Compiling".into()] },
+            BgTask { started_ms: 2000, running: false, cmd: "pnpm test".into(), tail: vec![] },
+        ];
+        let block = bgtasks_block(&tasks);
+        assert!(block.starts_with("{% bgtasks n=1 %}\n"));
+        assert!(block.contains("t|1000|running|cargo build\no|Compiling\n"));
+        assert!(block.contains("t|2000|done|pnpm test\n"));
+        assert!(block.ends_with("{% /bgtasks %}"));
+
+        // Splice replaces the whole container block, keeping surrounding text.
+        let msg = format!("before\n\n{block}\n\n{{% result /%}}");
+        let done = bgtasks_block(&[BgTask { started_ms: 1000, running: false, cmd: "cargo build".into(), tail: vec![] }]);
+        let out = splice_bgtasks(&msg, &done).unwrap();
+        assert!(out.starts_with("before\n\n{% bgtasks n=1 %}\nt|1000|done|cargo build\n"));
+        assert!(out.ends_with("{% /bgtasks %}\n\n{% result /%}"));
+        assert!(!out.contains("pnpm"));
+    }
+
+    #[test]
+    fn splice_bare_tag_and_missing() {
+        // Old-style self-closing tag upgrades to the container block in place.
+        let msg = "text\n{% bgtasks n=2 /%}\ntail";
+        let out = splice_bgtasks(msg, "{% bgtasks n=1 %}\nt|5|running|x\n{% /bgtasks %}").unwrap();
+        assert_eq!(out, "text\n{% bgtasks n=1 %}\nt|5|running|x\n{% /bgtasks %}\ntail");
+        // No card in the message → no edit.
+        assert!(splice_bgtasks("plain reply", "{% bgtasks n=1 /%}").is_none());
+    }
+
+    #[test]
+    fn card_line_sanitizes() {
+        // ANSI colors, carriage-return progress rewrites, markdoc delimiters.
+        assert_eq!(strip_ansi("\u{1b}[32mok\u{1b}[0m done"), "ok done");
+        assert_eq!(card_line("10%\r50%\r100% built", 160), "100% built");
+        assert_eq!(card_line("evil {% ask %} body", 160), "evil { % ask % } body");
+        assert_eq!(card_line("aaaaaa", 3), "aaa…");
+    }
 }
 
 #[cfg(test)]
