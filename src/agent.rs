@@ -1311,11 +1311,6 @@ async fn connect_and_run(
     // into the mafold preamble each turn.
     let card_tags = available_card_tags(client).await;
 
-    // Per-(conversation, requester) dedup for the {% gate %} access-request card,
-    // so a non-whitelisted user @-mentioning me repeatedly gets ONE card, not a
-    // flood. Per-connection (resets on reconnect — at most one extra card then).
-    let mut gate_carded: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-
     while let Some(frame) = read.next().await {
         let frame = match frame { Ok(f) => f, Err(e) => { eprintln!("ws error: {e}"); break; } };
         let text = match frame.into_text() { Ok(t) => t, Err(_) => continue };
@@ -1470,39 +1465,33 @@ async fn connect_and_run(
         if !allow.read().await.allows(&m.sender.username, sender_is_bot) {
             // Non-whitelisted sender. If a HUMAN @-mentioned me (directed at me,
             // not just chatting) and isn't blacklisted, post an owner-gated
-            // {% gate %} card ONCE per (conversation, user) instead of silently
-            // dropping — the owner taps 放行 (whitelists them + I auto-answer
-            // this message, via the server re-delivering it) or 忽略. The card +
-            // its actions are enforced server-side (owner-only); we only propose.
+            // {% gate %} card as the reply — EVERY directed mention gets one
+            // (owner decision 2026-07-26: no once-per-user dedup; the old
+            // dedup turned a deleted card into permanent silence, and a
+            // template reply per ask is the expected behavior). Spam control
+            // is the blacklist, which drops a user to silent-ignore below.
+            // The card + its actions are enforced server-side (owner-only);
+            // we only propose.
             let is_blocked = allow.read().await.blocked.contains(&sender_lc);
-            let gate_key = (m.conversation_id.clone(), sender_lc.clone());
             if !sender_is_bot && !is_blocked && mentions_me(&m.content, my_username) {
-                if gate_carded.contains(&gate_key) {
-                    println!("← @{} (not authorized → ignored: access card already posted in this chat)", m.sender.username);
-                } else {
-                    let content = format!("{{% gate user=\"{}\" msg=\"{}\" /%}}", m.sender.username, m.id);
-                    match client
-                        .call(
-                            "sendMessage",
-                            serde_json::json!({
-                                "conversation_id": m.conversation_id,
-                                "content": content,
-                                "reply_to_id": m.id,
-                                "channel_id": m.channel_id,
-                            }),
-                        )
-                        .await
-                    {
-                        // Dedup only AFTER the card actually posted — a failed send
-                        // must stay retryable on their next mention, not become
-                        // permanent silence for this (chat, user).
-                        Ok(_) => {
-                            gate_carded.insert(gate_key);
-                            println!("← @{} (not authorized → posted access-request card for owner)", m.sender.username);
-                        }
-                        Err(e) => {
-                            eprintln!("← @{} (not authorized → access-request card send FAILED: {e:#} — will retry on their next mention)", m.sender.username);
-                        }
+                let content = format!("{{% gate user=\"{}\" msg=\"{}\" /%}}", m.sender.username, m.id);
+                match client
+                    .call(
+                        "sendMessage",
+                        serde_json::json!({
+                            "conversation_id": m.conversation_id,
+                            "content": content,
+                            "reply_to_id": m.id,
+                            "channel_id": m.channel_id,
+                        }),
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        println!("← @{} (not authorized → posted access-request card for owner)", m.sender.username);
+                    }
+                    Err(e) => {
+                        eprintln!("← @{} (not authorized → access-request card send FAILED: {e:#} — will retry on their next mention)", m.sender.username);
                     }
                 }
             } else {
@@ -2480,7 +2469,15 @@ async fn recent_group_context(
     channel_id: Option<&str>,
 ) -> Option<String> {
     const MAX_MSGS: usize = 30; // cap injected lines (recent-most kept)
-    const MAX_CHARS: usize = 600; // cap per-message length (anti-bloat / anti-flood)
+    // Per-message cap. 600 used to cut card-heavy messages (usually other
+    // agents' run/tool cards) mid-tag, which made AI-authored messages
+    // second-class in practice — against the unified account model. One
+    // uniform, larger budget for EVERY sender, with head+tail keeping so a
+    // long message's conclusion survives (see below).
+    const MAX_CHARS: usize = 2000;
+    // Whole-block cap: a card-heavy chat could otherwise inject 30 × MAX_CHARS.
+    // Past this, OLDEST rows are dropped first.
+    const TOTAL_BUDGET: usize = 24_000;
     let me_lc = my_username.trim().to_lowercase();
     // When the turn fired INSIDE a thread, pull the THREAD's history (root +
     // replies) — thread replies aren't in the channel's main timeline, so the
@@ -2513,8 +2510,16 @@ async fn recent_group_context(
         let attach = msg.get("attachments").and_then(|a| a.as_array()).map(|a| a.len()).unwrap_or(0);
         let body = if text.is_empty() {
             if attach > 0 { format!("[{attach} attachment(s)]") } else { continue; }
+        } else if text.chars().count() <= MAX_CHARS {
+            text.to_string()
         } else {
-            text.chars().take(MAX_CHARS).collect::<String>()
+            // Keep the head AND the tail — long agent messages put their
+            // conclusion at the end; the old mid-cut lost exactly the part
+            // worth reading.
+            let chars: Vec<char> = text.chars().collect();
+            let head: String = chars[..MAX_CHARS * 3 / 4].iter().collect();
+            let tail: String = chars[chars.len() - MAX_CHARS / 4..].iter().collect();
+            format!("{head}\n…[truncated]…\n{tail}")
         };
         let at = msg.get("created_at").and_then(|c| c.as_str()).unwrap_or("").to_string();
         rows.push((at, who.to_string(), body));
@@ -2525,6 +2530,11 @@ async fn recent_group_context(
     rows.sort_by(|a, b| a.0.cmp(&b.0)); // chronological (RFC3339 sorts lexically)
     if rows.len() > MAX_MSGS {
         rows = rows.split_off(rows.len() - MAX_MSGS);
+    }
+    let mut total: usize = rows.iter().map(|r| r.2.chars().count()).sum();
+    while rows.len() > 1 && total > TOTAL_BUDGET {
+        let dropped = rows.remove(0); // oldest first
+        total -= dropped.2.chars().count();
     }
     let mut s = String::from(
         "[RECENT CONVERSATION — the latest messages in this chat (oldest first), for \
