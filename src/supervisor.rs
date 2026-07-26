@@ -708,7 +708,11 @@ pub async fn supervise(base: String, auto_update: bool) {
                             // turn can't block updates forever.
                             drain_daemons(&cfg.daemons, std::time::Duration::from_secs(300)).await;
                             for d in &cfg.daemons { let _ = stop_one(&d.name); }
-                            let _ = crate::update::reexec(); // new supervisor respawns daemons (new binary)
+                            // New supervisor respawns daemons (new binary). If the
+                            // re-exec fails we keep running as the OLD supervisor with
+                            // daemons stopped — the keep-alive loop below respawns them
+                            // (they'll be the new binary), but say so loudly.
+                            crate::update::reexec_or_warn(&r.version);
                         }
                         Err(e) => {
                             crate::update::mark_failed(&r.version);

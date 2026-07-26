@@ -646,7 +646,7 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
             if !crate::update::recently_failed(&r.version) {
                 println!("↻ updating to v{}…", r.version);
                 match crate::update::apply(&client.http, &r.url, &r.version, r.sha256.as_deref()).await {
-                    Ok(()) => { let _ = crate::update::reexec(); } // replaces this process
+                    Ok(()) => crate::update::reexec_or_warn(&r.version), // replaces this process (loud if not)
                     Err(e) => {
                         crate::update::mark_failed(&r.version);
                         eprintln!("self-update to v{} failed ({e:#}) — continuing on v{}", r.version, crate::update::current_version());
@@ -973,7 +973,7 @@ async fn maybe_update(http: &reqwest::Client, coord: &Arc<ExecCoord>) {
             if coord.idle() {
                 println!("↻ updating to v{} — restarting…", r.version);
                 match crate::update::apply(http, &r.url, &r.version, r.sha256.as_deref()).await {
-                    Ok(()) => { let _ = crate::update::reexec(); }
+                    Ok(()) => crate::update::reexec_or_warn(&r.version),
                     Err(e) => {
                         crate::update::mark_failed(&r.version);
                         eprintln!("self-update to v{} failed ({e:#}) — will retry in ~1h", r.version);
@@ -1475,26 +1475,43 @@ async fn connect_and_run(
             // this message, via the server re-delivering it) or 忽略. The card +
             // its actions are enforced server-side (owner-only); we only propose.
             let is_blocked = allow.read().await.blocked.contains(&sender_lc);
-            if !sender_is_bot
-                && !is_blocked
-                && mentions_me(&m.content, my_username)
-                && gate_carded.insert((m.conversation_id.clone(), sender_lc.clone()))
-            {
-                let content = format!("{{% gate user=\"{}\" msg=\"{}\" /%}}", m.sender.username, m.id);
-                let _ = client
-                    .call(
-                        "sendMessage",
-                        serde_json::json!({
-                            "conversation_id": m.conversation_id,
-                            "content": content,
-                            "reply_to_id": m.id,
-                            "channel_id": m.channel_id,
-                        }),
-                    )
-                    .await;
-                println!("← @{} (not authorized → posted access-request card for owner)", m.sender.username);
+            let gate_key = (m.conversation_id.clone(), sender_lc.clone());
+            if !sender_is_bot && !is_blocked && mentions_me(&m.content, my_username) {
+                if gate_carded.contains(&gate_key) {
+                    println!("← @{} (not authorized → ignored: access card already posted in this chat)", m.sender.username);
+                } else {
+                    let content = format!("{{% gate user=\"{}\" msg=\"{}\" /%}}", m.sender.username, m.id);
+                    match client
+                        .call(
+                            "sendMessage",
+                            serde_json::json!({
+                                "conversation_id": m.conversation_id,
+                                "content": content,
+                                "reply_to_id": m.id,
+                                "channel_id": m.channel_id,
+                            }),
+                        )
+                        .await
+                    {
+                        // Dedup only AFTER the card actually posted — a failed send
+                        // must stay retryable on their next mention, not become
+                        // permanent silence for this (chat, user).
+                        Ok(_) => {
+                            gate_carded.insert(gate_key);
+                            println!("← @{} (not authorized → posted access-request card for owner)", m.sender.username);
+                        }
+                        Err(e) => {
+                            eprintln!("← @{} (not authorized → access-request card send FAILED: {e:#} — will retry on their next mention)", m.sender.username);
+                        }
+                    }
+                }
             } else {
-                println!("← @{} (not authorized → ignored)", m.sender.username);
+                // Say WHY it was dropped — a bare "ignored" made field reports
+                // ("the bot never replied") undiagnosable from the log.
+                let why = if is_blocked { "blacklisted" }
+                    else if sender_is_bot { "bot sender (whitelist a bot explicitly to allow it)" }
+                    else { "didn't @-mention me" };
+                println!("← @{} (not authorized → ignored: {why})", m.sender.username);
             }
             continue;
         }

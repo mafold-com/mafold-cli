@@ -327,3 +327,20 @@ pub async fn update_to_latest(http: &reqwest::Client) -> Result<Option<String>> 
 pub fn reexec() -> std::io::Error {
     crate::platform::reexec()
 }
+
+/// `reexec`, but LOUD on failure. After `apply()` the binary on disk is already
+/// `new_version`; if the re-exec fails THIS process silently keeps running the
+/// old code — the "disk says new, behavior says old" stale-daemon trap (easiest
+/// to hit on Windows, where a virus scanner can hold the fresh exe just long
+/// enough for the spawn to fail). Retry once after a beat, then leave an
+/// unmissable log line instead of the old `let _ =` swallow.
+pub fn reexec_or_warn(new_version: &str) {
+    let e = reexec(); // only returns on failure
+    std::thread::sleep(std::time::Duration::from_millis(750));
+    let e2 = reexec();
+    eprintln!(
+        "⚠️  re-exec into v{new_version} FAILED (first: {e}; retry: {e2}) — STILL RUNNING v{} \
+         while the binary on disk is v{new_version}. Restart me: `mafold down && mafold up`.",
+        current_version()
+    );
+}
