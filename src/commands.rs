@@ -679,6 +679,13 @@ pub(crate) async fn claude_version() -> String {
     out.split_whitespace().next().unwrap_or("").trim_start_matches('v').to_string()
 }
 
+/// Claude Code's per-project transcript dir for a workdir — the CLI's own
+/// munge: every non-alphanumeric byte becomes `-`.
+pub(crate) fn project_dir(workdir: &str) -> PathBuf {
+    let munged: String = workdir.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    home().join(".claude/projects").join(munged)
+}
+
 /// Estimate the CURRENT context size of a resumed session: the last assistant
 /// turn's input-side usage (input + cache read + cache creation) from its
 /// transcript under `~/.claude/projects/<munged workdir>/<session>.jsonl`.
@@ -689,8 +696,7 @@ pub(crate) fn session_context_tokens(workdir: &str, session_id: &str) -> Option<
     if session_id.is_empty() || !session_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return None;
     }
-    let munged: String = workdir.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
-    let path = home().join(".claude/projects").join(munged).join(format!("{session_id}.jsonl"));
+    let path = project_dir(workdir).join(format!("{session_id}.jsonl"));
 
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(&path).ok()?;
@@ -718,6 +724,174 @@ pub(crate) fn session_context_tokens(workdir: &str, session_id: &str) -> Option<
         if ctx > 0 { return Some(ctx); }
     }
     None
+}
+
+// ───────────────────────── /resume: session listing ─────────────────────────
+
+/// One resumable transcript in a project dir — enough for the `/resume` picker.
+pub(crate) struct SessionMeta {
+    pub id: String,
+    /// Seconds since the transcript was last written.
+    pub age_secs: i64,
+    /// Claude's own rolling summary, else the first real user prompt ("" if
+    /// neither) — the picker's one-line description.
+    pub preview: String,
+}
+
+/// The workdir's resumable Claude Code sessions, newest-first — the same
+/// transcripts the TUI's own `/resume` picker lists for that directory.
+pub(crate) fn list_project_sessions(workdir: &str) -> Vec<SessionMeta> {
+    let dir = project_dir(workdir);
+    let mut rows: Vec<(String, std::time::SystemTime)> = vec![];
+    let Ok(entries) = std::fs::read_dir(&dir) else { return vec![] };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("jsonl") { continue; }
+        let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+        if !stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') { continue; }
+        let Some(mtime) = e.metadata().ok().and_then(|md| md.modified().ok()) else { continue };
+        rows.push((stem.to_string(), mtime));
+    }
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    let now = std::time::SystemTime::now();
+    rows.into_iter()
+        .map(|(id, mtime)| {
+            let age_secs = now.duration_since(mtime).map(|d| d.as_secs() as i64).unwrap_or(0);
+            let head = read_head(&dir.join(format!("{id}.jsonl")), 96 * 1024);
+            SessionMeta { id, age_secs, preview: preview_from_head(&head) }
+        })
+        .collect()
+}
+
+/// First `max` bytes of a file, lossy ("" on any miss).
+fn read_head(path: &Path, max: u64) -> String {
+    use std::io::Read;
+    let Ok(f) = std::fs::File::open(path) else { return String::new() };
+    let mut bytes = Vec::new();
+    let _ = f.take(max).read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Pull a one-line preview out of a transcript head: a `summary` line when the
+/// session carries one (continued/compacted sessions do), else the first real
+/// user prompt — skipping meta lines, command stubs and interrupt notices, and
+/// stripping the daemon's own injected context blocks down to the trigger text.
+pub(crate) fn preview_from_head(head: &str) -> String {
+    for line in head.lines() {
+        if line.starts_with("{\"type\":\"summary\"") {
+            if let Some(s) = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| v["summary"].as_str().map(str::to_string))
+            {
+                if !s.trim().is_empty() { return clip(&s, 48); }
+            }
+            continue;
+        }
+        if !line.contains("\"type\":\"user\"") { continue; }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if v["type"].as_str() != Some("user") || v["isMeta"].as_bool() == Some(true) { continue; }
+        let c = &v["message"]["content"];
+        let text = match c {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(items) => items
+                .iter()
+                .find_map(|b| (b["type"].as_str() == Some("text")).then(|| b["text"].as_str().unwrap_or("").to_string()))
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        // The daemon prefixes group turns with bracketed context blocks; the
+        // real trigger is whatever follows the last END marker.
+        let t = ["[END RECENT CONVERSATION — now handle the triggering message below.]", "[END AVAILABLE APPS & ROOMS]"]
+            .iter()
+            .fold(text.trim(), |acc, marker| acc.rsplit(marker).next().unwrap_or(acc).trim());
+        if t.is_empty() || t.starts_with("Caveat:") || t.starts_with('<') || t.starts_with("[Request interrupted") {
+            continue;
+        }
+        return clip(t, 48);
+    }
+    String::new()
+}
+
+/// Seconds → "just now" / "5m ago" / "3h ago" / "2d ago".
+pub(crate) fn fmt_age(secs: i64) -> String {
+    if secs < 60 { "just now".into() }
+    else if secs < 3600 { format!("{}m ago", secs / 60) }
+    else if secs < 86400 { format!("{}h ago", secs / 3600) }
+    else { format!("{}d ago", secs / 86400) }
+}
+
+/// An interactive `claude` (TUI) session alive right now.
+pub(crate) struct LiveTui {
+    pub session_id: String,
+    pub cwd: String,
+    /// "busy" | "idle" | "" (older CLIs don't report one).
+    pub status: String,
+}
+
+/// Live TUI sessions from Claude Code's own registry
+/// (`~/.claude/sessions/<pid>.json`). Every claude process writes one — real
+/// terminals as `entrypoint:"cli"`, the daemon's own stream-json turns as
+/// `"sdk-cli"` — so only `cli` entries count (else a bot's in-flight turn tags
+/// itself "open in a TUI"). Exited TUIs leave their file behind, so an entry
+/// only counts while its pid is still alive. Windows: no signal-0 probe, so
+/// the live tags simply don't show there — `/resume` itself still works.
+pub(crate) fn live_tui_sessions() -> Vec<LiveTui> {
+    let mut out: Vec<LiveTui> = vec![];
+    let Ok(entries) = std::fs::read_dir(home().join(".claude/sessions")) else { return out };
+    for e in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+        let Some((pid, l)) = parse_live_entry(&text) else { continue };
+        if !pid_alive(pid) { continue; }
+        // Two registry entries can claim one session (a TUI relaunched via
+        // `--resume`); busy beats idle.
+        if let Some(prev) = out.iter_mut().find(|x| x.session_id == l.session_id) {
+            if prev.status != "busy" && l.status == "busy" { *prev = l; }
+        } else {
+            out.push(l);
+        }
+    }
+    out
+}
+
+/// Parse one live-registry entry; None for anything that isn't a real
+/// terminal session (non-interactive kinds, sdk-cli entrypoints, drift).
+pub(crate) fn parse_live_entry(text: &str) -> Option<(u32, LiveTui)> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    if v["kind"].as_str() != Some("interactive") || v["entrypoint"].as_str() != Some("cli") { return None; }
+    let pid = v["pid"].as_u64()? as u32;
+    let session_id = v["sessionId"].as_str()?.to_string();
+    let cwd = v["cwd"].as_str().unwrap_or("").to_string();
+    let status = v["status"].as_str().unwrap_or("").to_string();
+    Some((pid, LiveTui { session_id, cwd, status }))
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    // Same-user probe: signal 0 delivers nothing, just checks existence.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    false
+}
+
+/// `/resume <arg>` resolution over the (newest-first) session list.
+pub(crate) enum Resolve<'a> {
+    One(&'a SessionMeta),
+    NotFound,
+    Ambiguous(usize),
+}
+
+pub(crate) fn resolve_session<'a>(metas: &'a [SessionMeta], arg: &str) -> Resolve<'a> {
+    if arg.eq_ignore_ascii_case("last") {
+        return metas.first().map(Resolve::One).unwrap_or(Resolve::NotFound);
+    }
+    let hits: Vec<&SessionMeta> = metas.iter().filter(|m| m.id.starts_with(arg)).collect();
+    match hits.len() {
+        0 => Resolve::NotFound,
+        1 => Resolve::One(hits[0]),
+        n => Resolve::Ambiguous(n),
+    }
 }
 
 /// 1_234_567 → "1.2M" (K/M/B, trailing `.0` stripped).
@@ -951,6 +1125,71 @@ Last 7d · 7983 requests · 30 sessions
         assert_eq!(fmt_dur(30), "1m");
     }
 
+    #[test]
+    fn ages() {
+        assert_eq!(fmt_age(5), "just now");
+        assert_eq!(fmt_age(300), "5m ago");
+        assert_eq!(fmt_age(7200), "2h ago");
+        assert_eq!(fmt_age(200_000), "2d ago");
+    }
+
+    #[test]
+    fn preview_prefers_summary_then_first_real_prompt() {
+        // Summary line wins even when a user line follows.
+        let head = r#"{"type":"summary","summary":"Fixing the flaky auth test"}
+{"type":"user","message":{"role":"user","content":"hello"}}"#;
+        assert_eq!(preview_from_head(head), "Fixing the flaky auth test");
+
+        // Meta/mode/snapshot lines and command stubs are skipped; the first
+        // real prompt is picked, whitespace collapsed.
+        let head = r#"{"type":"mode","mode":"normal"}
+{"type":"file-history-snapshot","messageId":"x"}
+{"type":"user","isMeta":true,"message":{"role":"user","content":"Caveat: injected"}}
+{"type":"user","message":{"role":"user","content":"<command-name>/usage</command-name>"}}
+{"type":"user","message":{"role":"user","content":"fix the   login bug"}}"#;
+        assert_eq!(preview_from_head(head), "fix the login bug");
+
+        // Daemon-injected context blocks are stripped down to the trigger; an
+        // array-form content still yields its text block.
+        let head = r#"{"type":"user","message":{"role":"user","content":"[RECENT CONVERSATION]\nnoise\n[END RECENT CONVERSATION — now handle the triggering message below.]\n\nship the release"}}"#;
+        assert_eq!(preview_from_head(head), "ship the release");
+        let head = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"array prompt"}]}}"#;
+        assert_eq!(preview_from_head(head), "array prompt");
+        assert_eq!(preview_from_head("garbage\nlines"), "");
+    }
+
+    #[test]
+    fn resolves_sessions_by_prefix_and_last() {
+        let metas = vec![
+            SessionMeta { id: "aabb1111-x".into(), age_secs: 10, preview: String::new() },
+            SessionMeta { id: "aacc2222-y".into(), age_secs: 20, preview: String::new() },
+        ];
+        assert!(matches!(resolve_session(&metas, "last"), Resolve::One(m) if m.id == "aabb1111-x"));
+        assert!(matches!(resolve_session(&metas, "aacc"), Resolve::One(m) if m.id == "aacc2222-y"));
+        assert!(matches!(resolve_session(&metas, "aa"), Resolve::Ambiguous(2)));
+        assert!(matches!(resolve_session(&metas, "zz"), Resolve::NotFound));
+        assert!(matches!(resolve_session(&[], "last"), Resolve::NotFound));
+    }
+
+    #[test]
+    fn parses_live_registry_entries() {
+        // Captured shape from ~/.claude/sessions/<pid>.json (Claude Code 2.1.x).
+        let entry = r#"{"pid":80413,"sessionId":"149fe1e7-d58a-4f47-a194-d5f030927da2","cwd":"/Users/ops/Desktop","startedAt":1785033002454,"version":"2.1.220","kind":"interactive","entrypoint":"cli","status":"busy","updatedAt":1785033278170}"#;
+        let (pid, l) = parse_live_entry(entry).expect("parses");
+        assert_eq!(pid, 80413);
+        assert_eq!(l.session_id, "149fe1e7-d58a-4f47-a194-d5f030927da2");
+        assert_eq!(l.cwd, "/Users/ops/Desktop");
+        assert_eq!(l.status, "busy");
+        // Non-interactive kinds, the daemon's own sdk-cli turns (they register
+        // too — kind "interactive", entrypoint "sdk-cli"), and drift are all
+        // rejected; a missing status is tolerated.
+        assert!(parse_live_entry(r#"{"pid":1,"sessionId":"x","kind":"print","entrypoint":"cli"}"#).is_none());
+        assert!(parse_live_entry(r#"{"pid":3,"sessionId":"z","kind":"interactive","entrypoint":"sdk-cli"}"#).is_none());
+        assert!(parse_live_entry("not json").is_none());
+        let (_, l) = parse_live_entry(r#"{"pid":2,"sessionId":"y","cwd":"/w","kind":"interactive","entrypoint":"cli"}"#).unwrap();
+        assert_eq!(l.status, "");
+    }
+
     // ── machine-dependent smokes: read THIS machine's ~/.claude, run manually
     //    with `cargo test -- --ignored --nocapture` ──
 
@@ -975,6 +1214,21 @@ Last 7d · 7983 requests · 30 sessions
     async fn limits_smoke_print() {
         let s = fetch_limits().await;
         println!("{s}");
+    }
+
+    #[test]
+    #[ignore = "reads this machine's ~/.claude transcripts + live registry"]
+    fn resume_listing_smoke() {
+        let metas = list_project_sessions("/Users/ops/Desktop/mafold");
+        println!("{} sessions; newest 6:", metas.len());
+        for m in metas.iter().take(6) {
+            println!("  {} · {} · {:?}", &m.id[..8], fmt_age(m.age_secs), m.preview);
+        }
+        // Newest-first ordering.
+        assert!(metas.windows(2).all(|w| w[0].age_secs <= w[1].age_secs));
+        for l in live_tui_sessions() {
+            println!("live: {} · {} · {:?}", &l.session_id[..8], l.cwd, l.status);
+        }
     }
 
     #[test]

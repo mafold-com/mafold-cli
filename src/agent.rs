@@ -1003,6 +1003,9 @@ fn control_commands(harness_id: &str) -> Vec<Value> {
     if harness_id != "codex" {
         cmds.push(serde_json::json!({ "command": "think", "description": "Toggle extended thinking for this chat", "arg_hint": "on | off | <tokens>" }));
     }
+    if harness_id == "claude-code" {
+        cmds.push(serde_json::json!({ "command": "resume", "description": "Resume an earlier session (terminal ones pick up their live state)", "arg_hint": "id | last" }));
+    }
     cmds.extend([
         serde_json::json!({ "command": "status", "description": "Agent, session, account & daemon info" }),
         serde_json::json!({ "command": "cwd",    "description": "Show the working directory" }),
@@ -1587,6 +1590,13 @@ async fn connect_and_run(
                 continue;
             }
             if is_control(&name) {
+                // A control command arriving as a REPLY may be answering one of
+                // our finalized {% ask %} cards (e.g. the /resume picker, whose
+                // option labels are the commands themselves) — stamp the card
+                // answered everywhere before running it.
+                if let Some(rid) = m.reply_to_id.as_deref() {
+                    stamp_finalized_ask(client, &m.conversation_id, rid, my_username, trimmed, m.thread_root_id.as_deref()).await;
+                }
                 handle_control(client, workdir, owner.read().await.cwd.clone(), &m.conversation_id, m.channel_id.as_deref(), &name, arg, sessions, chat_states, harness).await;
                 continue;
             }
@@ -1700,7 +1710,7 @@ async fn connect_and_run(
 
 /// Is this slash name one the daemon handles itself (vs a Claude Code skill)?
 fn is_control(name: &str) -> bool {
-    matches!(name, "clear" | "new" | "compact" | "stop" | "model" | "think" | "status" | "cwd" | "help")
+    matches!(name, "clear" | "new" | "compact" | "resume" | "stop" | "model" | "think" | "status" | "cwd" | "help")
 }
 
 /// v0 inline-query handler. The full plumbing (client → API → daemon → API →
@@ -1806,6 +1816,26 @@ async fn handle_control(
                 let (client, workdir, chat_id, skey, channel, sessions) =
                     (client.clone(), workdir.to_string(), chat_id.to_string(), skey.clone(), channel_id.map(str::to_string), sessions.clone());
                 tokio::spawn(async move { compact_session(client, workdir, chat_id, skey, channel, sessions).await; });
+            }
+        }
+        "resume" => {
+            // Claude-Code-specific: it points the chat at one of claude's
+            // on-disk transcripts. Codex (thread rollout) and Kimi (own home)
+            // have nothing this could target.
+            if harness.id() != "claude-code" {
+                let _ = client.send_in(chat_id, channel_id, "`/resume` is a Claude Code mechanic — this harness manages its own context. `/clear` starts fresh; otherwise the conversation already continues automatically.").await;
+            } else {
+                let busy = {
+                    let states = chat_states.lock().await;
+                    states.get(chat_id).map(|s| !s.turns.is_empty()).unwrap_or(false)
+                };
+                let (client, workdir, chat_id, skey, channel, sessions, arg) = (
+                    client.clone(), workdir.to_string(), chat_id.to_string(), skey.clone(),
+                    channel_id.map(str::to_string), sessions.clone(), arg.to_string(),
+                );
+                tokio::spawn(async move {
+                    resume_session(client, workdir, owner_cwd, chat_id, skey, channel, sessions, arg, busy).await;
+                });
             }
         }
         "stop" => {
@@ -1941,7 +1971,7 @@ async fn handle_control(
             let text = if harness.id() == "codex" {
                 "I'm a Codex agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /stop — stop the running reply\n• /model <name> — switch model for this chat\n• /status · /cwd — agent info\n\nReasoning depth is set by the **Reasoning effort** field in this bot's Customize sheet."
             } else {
-                "I'm a Claude Code agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /compact — summarize the context to free up room (keeps continuity)\n• /stop — stop the running reply\n• /model <name> — switch model for this chat\n• /think on|off|<tokens> — toggle extended thinking for this chat\n• /status · /cwd — agent info\n\nEverything else in the `/` menu is a Claude Code skill or command — tap one to run it."
+                "I'm a Claude Code agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /compact — summarize the context to free up room (keeps continuity)\n• /resume [id|last] — pick up an earlier session, including ones open in a terminal (they carry over their live state)\n• /stop — stop the running reply\n• /model <name> — switch model for this chat\n• /think on|off|<tokens> — toggle extended thinking for this chat\n• /status · /cwd — agent info\n\nEverything else in the `/` menu is a Claude Code skill or command — tap one to run it."
             };
             let _ = client.send_in(chat_id, channel_id, text).await;
         }
@@ -2014,6 +2044,110 @@ async fn compact_session(client: Client, workdir: String, chat_id: String, skey:
             let _ = client.send_in(&chat_id, channel_id, &format!("Couldn't run compaction: {e}")).await;
         }
     }
+}
+
+/// `/resume [id|prefix|last]` — point this conversation at an existing Claude
+/// Code session from the chat's working directory (the same transcripts the
+/// TUI's own `/resume` lists). Bare `/resume` posts a tappable picker whose
+/// option labels ARE the `/resume <id>` commands — a tap sends the command
+/// right back. Switching only moves the pointer: the NEXT message runs
+/// `claude -p --resume <id>`, which forks a fresh session id from that
+/// transcript's on-disk state at that moment.
+///
+/// TUI-alive edge case: an interactive `claude` holding the session keeps
+/// appending to the SAME transcript (interactive resume doesn't fork), so the
+/// next-message fork inherits everything typed in the terminal up to that
+/// instant — the terminal's thread itself is never touched. Live sessions are
+/// tagged from the CLI's own registry (`~/.claude/sessions/<pid>.json`,
+/// pid-verified), and the switch reply spells the fork semantics out.
+#[allow(clippy::too_many_arguments)]
+async fn resume_session(client: Client, workdir: String, owner_cwd: Option<String>, chat_id: String, skey: String, channel: Option<String>, sessions: Sessions, arg: String, busy: bool) {
+    use crate::commands::{fmt_age, humanize, list_project_sessions, live_tui_sessions, resolve_session, session_context_tokens, Resolve};
+    let channel_id = channel.as_deref();
+    // The dir a TURN would actually use (chat workdir > owner default > process
+    // default) — a session anywhere else wouldn't resolve when the turn runs.
+    let cc = ConvConfig::fetch(&client, &chat_id).await;
+    let (dir, _) = resolve_turn_workdir(cc.cwd.as_deref(), owner_cwd.as_deref(), &workdir);
+    let metas = list_project_sessions(&dir);
+    if metas.is_empty() {
+        let _ = client.send_in(&chat_id, channel_id, &format!("No resumable sessions for `{dir}` yet — nothing under its Claude project dir.")).await;
+        return;
+    }
+    let live: HashMap<String, String> = live_tui_sessions().into_iter().filter(|l| l.cwd == dir).map(|l| (l.session_id, l.status)).collect();
+    let current = sessions.lock().await.get(&skey).cloned();
+    // Previews can carry the very chars the card's line format uses.
+    let card_safe = |s: &str| s.replace(['|', '\n'], " ");
+
+    let a = arg.trim();
+    if a.is_empty() {
+        let mut out = String::from("{% ask %}\nq|Resume|0|Pick a session — this chat continues from its latest state.\n");
+        for m in metas.iter().take(6) {
+            let id8: String = m.id.chars().take(8).collect();
+            let mut desc = fmt_age(m.age_secs);
+            if let Some(ctx) = session_context_tokens(&dir, &m.id) {
+                desc.push_str(&format!(" · ≈{} ctx", humanize(ctx)));
+            }
+            match live.get(&m.id).map(String::as_str) {
+                Some("busy") => desc.push_str(" · 🖥️ TUI, busy now"),
+                Some(_) => desc.push_str(" · 🖥️ open in a TUI"),
+                None => {}
+            }
+            if current.as_deref() == Some(m.id.as_str()) { desc.push_str(" · current"); }
+            if !m.preview.is_empty() { desc.push_str(&format!(" · {}", card_safe(&m.preview))); }
+            out.push_str(&format!("o|/resume {id8}|{desc}\n"));
+        }
+        out.push_str("{% /ask %}\n");
+        if metas.len() > 6 {
+            out.push_str(&format!("_{} more in `{}` — `/resume <session-id>` (any unique prefix) also works._\n", metas.len() - 6, dir));
+        }
+        out.push_str("_🖥️ = open in a terminal right now; resuming forks from its latest state — everything from the TUI carries over, and the terminal keeps its own thread._");
+        let _ = client.send_in(&chat_id, channel_id, &out).await;
+        return;
+    }
+
+    let m = match resolve_session(&metas, a) {
+        Resolve::One(m) => m,
+        Resolve::NotFound => {
+            let _ = client.send_in(&chat_id, channel_id, &format!("No session matching `{a}` under `{dir}` — bare `/resume` lists them.")).await;
+            return;
+        }
+        Resolve::Ambiguous(n) => {
+            let _ = client.send_in(&chat_id, channel_id, &format!("`{a}` matches {n} sessions — give a longer prefix (bare `/resume` lists them).")).await;
+            return;
+        }
+    };
+    let id8: String = m.id.chars().take(8).collect();
+    let tui = live.get(&m.id).map(String::as_str);
+    if current.as_deref() == Some(m.id.as_str()) {
+        let extra = if tui.is_some() { " It's open in a TUI too — the next message picks up whatever happened there." } else { "" };
+        let _ = client.send_in(&chat_id, channel_id, &format!("`{id8}…` is already this chat's session.{extra}")).await;
+        return;
+    }
+    {
+        let mut s = sessions.lock().await;
+        s.insert(skey.clone(), m.id.clone());
+        save_sessions(&s);
+    }
+    let mut msg = format!("⤷ Resumed `{id8}…` — last active {}", fmt_age(m.age_secs));
+    if let Some(ctx) = session_context_tokens(&dir, &m.id) {
+        msg.push_str(&format!(", ≈{} context", humanize(ctx)));
+    }
+    msg.push_str(". Your next message continues from it.");
+    match tui {
+        Some("busy") => msg.push_str("\n🖥️ It's open in a Claude Code terminal and running a turn right now — your next message forks from the transcript's latest state at that moment, so whatever the terminal has finished by then carries over. The terminal keeps its own thread."),
+        Some(_) => msg.push_str("\n🖥️ It's open in a Claude Code terminal right now — your next message forks from its latest state (everything typed there so far carries over), and the terminal's own thread is untouched."),
+        None => {}
+    }
+    if busy {
+        msg.push_str(&format!("\n⏳ Heads-up: a reply is still running in this chat — when it finishes it re-saves its own session, which can override this switch. Re-run `/resume {id8}` after it completes if that happens."));
+    }
+    if let Some(prev) = current {
+        if prev != m.id {
+            let p8: String = prev.chars().take(8).collect();
+            msg.push_str(&format!("\n(previous session `{p8}…` is set aside — `/resume {p8}` switches back)"));
+        }
+    }
+    let _ = client.send_in(&chat_id, channel_id, &msg).await;
 }
 
 /// Interactive `/login`: drive `claude auth login`, post the sign-in URL to the
