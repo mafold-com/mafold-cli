@@ -25,6 +25,7 @@ mod render;
 mod room;
 mod supervisor;
 mod update;
+mod wallet;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -93,6 +94,11 @@ enum Cmd {
     Channels {
         #[command(subcommand)]
         cmd: channels::ChannelsCmd,
+    },
+    /// Token wallet: balances / transfer / convert / rates / history / grants.
+    Wallet {
+        #[command(subcommand)]
+        cmd: wallet::WalletCmd,
     },
     /// Author, preview, and publish developer cards.
     Cards {
@@ -288,6 +294,7 @@ async fn main() -> Result<()> {
             send(&Client::new(cli.base, token), &chat, channel.as_deref(), &text.join(" ")).await?
         }
         Cmd::Channels { cmd } => channels::run(cmd, &Client::new(cli.base, token)).await?,
+        Cmd::Wallet { cmd } => wallet::run(cmd, &Client::new(cli.base, token)).await?,
         Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Install { .. } | Cmd::Cards { .. }
         | Cmd::Apps { .. } | Cmd::Room { .. }
         | Cmd::Langpack { .. } | Cmd::Login { .. } | Cmd::Report
