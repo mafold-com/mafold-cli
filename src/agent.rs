@@ -1476,15 +1476,7 @@ async fn connect_and_run(
             if !sender_is_bot && !is_blocked && mentions_me(&m.content, my_username) {
                 let content = format!("{{% gate user=\"{}\" msg=\"{}\" /%}}", m.sender.username, m.id);
                 match client
-                    .call(
-                        "sendMessage",
-                        serde_json::json!({
-                            "conversation_id": m.conversation_id,
-                            "content": content,
-                            "reply_to_id": m.id,
-                            "channel_id": m.channel_id,
-                        }),
-                    )
+                    .send_reply_in(&m.conversation_id, m.channel_id.as_deref(), &m.id, &content)
                     .await
                 {
                     Ok(_) => {

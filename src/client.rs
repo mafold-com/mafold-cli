@@ -198,6 +198,29 @@ impl Client {
         self.post("sendMessage", body).await
     }
 
+    /// Send into a channel as a REPLY to a specific message (the access-gate
+    /// card path). Go through a helper, never a hand-rolled body: a hand-written
+    /// gate payload used conversation_id/content/reply_to_id instead of the
+    /// API's chat_id/text/reply_to_message_id and silently 422'd for three
+    /// releases (0.9.56→0.9.63; diagnosed in the field by @linsky:opus48).
+    pub async fn send_reply_in(
+        &self,
+        chat_id: &str,
+        channel_id: Option<&str>,
+        reply_to_message_id: &str,
+        text: &str,
+    ) -> Result<Value> {
+        let mut body = json!({
+            "chat_id": chat_id,
+            "text": text,
+            "reply_to_message_id": reply_to_message_id,
+        });
+        if let Some(ch) = channel_id {
+            body["channel_id"] = json!(ch);
+        }
+        self.post("sendMessage", body).await
+    }
+
     /// Publish this bot's slash commands (the chat command panel).
     pub async fn set_commands(&self, commands: Value) -> Result<()> {
         self.post("setBotCommands", json!({ "commands": commands })).await?;
