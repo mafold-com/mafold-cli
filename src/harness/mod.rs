@@ -197,19 +197,70 @@ pub fn select(id: &str) -> Arc<dyn Harness> {
     }
 }
 
+// (harness id, the CLI binary whose presence signals it's installed)
+const BINS: &[(&str, &str)] = &[
+    ("claude-code", "claude"),
+    ("opencode", "opencode"),
+    ("codex", "codex"),
+    ("openclaw", "openclaw"),
+    ("kimi-code", "kimi"),
+];
+
 /// Probe which known harnesses are installed on THIS machine (their CLI is on
 /// PATH) — the control plane's capability report for New-Bot recommendation.
 /// Returns `(id, available)`. Extend `BINS` as more harness impls land.
 pub fn probe() -> Vec<(&'static str, bool)> {
-    // (harness id, the CLI binary whose presence signals it's installed)
-    const BINS: &[(&str, &str)] = &[
-        ("claude-code", "claude"),
-        ("opencode", "opencode"),
-        ("codex", "codex"),
-        ("openclaw", "openclaw"),
-        ("kimi-code", "kimi"),
-    ];
     BINS.iter().map(|(id, bin)| (*id, on_path(bin))).collect()
+}
+
+/// `probe_with_versions` cache: version probes spawn subprocesses, so results
+/// live ~10 min — the supervisor reports every 30s and must stay cheap.
+#[allow(clippy::type_complexity)]
+static VERSION_CACHE: std::sync::Mutex<
+    Option<(std::time::Instant, std::collections::HashMap<&'static str, Option<String>>)>,
+> = std::sync::Mutex::new(None);
+
+/// Like [`probe`], plus each available harness CLI's version (`<bin> --version`,
+/// first numeric-ish token). Cached ~10 min; call [`invalidate_versions`] after
+/// an install so the next report is fresh.
+pub fn probe_with_versions() -> Vec<(&'static str, bool, Option<String>)> {
+    let avail = probe();
+    let mut guard = VERSION_CACHE.lock().unwrap();
+    let fresh = guard.as_ref().is_some_and(|(at, _)| at.elapsed() < std::time::Duration::from_secs(600));
+    if !fresh {
+        let mut m = std::collections::HashMap::new();
+        for ((id, bin), (_, ok)) in BINS.iter().zip(&avail) {
+            m.insert(*id, if *ok { bin_version(bin) } else { None });
+        }
+        *guard = Some((std::time::Instant::now(), m));
+    }
+    let versions = &guard.as_ref().unwrap().1;
+    avail
+        .into_iter()
+        .map(|(id, ok)| (id, ok, if ok { versions.get(id).cloned().flatten() } else { None }))
+        .collect()
+}
+
+/// Drop the version cache (next `probe_with_versions` re-probes) — call after
+/// installing a runtime so its availability + version report immediately.
+pub fn invalidate_versions() {
+    *VERSION_CACHE.lock().unwrap() = None;
+}
+
+/// `<bin> --version` → a short version string ("2.1.198"): first token that
+/// starts with a digit, else the trimmed first line. None on any failure.
+fn bin_version(bin: &str) -> Option<String> {
+    let out = std::process::Command::new(bin).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    let line = s.lines().next()?.trim();
+    let v = line
+        .split_whitespace()
+        .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .unwrap_or(line);
+    (!v.is_empty()).then(|| v.chars().take(32).collect())
 }
 
 /// Is `bin` resolvable on `$PATH`? Windows-aware: also tries each `PATHEXT`

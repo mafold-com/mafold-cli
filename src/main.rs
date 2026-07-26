@@ -69,10 +69,11 @@ enum Cmd {
     Status,
     /// Update mafold to the latest release.
     Update,
-    /// Install a tool the Mafold agent needs (today: claude-code).
+    /// Install a coding-agent runtime (claude-code / codex / kimi-code /
+    /// opencode). No argument lists the runtimes + their install state.
     Install {
-        /// The tool to install — currently only `claude-code`.
-        tool: String,
+        /// The runtime to install; omit to list all with their state.
+        tool: Option<String>,
         /// Don't ask before running the official installer.
         #[arg(long, short)]
         yes: bool,
@@ -254,7 +255,7 @@ async fn main() -> Result<()> {
     }
     // Machine setup — no account or token involved at all.
     if let Cmd::Install { tool, yes } = &cli.cmd {
-        return install::run(tool, *yes);
+        return install::run(tool.as_deref().unwrap_or(""), *yes);
     }
 
     let token = cli
@@ -404,18 +405,19 @@ async fn report_harnesses(base: &str) -> Result<()> {
 }
 
 async fn report_with(base: &str, sess: &session::Session) -> Result<()> {
-    let probed = harness::probe();
+    let probed = harness::probe_with_versions();
     let harnesses: Vec<serde_json::Value> = probed
         .iter()
-        .map(|(id, available)| serde_json::json!({ "id": id, "available": available }))
+        .map(|(id, available, version)| serde_json::json!({ "id": id, "available": available, "version": version }))
         .collect();
-    let avail: Vec<&str> = probed.iter().filter(|(_, a)| *a).map(|(id, _)| *id).collect();
+    let avail: Vec<&str> = probed.iter().filter(|(_, a, _)| *a).map(|(id, _, _)| *id).collect();
     Client::new(base.to_string(), sess.token.clone())
         .call(
             "reportHarnesses",
             serde_json::json!({
                 "device_id": sess.device_id,
                 "device_name": sess.device_name,
+                "cli_version": env!("CARGO_PKG_VERSION"),
                 "harnesses": harnesses,
             }),
         )

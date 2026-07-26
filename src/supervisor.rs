@@ -762,20 +762,60 @@ async fn poll_provisions(http: &reqwest::Client, base: &str, sess: &crate::sessi
             Err(e) => eprintln!("provision @{name} failed: {e}"),
         }
     }
+
+    // One-click runtime installs queued from New-Bot (`requestRuntimeInstall`).
+    // Run each official installer headlessly, then re-report immediately so the
+    // web's availability poll flips without waiting for the 30s cadence.
+    let installs = resp.pointer("/result/installs").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    if !installs.is_empty() {
+        for rt in installs.iter().filter_map(|v| v.as_str()) {
+            let rt = rt.to_string();
+            println!("⬇ installing runtime {rt} (requested from New-Bot)…");
+            let res = tokio::task::spawn_blocking(move || crate::install::run(&rt, true)).await;
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("runtime install failed: {e}"),
+                Err(e) => eprintln!("runtime install task failed: {e}"),
+            }
+        }
+        // Installers default to ~/.local/bin; make sure this process (and the
+        // daemons it spawns) resolve it even when the service PATH predates the
+        // install — else probe() never flips the runtime available.
+        if let Some(home) = std::env::var_os("HOME") {
+            let local = std::path::Path::new(&home).join(".local/bin");
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            if local.is_dir() && !std::env::split_paths(&path).any(|p| p == local) {
+                let mut parts = vec![local];
+                parts.extend(std::env::split_paths(&path));
+                if let Ok(joined) = std::env::join_paths(parts) {
+                    std::env::set_var("PATH", joined);
+                }
+            }
+        }
+        crate::harness::invalidate_versions();
+        let _ = report_local_harnesses(http, base, sess).await;
+    }
     Ok(())
 }
 
 /// Re-send this machine's available harnesses (keeps the device "online").
+/// Includes this cli's own version + each harness CLI's version (cached probe)
+/// — New-Bot shows both next to the machine / on the runtime badges.
 async fn report_local_harnesses(http: &reqwest::Client, base: &str, sess: &crate::session::Session) -> Result<()> {
-    let harnesses: Vec<serde_json::Value> = crate::harness::probe()
+    // Version probes spawn `<bin> --version` subprocesses (cached 10 min) —
+    // keep them off the async runtime.
+    let harnesses: Vec<serde_json::Value> = tokio::task::spawn_blocking(crate::harness::probe_with_versions)
+        .await
+        .unwrap_or_default()
         .into_iter()
-        .map(|(id, available)| serde_json::json!({ "id": id, "available": available }))
+        .map(|(id, available, version)| serde_json::json!({ "id": id, "available": available, "version": version }))
         .collect();
     http.post(format!("{base}/api/reportHarnesses"))
         .bearer_auth(&sess.token)
         .json(&serde_json::json!({
             "device_id": sess.device_id,
             "device_name": sess.device_name,
+            "cli_version": env!("CARGO_PKG_VERSION"),
             "harnesses": harnesses,
         }))
         .send()
