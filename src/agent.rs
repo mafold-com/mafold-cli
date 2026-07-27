@@ -1389,6 +1389,36 @@ async fn connect_and_run(
             }
             continue;
         }
+        // Composer polish (✦). Deliberately NOT a turn: no agent session, no
+        // history, no chat state — just a headless one-shot CLI call. Spawned so
+        // a 10-second rewrite never stalls the event loop or a live run.
+        if method == "events.polishProbe" {
+            let probe_id = env["params"]["probe_id"].as_str().unwrap_or("").to_string();
+            if !probe_id.is_empty() {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let channels = crate::polish::probe_channels().await;
+                    let _ = client
+                        .answer_polish_probe(&probe_id, serde_json::Value::Array(channels))
+                        .await;
+                });
+            }
+            continue;
+        }
+        if method == "events.polish" {
+            let job_id = env["params"]["job_id"].as_str().unwrap_or("").to_string();
+            let channel = env["params"]["channel_id"].as_str().unwrap_or("").to_string();
+            let level = env["params"]["level"].as_u64().unwrap_or(1) as u8;
+            let text = env["params"]["text"].as_str().unwrap_or("").to_string();
+            if !job_id.is_empty() && !text.trim().is_empty() {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let out = crate::polish::polish(&channel, level, &text).await;
+                    let _ = client.answer_polish(&job_id, out.as_deref().unwrap_or("")).await;
+                });
+            }
+            continue;
+        }
         // Our bot was deleted server-side (owner hit "Delete this bot") — the
         // account and token are gone, so this daemon can never work again.
         // Tell the caller to deprovision instead of reconnect-looping forever.
