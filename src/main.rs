@@ -21,7 +21,6 @@ mod install;
 mod langpack;
 mod session;
 mod platform;
-mod polish;
 mod render;
 mod room;
 mod supervisor;
@@ -186,14 +185,6 @@ async fn main() -> Result<()> {
         if let Some(profile) = std::env::var_os("USERPROFILE") {
             std::env::set_var("HOME", profile);
         }
-    }
-
-    // Dev-only: exercise the polish path against the real local CLIs without
-    // standing up the API. Guarded by an env var so it can never fire in normal
-    // use. See `polish::selftest`.
-    if std::env::var_os("MAFOLD_POLISH_SELFTEST").is_some() {
-        polish::selftest().await;
-        return Ok(());
     }
 
     let cli = Cli::parse();

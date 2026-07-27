@@ -337,21 +337,6 @@ impl Client {
         Ok(())
     }
 
-    /// Report this machine's polish channels for a pending probe. One daemon
-    /// answers for the whole box — the coding-agent CLIs are installed per
-    /// machine, not per bot.
-    pub async fn answer_polish_probe(&self, probe_id: &str, channels: serde_json::Value) -> Result<()> {
-        self.post("answerPolishProbe", json!({ "probe_id": probe_id, "channels": channels })).await?;
-        Ok(())
-    }
-
-    /// Hand back a rewritten draft (or empty text when the channel produced
-    /// nothing usable — the client then falls through to its own L0 pass).
-    pub async fn answer_polish(&self, job_id: &str, text: &str) -> Result<()> {
-        self.post("answerPolish", json!({ "job_id": job_id, "text": text })).await?;
-        Ok(())
-    }
-
     /// Push a directed alert popup to a single user (Telegram answerCallbackQuery
     /// `show_alert` analog). Used to tell a non-allow-listed user their Stop
     /// request was denied. `level` ∈ {info, success, error}.
