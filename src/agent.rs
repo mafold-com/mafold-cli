@@ -1182,26 +1182,26 @@ fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
         // and NO extended-thinking budget field.
         "codex" => (
             serde_json::json!([
-                { "key": "model", "label": "Model", "kind": "select", "default": "",
+                { "key": "model", "label": "Model", "label_key": "botField.model.label", "kind": "select", "default": "",
                   "options": [
-                    { "label": "Agent default", "value": "" },
+                    { "label": "Agent default", "label_key": "botField.optionAgentDefault", "value": "" },
                     { "label": "gpt-5.6-sol",   "value": "gpt-5.6-sol" },
                     { "label": "gpt-5.6-luna",  "value": "gpt-5.6-luna" },
                     { "label": "gpt-5.6-terra", "value": "gpt-5.6-terra" },
                     { "label": "gpt-5.6-pro",   "value": "gpt-5.6-pro" }
                   ] },
-                { "key": "effort", "label": "Reasoning effort", "kind": "select", "default": "",
+                { "key": "effort", "label": "Reasoning effort", "label_key": "botField.effort.label", "kind": "select", "default": "",
                   "options": [
-                    { "label": "Agent default", "value": "" },
-                    { "label": "Minimal", "value": "minimal" },
-                    { "label": "Low",     "value": "low" },
-                    { "label": "Medium",  "value": "medium" },
-                    { "label": "High",    "value": "high" }
+                    { "label": "Agent default", "label_key": "botField.optionAgentDefault", "value": "" },
+                    { "label": "Minimal", "label_key": "botField.effort.minimal", "value": "minimal" },
+                    { "label": "Low",     "label_key": "botField.effort.low",     "value": "low" },
+                    { "label": "Medium",  "label_key": "botField.effort.medium",  "value": "medium" },
+                    { "label": "High",    "label_key": "botField.effort.high",    "value": "high" }
                   ] },
-                { "key": "system_prompt", "label": "System prompt", "kind": "string",
-                  "placeholder": "Extra instructions appended for every reply" },
-                { "key": "cwd", "label": "Working directory", "kind": "string",
-                  "placeholder": "~/project — per-chat here = that chat only; All chats = the default" }
+                { "key": "system_prompt", "label": "System prompt", "label_key": "botField.systemPrompt.label", "kind": "string",
+                  "placeholder": "Extra instructions appended for every reply", "placeholder_key": "botField.systemPrompt.placeholder" },
+                { "key": "cwd", "label": "Working directory", "label_key": "botField.cwd.label", "kind": "string",
+                  "placeholder": "~/project — per-chat here = that chat only; All chats = the default", "placeholder_key": "botField.cwd.placeholder" }
             ]),
             "model / effort / system prompt / cwd",
         ),
@@ -1212,38 +1212,38 @@ fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
         // 0 = off, empty = the agent's own default.
         "kimi-code" | "kimi" => (
             serde_json::json!([
-                { "key": "model", "label": "Model", "kind": "select", "default": "",
+                { "key": "model", "label": "Model", "label_key": "botField.model.label", "kind": "select", "default": "",
                   "options": [
-                    { "label": "Agent default",           "value": "" },
+                    { "label": "Agent default", "label_key": "botField.optionAgentDefault", "value": "" },
                     { "label": "K3 (1M context)",         "value": "kimi-code/k3" },
                     { "label": "K2.7 Coding",             "value": "kimi-code/kimi-for-coding" },
                     { "label": "K2.7 Coding · Highspeed", "value": "kimi-code/kimi-for-coding-highspeed" }
                   ] },
-                { "key": "system_prompt", "label": "System prompt", "kind": "string",
-                  "placeholder": "Extra instructions appended for every reply" },
-                { "key": "thinking", "label": "Thinking (0 = off, any number = on)", "kind": "number",
+                { "key": "system_prompt", "label": "System prompt", "label_key": "botField.systemPrompt.label", "kind": "string",
+                  "placeholder": "Extra instructions appended for every reply", "placeholder_key": "botField.systemPrompt.placeholder" },
+                { "key": "thinking", "label": "Thinking (0 = off, any number = on)", "label_key": "botField.thinkingToggle.label", "kind": "number",
                   "placeholder": "on" },
-                { "key": "cwd", "label": "Working directory", "kind": "string",
-                  "placeholder": "~/project — per-chat here = that chat only; All chats = the default" }
+                { "key": "cwd", "label": "Working directory", "label_key": "botField.cwd.label", "kind": "string",
+                  "placeholder": "~/project — per-chat here = that chat only; All chats = the default", "placeholder_key": "botField.cwd.placeholder" }
             ]),
             "model / system prompt / thinking / cwd",
         ),
         _ => (
             serde_json::json!([
-                { "key": "model", "label": "Model", "kind": "select", "default": "",
+                { "key": "model", "label": "Model", "label_key": "botField.model.label", "kind": "select", "default": "",
                   "options": [
-                    { "label": "Agent default", "value": "" },
+                    { "label": "Agent default", "label_key": "botField.optionAgentDefault", "value": "" },
                     { "label": "Fable",  "value": "fable" },
                     { "label": "Opus",   "value": "opus" },
                     { "label": "Sonnet", "value": "sonnet" },
                     { "label": "Haiku",  "value": "haiku" }
                   ] },
-                { "key": "system_prompt", "label": "System prompt", "kind": "string",
-                  "placeholder": "Extra instructions appended for every reply" },
-                { "key": "thinking", "label": "Thinking budget (tokens)", "kind": "number",
+                { "key": "system_prompt", "label": "System prompt", "label_key": "botField.systemPrompt.label", "kind": "string",
+                  "placeholder": "Extra instructions appended for every reply", "placeholder_key": "botField.systemPrompt.placeholder" },
+                { "key": "thinking", "label": "Thinking budget (tokens)", "label_key": "botField.thinking.label", "kind": "number",
                   "placeholder": "10000" },
-                { "key": "cwd", "label": "Working directory", "kind": "string",
-                  "placeholder": "~/project — per-chat here = that chat only; All chats = the default" }
+                { "key": "cwd", "label": "Working directory", "label_key": "botField.cwd.label", "kind": "string",
+                  "placeholder": "~/project — per-chat here = that chat only; All chats = the default", "placeholder_key": "botField.cwd.placeholder" }
             ]),
             "model / system prompt / thinking / cwd",
         ),
