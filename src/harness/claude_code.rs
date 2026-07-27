@@ -127,6 +127,13 @@ impl Harness for ClaudeCode {
 
         let mut produced = false;
         let mut stopped = false;
+        // Did the CURRENT assistant message arrive as text deltas? Reset on every
+        // `message_start`. Reply text has three possible carriers (partial deltas,
+        // the completed `assistant` message, the final `result`) and claude does
+        // not guarantee the first one — when the partial stream is missing, the
+        // completed message is the only copy we get. Streaming stays the primary
+        // path; this flag is what keeps the fallbacks below from double-posting it.
+        let mut streamed_text = false;
         let mut session_id: Option<String> = None;
         // Set when an API / execution error ends the turn — surfaced to the user.
         let mut error: Option<String> = None;
@@ -188,6 +195,7 @@ impl Harness for ClaudeCode {
                         if let Some(t) = d["text"].as_str() {
                             let _ = sink.send(AgentEvent::Text(t.to_string()));
                             produced = true;
+                            streamed_text = true;
                         }
                     } else if let Some(t) = d["thinking"].as_str().or_else(|| d["partial_json"].as_str()) {
                         let _ = sink.send(AgentEvent::Pulse { chars: t.len() as u64, tokens: None });
@@ -195,6 +203,7 @@ impl Harness for ClaudeCode {
                 } else if ev_type == "message_start" {
                     // A new assistant message: bank the previous one's usage.
                     tokens_done += std::mem::take(&mut tokens_cur);
+                    streamed_text = false;
                 } else if ev_type == "message_delta" {
                     // Cumulative REAL output tokens for the current message.
                     if let Some(t) = v["event"]["usage"]["output_tokens"].as_u64() {
@@ -203,11 +212,26 @@ impl Harness for ClaudeCode {
                     }
                 }
             }
-            // Completed assistant message → tool calls + thinking (text already streamed).
+            // Completed assistant message → tool calls + thinking, plus the text
+            // itself when it never streamed (see `streamed_text`).
             if v["type"] == "assistant" {
                 if let Some(blocks) = v["message"]["content"].as_array() {
                     for b in blocks {
                         match b["type"].as_str() {
+                            // Normally a no-op: the deltas already streamed this
+                            // text and re-sending it would double the reply. But a
+                            // turn whose partial stream never arrived carries its
+                            // ONLY copy here — without this the entire reply is
+                            // dropped and the user gets "(the agent produced no
+                            // output)" while the transcript holds a full answer.
+                            Some("text") if !streamed_text => {
+                                if let Some(t) = b["text"].as_str() {
+                                    if !t.trim().is_empty() {
+                                        let _ = sink.send(AgentEvent::Text(t.to_string()));
+                                        produced = true;
+                                    }
+                                }
+                            }
                             Some("tool_use") => {
                                 let _ = sink.send(AgentEvent::ToolCall {
                                     id: b["id"].as_str().unwrap_or("").to_string(),
@@ -255,6 +279,18 @@ impl Harness for ClaudeCode {
                             .unwrap_or_else(|| format!("agent ended with `{}`", if subtype.is_empty() { "error" } else { subtype })),
                     );
                     break;
+                }
+                // Last-resort carrier: a turn that succeeded but reached us with
+                // NOTHING (no deltas, no assistant message, no tool events) still
+                // has its final answer here. Delivering it beats finalizing an
+                // empty bubble — the failure this guards against is silent, and
+                // the daemon's empty-turn retry would otherwise burn a second
+                // full turn just to lose the reply again.
+                if !produced {
+                    if let Some(t) = v["result"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        let _ = sink.send(AgentEvent::Text(t.to_string()));
+                        produced = true;
+                    }
                 }
                 let u = &v["usage"];
                 let toks: u64 = ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
