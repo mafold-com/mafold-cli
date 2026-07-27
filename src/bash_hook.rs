@@ -43,8 +43,18 @@ fn rewrite(input: &str) -> Option<String> {
     detach(&v, ti)
 }
 
+/// Can a `run_in_background` Bash actually be moved out of claude's kill radius
+/// on this platform? THE SINGLE SOURCE OF TRUTH for the whole promise chain —
+/// `agent.rs` states it to the model in the system prompt, and only emits the
+/// `{% bgtasks %}` card ("结果会出现在下一条回复里") for tasks this returned true
+/// for. When it is false the agent must not claim a follow-up is coming.
+pub const fn bg_detach_supported() -> bool {
+    cfg!(unix)
+}
+
 // No detach story on Windows yet — background tasks keep claude's own
-// (turn-scoped) semantics there.
+// (turn-scoped) semantics there, and `bg_detach_supported()` tells the agent to
+// stop promising otherwise.
 #[cfg(not(unix))]
 fn detach(_v: &Value, _ti: &Value) -> Option<String> {
     None

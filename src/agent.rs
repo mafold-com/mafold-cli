@@ -25,9 +25,15 @@ use crate::harness::{AgentEvent, Harness, Turn};
 #[derive(Deserialize)]
 struct Sender {
     username: String,
-    /// "human" | "bot" — used to avoid bot-to-bot auto-reply loops.
+    /// "human" | "bot" — picks the AI-sender trigger rules (@-only, a2a).
     #[serde(default)]
     kind: String,
+    /// For bot senders, the owning human's username (present on the wire — the
+    /// sender is a full Account). The allow-list judges an AI sender as BOTH
+    /// itself and its owner: trusting a person = trusting their automation
+    /// (`.docs/a2a-v0.md` §2). None for humans and ownerless bots.
+    #[serde(default)]
+    parent_username: Option<String>,
 }
 #[derive(Deserialize, Clone)]
 struct InAttachment {
@@ -81,10 +87,22 @@ struct IncomingMessage {
     /// bot's own messages re-engages it in a group without an @-mention.
     #[serde(default)]
     reply_to_id: Option<String>,
+    /// Author of the replied-to message, stamped by the server at send time
+    /// (api ≥ 0.0.41). The reply-engages-me check keys on this, so it works
+    /// for messages from any era and across daemon restarts — the old
+    /// in-memory recent-ids set forgot everything on every self-update.
+    #[serde(default)]
+    reply_to_sender: Option<String>,
     /// Set when the trigger arrived in a forum channel — the bot's reply + the
     /// context it pulls must follow that channel. None = the `#all` main timeline.
     #[serde(default)]
     channel_id: Option<String>,
+    /// Present when this message was FORWARDED: its content is someone ELSE'S
+    /// text, so a quoted `@bot` inside it isn't the sender addressing us. Only
+    /// consulted for AI senders (mirrors the server's `fire_bots` forward rule);
+    /// the human paths (reply-to / always-on / DM) are unaffected by forwards.
+    #[serde(default)]
+    forwarded_from: Option<serde_json::Value>,
 }
 
 fn attachments_dir() -> PathBuf {
@@ -176,7 +194,11 @@ fn session_key(chat_id: &str, channel_id: Option<&str>) -> String {
 ///   - the **owner** is ALWAYS allowed (you can never lock yourself out);
 ///   - a **blacklisted** user is NEVER allowed (deny wins over everything else);
 ///   - a **whitelisted** user is allowed (a listed bot too — explicit opt-in);
-///   - the literal `*` in the whitelist opens the bot to ANY human;
+///   - an **AI sender inherits its owner's standing** (`parent_username`):
+///     whitelisting a person whitelists their bots, blacklisting a person
+///     blacklists their bots (`.docs/a2a-v0.md` §2);
+///   - the literal `*` in the whitelist opens the bot to EVERYONE — AI senders
+///     included (owner decision 2026-07-27);
 ///   - otherwise (empty whitelist) the DEFAULT is owner-only.
 /// The legacy env var `MAFOLD_ALLOWED_USERS` still adds to the whitelist.
 /// Usernames are trimmed, `@`-stripped, lowercased (mirrors @-mention matching).
@@ -189,7 +211,7 @@ struct AllowList {
     users: std::collections::HashSet<String>,
     /// Blacklisted usernames (lowercased) — denied even if whitelisted.
     blocked: std::collections::HashSet<String>,
-    /// Whitelist contained `*` → any human may drive the bot (still excludes bots).
+    /// Whitelist contained `*` → ANYONE may drive the bot, AI senders included.
     anyone: bool,
 }
 
@@ -224,24 +246,25 @@ impl AllowList {
         Self { owner, users, blocked, anyone }
     }
 
-    /// May this sender drive the bot? Bots are NEVER implicitly allowed (don't let
-    /// bots drive bots) even when `*` is set, but an explicitly whitelisted bot
-    /// passes. The owner is immune to the blacklist (no self-lockout).
-    fn allows(&self, username: &str, is_bot: bool) -> bool {
-        let u = norm_user(username);
-        if self.owner.as_deref() == Some(u.as_str()) {
-            return true; // owner always
+    /// May this sender drive the bot? An AI sender is judged as BOTH itself and
+    /// its owner (`parent_username`) at every rung — trusting a person = trusting
+    /// their automation (`.docs/a2a-v0.md` §2). The ladder is unchanged: owner →
+    /// blacklist (deny wins) → whitelist → `*` → owner-only default; the owner
+    /// (and the owner's own bots) stay immune to the blacklist (no self-lockout).
+    fn allows(&self, username: &str, parent_username: Option<&str>) -> bool {
+        let idents: Vec<String> = std::iter::once(norm_user(username))
+            .chain(parent_username.map(norm_user).filter(|p| !p.is_empty()))
+            .collect();
+        if self.owner.is_some() && idents.iter().any(|i| self.owner.as_deref() == Some(i.as_str())) {
+            return true; // owner always — their own bots inherit this rung
         }
-        if self.blocked.contains(&u) {
-            return false; // deny wins
+        if idents.iter().any(|i| self.blocked.contains(i)) {
+            return false; // deny wins — blacklisting a person blacklists their bots
         }
-        if self.users.contains(&u) {
-            return true; // explicitly whitelisted (a listed bot too)
+        if idents.iter().any(|i| self.users.contains(i)) {
+            return true; // whitelisted by name, or inherited from the listed owner
         }
-        if self.anyone {
-            return !is_bot; // `*` → any human
-        }
-        false // default: owner-only
+        self.anyone // `*` → everyone (AI senders included); else owner-only default
     }
 }
 
@@ -290,34 +313,6 @@ struct ChatState {
     gate: Option<ConvGate>,
 }
 type ChatStates = Arc<Mutex<HashMap<String, ChatState>>>;
-
-/// Bounded memory of the bot's OWN recent message ids (it sees its own echoes on
-/// the WS). A reply that targets one of these re-engages the bot in a group
-/// WITHOUT an @-mention — replying to the bot's message reads as "talking to it",
-/// the same as a mention. Bounded (oldest evicted) so it can't grow unbounded.
-#[derive(Default)]
-struct BotMsgMemory {
-    set: std::collections::HashSet<String>,
-    order: std::collections::VecDeque<String>,
-}
-impl BotMsgMemory {
-    fn remember(&mut self, id: &str) {
-        if id.is_empty() || self.set.contains(id) {
-            return;
-        }
-        self.set.insert(id.to_string());
-        self.order.push_back(id.to_string());
-        if self.order.len() > 1000 {
-            if let Some(old) = self.order.pop_front() {
-                self.set.remove(&old);
-            }
-        }
-    }
-    fn contains(&self, id: &str) -> bool {
-        self.set.contains(id)
-    }
-}
-type BotMsgIds = Arc<std::sync::Mutex<BotMsgMemory>>;
 
 /// Execution coordination. Turns run CONCURRENTLY — across conversations AND
 /// within one conversation (each turn has its own draft + claude session; a
@@ -404,22 +399,29 @@ fn mentions_me(text: &str, my_username: &str) -> bool {
 }
 
 /// Group reply gate. In a group the daemon answers only when @-mentioned or set
-/// always-on; DMs always answer. Group kind + always-on are cached per
-/// conversation (60s TTL) so this costs at most two cheap calls per minute.
+/// always-on; DMs always answer. An AI sender engages the bot through exactly ONE
+/// door — an explicit @-mention in a message it authored (`.docs/a2a-v0.md` §1);
+/// same rule the server's `fire_bots` applies to internal brains. Group kind +
+/// always-on are cached per conversation (60s TTL) so this costs at most two
+/// cheap calls per minute.
 async fn should_respond(
     client: &Client,
     conv_id: &str,
     my_username: &str,
     sender_is_bot: bool,
+    is_forward: bool,
     content: &str,
     reply_to_me: bool,
     chat_states: &ChatStates,
 ) -> bool {
-    // Never auto-chain off another bot's message (would loop two always-on bots
-    // — or two bots that @-mention each other — forever). Checked BEFORE the
-    // mention short-circuit so a bot's @mention can't pull this bot into a loop.
+    // AI senders: @-mention only. reply-to / always-on / DM-answers-everything
+    // stay human-only doors (two always-on bots would answer each other forever),
+    // and a FORWARDED message carries someone else's text — a quoted `@bot` isn't
+    // the sender addressing us. Not @-ing back is how an a2a exchange terminates,
+    // so this branch is also the a2a terminator. Checked BEFORE the reply_to_me
+    // short-circuit so a bot's reply can't re-engage us without an @.
     if sender_is_bot {
-        return false;
+        return !is_forward && mentions_me(content, my_username);
     }
     // A mention OR a reply to one of our messages always fires — both free, so
     // check them before any fetch.
@@ -631,6 +633,38 @@ fn save_sessions(map: &HashMap<String, String>) {
     }
 }
 
+/// Per-bot event-log cursor (`~/.mafold/cursors/<bot>.json`): the highest hub
+/// `seq` this daemon has processed. On reconnect the gap (cursor, head] is
+/// fetched via `getUpdates` and replayed, so a message sent while the daemon
+/// was offline or mid-restart still gets its turn — before this cursor
+/// existed, delivery was WS-only and offline meant lost forever.
+fn cursor_path(my_username: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let tag: String = my_username
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .collect();
+    PathBuf::from(home).join(".mafold").join("cursors").join(format!("{tag}.json"))
+}
+fn load_cursor(my_username: &str) -> u64 {
+    std::fs::read_to_string(cursor_path(my_username))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+fn save_cursor(my_username: &str, seq: u64) {
+    // Atomic tmp+rename, mirroring save_sessions: a torn cursor would replay
+    // (or skip) half the backlog on the next connect.
+    let path = cursor_path(my_username);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, seq.to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
 /// When this daemon process started serving — `/status` uptime.
 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
@@ -797,9 +831,6 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     let owner = Arc::new(RwLock::new(owner));
     let sessions: Sessions = Arc::new(Mutex::new(load_sessions()));
     let chat_states: ChatStates = Arc::new(Mutex::new(HashMap::new()));
-    // Recent ids of the bot's own messages (persist across reconnects) so a reply
-    // to one re-engages the bot without an @-mention.
-    let bot_msg_ids: BotMsgIds = Arc::new(std::sync::Mutex::new(BotMsgMemory::default()));
     // Per-conversation execution: different conversations run in parallel; turns
     // within one conversation serialize. (They share this workdir — don't run
     // conflicting edits in two chats at once.)
@@ -861,7 +892,6 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     // — live OR finished-but-unreported — gets a fresh monitor (tag == chat id;
     // uuids survive the sanitization unchanged). Config layering is skipped
     // here (defaults); the wrap-up resumes an existing session anyway.
-    #[cfg(unix)]
     {
         let mut tags: HashMap<String, u64> = HashMap::new();
         if let Ok(home) = std::env::var("HOME") {
@@ -910,7 +940,7 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     let mut auth_rejects = 0u32;
     let mut last_update_check = std::time::Instant::now();
     loop {
-        match connect_and_run(&client, &workdir, &my_username, &sessions, &coord, &chat_states, &bot_msg_ids, &harness, &owner, &allow, auto_update).await {
+        match connect_and_run(&client, &workdir, &my_username, &sessions, &coord, &chat_states, &harness, &owner, &allow, auto_update).await {
             Ok(WsExit::Deprovisioned) => deprovision_and_exit(&my_username, &client.token, "bot deleted server-side"),
             Ok(WsExit::AuthRejected) => {
                 auth_rejects += 1;
@@ -1274,7 +1304,6 @@ async fn connect_and_run(
     sessions: &Sessions,
     coord: &Arc<ExecCoord>,
     chat_states: &ChatStates,
-    bot_msg_ids: &BotMsgIds,
     harness: &Arc<dyn Harness>,
     owner: &Arc<RwLock<OwnerConfig>>,
     allow: &Arc<RwLock<AllowList>>,
@@ -1311,14 +1340,81 @@ async fn connect_and_run(
     // into the mafold preamble each turn.
     let card_tags = available_card_tags(client).await;
 
-    while let Some(frame) = read.next().await {
-        let frame = match frame { Ok(f) => f, Err(e) => { eprintln!("ws error: {e}"); break; } };
-        let text = match frame.into_text() { Ok(t) => t, Err(_) => continue };
-        let env: serde_json::Value = match serde_json::from_str(&text) { Ok(v) => v, Err(_) => continue };
+    // Event-log cursor: the highest hub `seq` this daemon has processed,
+    // persisted per bot. The hello's head seq says how far behind we are; the
+    // gap is fetched via `getUpdates` into `replay`, consumed ahead of the
+    // socket — a message sent while the daemon was offline or mid-restart
+    // takes the normal arms below instead of vanishing (the socket only ever
+    // carries live frames).
+    let mut last_seq: u64 = load_cursor(my_username);
+    let mut last_cursor_save = std::time::Instant::now();
+    let mut replay: std::collections::VecDeque<serde_json::Value> = Default::default();
+
+    loop {
+        let env: serde_json::Value = match replay.pop_front() {
+            Some(v) => v,
+            None => {
+                let Some(frame) = read.next().await else { break };
+                let frame = match frame { Ok(f) => f, Err(e) => { eprintln!("ws error: {e}"); break; } };
+                let text = match frame.into_text() { Ok(t) => t, Err(_) => continue };
+                match serde_json::from_str(&text) { Ok(v) => v, Err(_) => continue }
+            }
+        };
         // React to new top-level messages AND thread replies (so the bot can be
         // @-mentioned inside a thread). `messageNew` carries the message at
         // `params`; `threadReply` nests it under `params.message`.
         let method = env.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        // ── Reconnect catch-up ───────────────────────────────────────────
+        // hello carries the server's head seq. Behind it → fetch the gap and
+        // replay it through the SAME arms live frames take (access gate,
+        // control commands, group gate, turn spawn). Ahead of it → the api
+        // restarted and its in-memory event log reset; re-anchor (that
+        // window is unrecoverable server-side).
+        if method == "events.hello" {
+            let head = env.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+            if last_seq == 0 || last_seq > head {
+                if last_seq > head {
+                    println!("⚠ cursor {last_seq} ahead of server head {head} — api restarted, re-anchoring");
+                }
+                last_seq = head;
+                save_cursor(my_username, last_seq);
+            } else if last_seq < head {
+                match client.get_updates(last_seq).await {
+                    Ok(items) => {
+                        // Replay message-bearing events (+ chatCleared) only:
+                        // a stale inline query / probe / push job must not
+                        // re-fire its side effects.
+                        let items: Vec<_> = items
+                            .into_iter()
+                            .filter(|u| matches!(
+                                u["method"].as_str().unwrap_or(""),
+                                "events.messageNew" | "events.threadReply" | "events.chatCleared"
+                            ))
+                            .collect();
+                        if !items.is_empty() {
+                            println!("↻ catch-up: replaying {} missed event(s) (seq {last_seq} → {head})", items.len());
+                        }
+                        replay.extend(items);
+                    }
+                    Err(e) => eprintln!("⚠ catch-up getUpdates failed: {e:#} — events in (seq {last_seq}, {head}] are lost to this daemon"),
+                }
+            }
+            continue;
+        }
+        // Every frame — live or replayed — advances the cursor. A live frame
+        // the replay already covered (it raced in while getUpdates ran) is a
+        // duplicate: drop it. Persist throttled; message frames pin the
+        // cursor right after their turn spawns (loop tail).
+        if let Some(s) = env.get("seq").and_then(|v| v.as_u64()) {
+            if s <= last_seq {
+                continue;
+            }
+            last_seq = s;
+            if last_cursor_save.elapsed() >= Duration::from_secs(2) {
+                save_cursor(my_username, last_seq);
+                last_cursor_save = std::time::Instant::now();
+            }
+        }
         // A new cli release was published (server got the GitHub webhook) → check +
         // apply NOW instead of waiting for the 10-min poll (which stays as backstop).
         // maybe_update is idle-gated, so it never interrupts a turn; on success it
@@ -1358,7 +1454,7 @@ async fn connect_and_run(
             if !has_turn(chat_states, &conv_id, msg_id.as_deref()).await {
                 continue;
             }
-            if allow.read().await.allows(&from, false) {
+            if allow.read().await.allows(&from, None) {
                 match &msg_id {
                     Some(mid) => { cancel_turn(chat_states, &conv_id, mid).await; }
                     None => { cancel_all(chat_states, &conv_id).await; }
@@ -1474,10 +1570,10 @@ async fn connect_and_run(
             _ => continue,
         };
         let m: IncomingMessage = match serde_json::from_value(raw_msg) { Ok(m) => m, Err(_) => continue };
-        // Our own echo: remember its id (so a reply to one of our messages
-        // re-engages us without an @-mention), then skip it (never reply to self).
+        // Our own echo → skip (never reply to self). Replies to our messages
+        // are recognized via the server-stamped `reply_to_sender`, so there's
+        // no recent-ids memory to feed.
         if m.sender.username.eq_ignore_ascii_case(my_username) {
-            bot_msg_ids.lock().unwrap().remember(&m.id);
             continue;
         }
         // Skip truly empty messages — but an image-only message (empty text +
@@ -1491,8 +1587,9 @@ async fn connect_and_run(
         // host code execution, so a message from a sender NOT on the allow-list
         // must NEVER drive a turn, answer a pending ask, relay a login code, or
         // run a control command. Enforced BEFORE every fast-path below and before
-        // the group @-mention gate. Owner / allow-listed only; bots never implicitly.
-        if !allow.read().await.allows(&m.sender.username, sender_is_bot) {
+        // the group @-mention gate. Owner / allow-listed only; an AI sender may
+        // also inherit its owner's listing (a2a, `.docs/a2a-v0.md` §2).
+        if !allow.read().await.allows(&m.sender.username, m.sender.parent_username.as_deref()) {
             // Non-whitelisted sender. If a HUMAN @-mentioned me (directed at me,
             // not just chatting) and isn't blacklisted, post an owner-gated
             // {% gate %} card as the reply — EVERY directed mention gets one
@@ -1520,7 +1617,7 @@ async fn connect_and_run(
                 // Say WHY it was dropped — a bare "ignored" made field reports
                 // ("the bot never replied") undiagnosable from the log.
                 let why = if is_blocked { "blacklisted" }
-                    else if sender_is_bot { "bot sender (whitelist a bot explicitly to allow it)" }
+                    else if sender_is_bot { "AI sender not allow-listed (whitelist the bot or its owner, or `*`, to allow it)" }
                     else { "didn't @-mention me" };
                 println!("← @{} (not authorized → ignored: {why})", m.sender.username);
             }
@@ -1632,16 +1729,20 @@ async fn connect_and_run(
 
         // A reply to one of the bot's own messages counts as engaging it (same as
         // an @-mention) — so you can just reply to Claude instead of @-ing it.
+        // Keyed on the server-stamped author of the replied-to message, so it
+        // holds across daemon restarts and for messages of any age (the old
+        // in-memory recent-ids set forgot every pre-restart message, silently
+        // dropping replies to them).
         let reply_to_me = m
-            .reply_to_id
+            .reply_to_sender
             .as_deref()
-            .map(|rid| bot_msg_ids.lock().unwrap().contains(rid))
+            .map(|s| s.eq_ignore_ascii_case(my_username))
             .unwrap_or(false);
 
         // Group reply gate: in a group, only answer when @-mentioned, replied-to,
         // or set always-on; DMs answer everything. (Control commands above already
         // ran, so `/stop` etc. still work without a mention.)
-        if !should_respond(client, &m.conversation_id, my_username, sender_is_bot, &m.content, reply_to_me, chat_states).await {
+        if !should_respond(client, &m.conversation_id, my_username, sender_is_bot, m.forwarded_from.is_some(), &m.content, reply_to_me, chat_states).await {
             println!("  (group/bot · not @{my_username} → skip)");
             continue;
         }
@@ -1664,6 +1765,8 @@ async fn connect_and_run(
         // The (lowercased) sender that triggered this turn — only they may answer
         // its AskUserQuestion (bound into the per-chat state by `handle`).
         let turn_sender = sender_lc.clone();
+        // Display-cased handle for the a2a frame line (built just before `handle`).
+        let sender_username = m.sender.username.clone();
         // If the trigger arrived in a thread, the bot replies into that thread.
         let thread_root = m.thread_root_id.clone();
         // If it arrived in a forum channel, the reply + context follow the channel.
@@ -1726,10 +1829,25 @@ async fn connect_and_run(
             // Rebuild multi-party group context the access gate dropped (None for
             // DMs / when there's nothing the resumed session is missing).
             let group_context = recent_group_context(&client, &chat_id, &me_user, &turn_sender, &trigger_id, thread_root.as_deref(), channel_id.as_deref()).await;
-            if let Err(e) = handle(&client, &turn_workdir, workdir_ns, &chat_id, thread_root.as_deref(), channel_id.as_deref(), &content, &attachments, &sessions, &coord, &chat_states, &harness, model, effort, thinking, system, &turn_sender, group_context).await {
+            // a2a: frame an AI-authored trigger so the model knows the peer is an
+            // authorized AI account and how the exchange terminates — an @ hands
+            // the mic back, no @ lets it end (`.docs/a2a-v0.md` §3). Prompt-only:
+            // `content` above stays pristine for the slash and ask-stamp paths.
+            let prompt = if sender_is_bot {
+                format!(
+                    "[该消息来自已授权的 AI 账户 @{sender_username}。直接回复即可;只有当你需要对方再回应时才 @ 他。若对话可以收尾,回复中不要 @ 任何 AI 账户。]\n{content}"
+                )
+            } else {
+                content
+            };
+            if let Err(e) = handle(&client, &turn_workdir, workdir_ns, &chat_id, thread_root.as_deref(), channel_id.as_deref(), &prompt, &attachments, &sessions, &coord, &chat_states, &harness, model, effort, thinking, system, &turn_sender, group_context).await {
                 eprintln!("handle error: {e}");
             }
         });
+        // Turn dispatched — pin the cursor so a crash-restart can't replay
+        // this message into a second turn.
+        save_cursor(my_username, last_seq);
+        last_cursor_save = std::time::Instant::now();
     }
     ping.abort();
     println!("disconnected.");
@@ -2402,11 +2520,35 @@ get a tap-to-answer choice here. The native AskUserQuestion tool also works (a h
 the same card) but can time out or be unavailable, so reach for the CARD first. Either way, never \
 make the user type \"1/2/3\" in prose when a tappable choice fits.\n\
 \n\nCONCURRENT SESSIONS: the owner often runs SEVERAL agent sessions for you at once (in different \
-conversations), plus background tasks that outlive a single turn. They run independently and keep \
-going on their own. If the user mentions \"the other session\" or work happening elsewhere, do NOT \
-assume it crashed, stalled, or was interrupted just because you can't see it from here — it is \
-almost certainly still running. Never claim a session or task is dead without direct evidence.",
+conversations). They run independently and keep going on their own. If the user mentions \"the other \
+session\" or work happening elsewhere, do NOT assume it crashed, stalled, or was interrupted just \
+because you can't see it from here — it is almost certainly still running. Never claim a SESSION is \
+dead without direct evidence.",
     );
+    // What actually survives a turn — stated per capability, never as a blanket
+    // claim. The old text promised that background tasks "outlive a single turn"
+    // and told the agent never to doubt it; where no detach story exists that is
+    // simply false, and it is what made the agent promise a follow-up report that
+    // no code path could ever deliver (the user then had to poke it). Keep this
+    // in lockstep with `bash_hook::bg_detach_supported` and the `{% bgtasks %}`
+    // emit gate — all three describe the same guarantee.
+    s.push_str(if crate::bash_hook::bg_detach_supported() {
+        "\n\nBACKGROUND WORK — WHAT SURVIVES A TURN: only a **Bash tool call with \
+run_in_background** does. A hook detaches it into its own session and the daemon re-opens the chat \
+with its results once it exits, so \"I'll report back when it finishes\" is a promise the system \
+will keep for you. NOTHING ELSE survives: Monitor watches, background Agent/Task runs and \
+background Workflows all die when this turn ends, and no completion notification will ever arrive. \
+Never promise to report back on one of those — run the work to completion in the foreground \
+instead, or hand it to a background Bash."
+    } else {
+        "\n\nBACKGROUND WORK — WHAT SURVIVES A TURN: **nothing does, on this machine.** Background \
+Bash tasks, Monitor watches, background Agent/Task runs and background Workflows are all killed \
+when this turn ends, and no completion notification will ever arrive. So NEVER say \"I'll report \
+back\", \"I'll let you know when it lands\", or arm a watcher and end the turn — that promise \
+cannot be kept and the user is left waiting. Run the work to completion in the FOREGROUND, even if \
+it means a long single turn; if it genuinely cannot finish in one turn, say so plainly and tell the \
+user to ask you again later."
+    });
     // Generic room mechanism (NOT any specific app). A conversation may have
     // mini-apps installed whose shared state lives in a co-edited CRDT "room";
     // the bot is a peer that can read and write it. Which apps/rooms exist is
@@ -2943,13 +3085,18 @@ async fn handle(
     let _ = client.finalize(&msg_id).await;
     println!("→ finalized reply for chat {chat_id}");
 
-    // Completion wakeup: the turn ended cleanly but left background shells
-    // running (they survive — nothing sweeps them any more). Watch for them to
-    // finish, then resume this session for a wrap-up reply — the `{% bgtasks %}`
-    // card's "结果会出现在下一条回复里" promise.
-    #[cfg(unix)]
+    // Completion wakeup: the turn ended cleanly but left DETACHED tasks running.
+    // Watch for them to finish, then resume this session for a wrap-up reply —
+    // the `{% bgtasks %}` card's "结果会出现在下一条回复里" promise.
+    //
+    // Gate on the REGISTRY, not on the shell count: `bg_shells` only counts that
+    // the model *asked* for a background Bash, which says nothing about whether
+    // the hook actually detached it. Arming on the count alone is how a turn
+    // whose hook never registered anything (no detach story on this platform, an
+    // older claude that ignores `updatedInput`, hook not installed) still showed
+    // the card and then silently stood down — a promise with nobody to keep it.
     if clean_end {
-        let shells = bg_shells.load(std::sync::atomic::Ordering::Relaxed);
+        let shells = bgtasks_snapshot(&conv_tag(chat_id)).len() as u64;
         if shells > 0 {
             // The reply that carries the `{% bgtasks %}` card, for live edits.
             let snapshot = final_md.lock().unwrap().clone();
@@ -2976,8 +3123,6 @@ async fn handle(
             );
         }
     }
-    #[cfg(not(unix))]
-    let _ = (clean_end, post_appended);
     Ok(())
 }
 
@@ -2989,7 +3134,6 @@ async fn handle(
 /// blip on the link to the api leaves the registration on disk for the next
 /// daemon restart's re-arm to retry. (Deleting on scan — before delivery — was
 /// the silent-loss bug: a failed wrap-up dropped the promise with no recovery.)
-#[cfg(unix)]
 fn bgtasks_scan(tag: &str) -> (usize, Vec<(PathBuf, String)>) {
     let mut live = 0usize;
     let mut finished: Vec<(PathBuf, String)> = vec![];
@@ -3021,7 +3165,6 @@ fn bgtasks_scan(tag: &str) -> (usize, Vec<(PathBuf, String)>) {
 /// Remove delivered tasks' registry files (`.pid` + sibling `.log`/`.sh`).
 /// Called ONLY after the wrap-up reply is confirmed sent, so an undelivered
 /// promise stays on disk for the next restart's re-arm.
-#[cfg(unix)]
 fn bgtasks_cleanup(pid_paths: &[PathBuf]) {
     for p in pid_paths {
         let _ = std::fs::remove_file(p);
@@ -3041,7 +3184,6 @@ fn conv_tag(chat_id: &str) -> String {
 
 /// One detached task's registry entry, snapshotted for the `{% bgtasks %}` card:
 /// what command runs, since when, whether it still lives, and its log tail.
-#[cfg(unix)]
 struct BgTask {
     started_ms: u64,
     running: bool,
@@ -3052,7 +3194,6 @@ struct BgTask {
 /// Drop ANSI escape sequences (CSI/OSC) and stray control chars from a log
 /// line — build/test output is full of color codes that would render as
 /// garbage inside the card.
-#[cfg(unix)]
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut it = s.chars().peekable();
@@ -3082,7 +3223,6 @@ fn strip_ansi(s: &str) -> String {
 
 /// Squash text to ONE display line for the card body (the `t|`/`o|` line
 /// encoding is newline-delimited) and keep markdoc inert (`{%` / `%}`).
-#[cfg(unix)]
 fn card_line(s: &str, max: usize) -> String {
     // Progress-bar lines rewrite themselves with `\r` — keep the last segment.
     let s = s.rsplit('\r').next().unwrap_or(s);
@@ -3099,7 +3239,6 @@ fn card_line(s: &str, max: usize) -> String {
 /// registered `.sh`, start time from the filename's nanosecond stamp, liveness
 /// from the pid probe, and the last few lines of the `.log`. Oldest first,
 /// capped at 8 (matches the card's own cap). Non-destructive.
-#[cfg(unix)]
 fn bgtasks_snapshot(tag: &str) -> Vec<BgTask> {
     const MAX_TASKS: usize = 8;
     const MAX_TAIL: usize = 6;
@@ -3163,8 +3302,15 @@ fn bgtasks_snapshot(tag: &str) -> Vec<BgTask> {
 /// newlines). Body lines: `t|<started_ms>|<running|done>|<command>` followed by
 /// that task's `o|<log line>` tail. Old cards ignore the body and keep showing
 /// the `n=` pill; the new card parses it into the expandable live view.
-#[cfg(unix)]
+///
+/// An EMPTY snapshot renders to an empty string, never a card. The card is a
+/// promise that a follow-up reply is coming, so "no registered task" must be
+/// structurally incapable of producing one — the `n = tasks.len().max(1)` floor
+/// below would otherwise turn an empty slice into a confident "1 task running".
 fn bgtasks_block(tasks: &[BgTask]) -> String {
+    if tasks.is_empty() {
+        return String::new();
+    }
     let live = tasks.iter().filter(|t| t.running).count();
     let n = if live > 0 { live } else { tasks.len().max(1) };
     let mut s = format!("{{% bgtasks n={n} %}}\n");
@@ -3187,7 +3333,6 @@ fn bgtasks_block(tasks: &[BgTask]) -> String {
 
 /// Replace the `{% bgtasks %}` occurrence in `content` (self-closing or
 /// container form) with `block`. None when the message carries no such card.
-#[cfg(unix)]
 fn splice_bgtasks(content: &str, block: &str) -> Option<String> {
     let open = content.find("{% bgtasks")?;
     let open_end = open + content[open..].find("%}")? + 2;
@@ -3221,7 +3366,6 @@ fn splice_bgtasks(content: &str, block: &str) -> Option<String> {
 /// is stamped done right before the wrap-up turn. None (restart re-arm, or a
 /// turn whose reply got post-finalize error appends) keeps the old static
 /// behavior: wake-up only, no live card.
-#[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn arm_bg_wakeup(
     client: Client,
@@ -3326,6 +3470,14 @@ fn arm_bg_wakeup(
             armed().lock().unwrap().remove(&key);
             live_slot().lock().unwrap().remove(&key);
             println!("⏳ background tasks in chat {chat_id} still running after 2h — wakeup abandoned");
+            // Say so IN THE CHAT, on the timeline that was promised. Giving up
+            // silently — with only a stdout line nobody sees — leaves the user
+            // waiting on a reply that is never coming.
+            let note = "⏳ 后台任务超过 2 小时仍未结束，我不再等待了。需要结果的话问我一声，\
+                        我去读它的日志。";
+            if let Err(e) = client.send_in(&chat_id, channel_id.as_deref(), note).await {
+                eprintln!("bgtasks: could not post the give-up notice: {e}");
+            }
             return;
         }
         println!("✓ background tasks finished — waking chat {chat_id} for the wrap-up reply");
@@ -3536,26 +3688,25 @@ async fn render_loop(
                 AgentEvent::Done { .. } => {
                     commit_buf!();
                     commit_group!();
-                    // Background shells outlive the turn (their completion
-                    // notification lands in the NEXT turn's session queue) —
-                    // leave a visible, EXPANDABLE trace instead of letting them
-                    // run invisibly (the 2026-07-18 watcher incident): the card
-                    // body carries each detached task's command, start time and
-                    // log tail, and the completion-wakeup monitor keeps it
-                    // fresh after finalize. Bare-tag fallback when the registry
-                    // has nothing (hook missed) or off-unix.
+                    // Detached tasks outlive the turn — leave a visible,
+                    // EXPANDABLE trace instead of letting them run invisibly
+                    // (the 2026-07-18 watcher incident): the card body carries
+                    // each task's command, start time and log tail, and the
+                    // completion-wakeup monitor keeps it fresh after finalize.
+                    //
+                    // THE CARD IS A PROMISE ("结果会出现在下一条回复里"), so it is
+                    // emitted ONLY when the registry proves a task was really
+                    // detached — the same condition `handle()` arms the monitor
+                    // on. The old bare-tag fallback made that promise whenever
+                    // the model merely ASKED for a background Bash, including
+                    // every case where nothing could keep it: no detach story on
+                    // this platform, an older claude that ignores `updatedInput`,
+                    // hook not installed. Silence beats a promise nobody holds.
                     if shells > 0 {
-                        #[cfg(unix)]
-                        {
-                            let snap = bgtasks_snapshot(&conv_tag(&chat_id));
-                            if snap.is_empty() {
-                                full.push_str(&format!("\n{{% bgtasks n={shells} /%}}\n"));
-                            } else {
-                                full.push_str(&format!("\n{}\n", bgtasks_block(&snap)));
-                            }
+                        let snap = bgtasks_snapshot(&conv_tag(&chat_id));
+                        if !snap.is_empty() {
+                            full.push_str(&format!("\n{}\n", bgtasks_block(&snap)));
                         }
-                        #[cfg(not(unix))]
-                        full.push_str(&format!("\n{{% bgtasks n={shells} /%}}\n"));
                     }
                     if let Some(s) = crate::render::render(&ev, &mut names) {
                         full.push_str(&s); // {% result %}
@@ -3610,9 +3761,26 @@ async fn render_loop(
 }
 
 #[cfg(test)]
-#[cfg(unix)]
 mod bgtasks_tests {
     use super::{bgtasks_block, card_line, splice_bgtasks, strip_ansi, BgTask};
+
+    /// The card is a PROMISE that a wrap-up reply is coming. No registered task
+    /// ⇒ nobody is watching ⇒ there must be no card. Pinned here because the
+    /// `n = len().max(1)` floor makes an empty slice look like "1 task running",
+    /// which is exactly the false promise this whole change removes.
+    #[test]
+    fn empty_snapshot_never_promises_a_reply() {
+        assert_eq!(bgtasks_block(&[]), "");
+        assert!(!bgtasks_block(&[]).contains("bgtasks"));
+    }
+
+    /// `bg_detach_supported()` is the single source of truth the system prompt
+    /// and the card gate both read; a platform that cannot detach must not be
+    /// told (or tell the user) that background work survives the turn.
+    #[test]
+    fn detach_capability_matches_the_hook() {
+        assert_eq!(crate::bash_hook::bg_detach_supported(), cfg!(unix));
+    }
 
     #[test]
     fn block_and_splice_container_form() {
@@ -3657,7 +3825,8 @@ mod bgtasks_tests {
 
 #[cfg(test)]
 mod gate_tests {
-    use super::{mentions_me, sanitize_attachment_name, AllowList};
+    use super::{mentions_me, sanitize_attachment_name, should_respond, AllowList, ChatStates};
+    use crate::client::Client;
     use std::collections::HashSet;
 
     #[test]
@@ -3711,43 +3880,79 @@ mod gate_tests {
     fn allowlist_owner_only_default() {
         let a = al(Some("ops"), &[], &[], false);
         // owner may drive (case/space/@-insensitive)
-        assert!(a.allows("ops", false));
-        assert!(a.allows("OPS", false));
-        assert!(a.allows("  @ops  ", false));
-        // anyone else is denied by default
-        assert!(!a.allows("mallory", false));
-        assert!(!a.allows("eve", true));
+        assert!(a.allows("ops", None));
+        assert!(a.allows("OPS", None));
+        assert!(a.allows("  @ops  ", None));
+        // anyone else is denied by default — someone else's bot too
+        assert!(!a.allows("mallory", None));
+        assert!(!a.allows("eve:bot", Some("eve")));
     }
 
     #[test]
     fn allowlist_whitelist_adds_users() {
         let a = al(Some("ops"), &["ada"], &[], false);
-        assert!(a.allows("ops", false)); // owner
-        assert!(a.allows("ada", false)); // whitelisted
-        assert!(!a.allows("bob", false));
+        assert!(a.allows("ops", None)); // owner
+        assert!(a.allows("ada", None)); // whitelisted
+        assert!(!a.allows("bob", None));
     }
 
     #[test]
-    fn allowlist_star_allows_anyone_but_not_bots() {
+    fn allowlist_star_allows_everyone() {
+        // `*` opens the bot to EVERYONE, AI senders included (owner decision
+        // 2026-07-27, `.docs/a2a-v0.md` §2).
         let a = al(Some("ops"), &[], &[], true);
-        assert!(a.allows("ops", false));
-        assert!(a.allows("anyone", false)); // `*` → any human
-        assert!(!a.allows("loopbot", true)); // but never a bot
-        // an explicitly-whitelisted bot still passes (owner opted it in)
-        let b = al(Some("ops"), &["trustedbot"], &[], true);
-        assert!(b.allows("trustedbot", true));
+        assert!(a.allows("ops", None));
+        assert!(a.allows("anyone", None));
+        assert!(a.allows("loopbot", Some("someone")));
+        // an explicitly-whitelisted bot passes with or without `*`
+        let b = al(Some("ops"), &["trustedbot"], &[], false);
+        assert!(b.allows("trustedbot", None));
+    }
+
+    #[test]
+    fn allowlist_parent_inheritance() {
+        // whitelisting a person whitelists their bots (trusting a person =
+        // trusting their automation)…
+        let a = al(Some("ops"), &["linsky"], &[], false);
+        assert!(a.allows("linsky:opus48", Some("linsky")));
+        assert!(a.allows("linsky:opus48", Some("  @Linsky "))); // normalized like usernames
+        assert!(!a.allows("stranger:bot", Some("stranger")));
+        // …and the owner's own bots ride the owner rung.
+        assert!(a.allows("ops:codex", Some("ops")));
+        // blacklisting a person blacklists their bots — deny wins even over `*`.
+        let b = al(Some("ops"), &[], &["mallory"], true);
+        assert!(!b.allows("mallory:bot", Some("mallory")));
+        // a bot blacklisted BY NAME is denied even when its owner is whitelisted;
+        // the owner themselves still passes.
+        let c = al(Some("ops"), &["linsky"], &["linsky:opus48"], false);
+        assert!(!c.allows("linsky:opus48", Some("linsky")));
+        assert!(c.allows("linsky", None));
+    }
+
+    #[tokio::test]
+    async fn a2a_gate_is_mention_only() {
+        // The AI-sender branch decides purely on content + forward flag, BEFORE
+        // any network await — a dead-URL client is never actually called.
+        let client = Client::new("http://127.0.0.1:1".into(), "dev:test".into());
+        let states: ChatStates = Default::default();
+        // an explicit @ in an authored message engages the bot…
+        assert!(should_respond(&client, "c1", "mybot", true, false, "hey @mybot look at this", false, &states).await);
+        // …a reply WITHOUT an @ does not (not @-ing back is the a2a terminator)…
+        assert!(!should_respond(&client, "c1", "mybot", true, false, "thanks, all done!", true, &states).await);
+        // …and a forwarded message's quoted @ isn't the sender addressing us.
+        assert!(!should_respond(&client, "c1", "mybot", true, true, "fwd: ping @mybot", false, &states).await);
     }
 
     #[test]
     fn allowlist_blacklist_denies() {
         // `*` open, but a blacklisted user is denied; deny wins over the whitelist.
         let a = al(Some("ops"), &["ada"], &["ada", "bob"], true);
-        assert!(a.allows("carol", false)); // open to anyone
-        assert!(!a.allows("bob", false)); // blacklisted
-        assert!(!a.allows("ada", false)); // blacklist beats whitelist
+        assert!(a.allows("carol", None)); // open to anyone
+        assert!(!a.allows("bob", None)); // blacklisted
+        assert!(!a.allows("ada", None)); // blacklist beats whitelist
         // the owner is immune to the blacklist (never self-lock-out).
         let b = al(Some("ops"), &[], &["ops"], false);
-        assert!(b.allows("ops", false));
+        assert!(b.allows("ops", None));
     }
 
     #[test]
@@ -3756,16 +3961,16 @@ mod gate_tests {
         // owner only. (Guard against a stray env var so the assert is meaningful.)
         if std::env::var("MAFOLD_ALLOWED_USERS").is_err() {
             let a = AllowList::build(Some("Owner"), &[], &[]);
-            assert!(a.allows("owner", false)); // lowercased
-            assert!(!a.allows("stranger", false));
+            assert!(a.allows("owner", None)); // lowercased
+            assert!(!a.allows("stranger", None));
             assert!(!a.anyone);
             // no owner + empty whitelist → nobody
             let none = AllowList::build(None, &[], &[]);
-            assert!(!none.allows("anyone", false));
-            // `*` in the whitelist opens it up
+            assert!(!none.allows("anyone", None));
+            // `*` in the whitelist opens it up — AI senders included
             let open = AllowList::build(Some("Owner"), &["*".to_string()], &[]);
-            assert!(open.allows("stranger", false));
-            assert!(!open.allows("stranger", true)); // still not bots
+            assert!(open.allows("stranger", None));
+            assert!(open.allows("strangebot", Some("stranger")));
         }
     }
 

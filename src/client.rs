@@ -85,6 +85,15 @@ impl Client {
         self.post("getChat", json!({ "chat_id": chat_id })).await
     }
 
+    /// POST /api/getUpdates — events with hub seq > `since` from the server's
+    /// per-account replay buffer (256 newest per account). Items are
+    /// `{seq, method, params}` in the exact shape WS frames arrive, so a
+    /// reconnect replays what it missed through the same handling path.
+    pub async fn get_updates(&self, since: u64) -> Result<Vec<Value>> {
+        let v = self.post("getUpdates", json!({ "since": since })).await?;
+        Ok(v["updates"].as_array().cloned().unwrap_or_default())
+    }
+
     /// Recent messages in a conversation (`{ items: [Message] }`). The access
     /// gate drops non-owner messages so they never reach claude's resumed
     /// session; for a group turn the daemon re-fetches history to rebuild the
