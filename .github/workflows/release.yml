@@ -1,0 +1,230 @@
+# mafold-cli release — this file RUNS IN THE PUBLIC REPO (mafold-lab/mafold-cli).
+#
+# Why here and not in the monorepo: GitHub-hosted STANDARD runners are free for
+# public repositories — no 10× macOS multiplier, no 2,000-minute quota, no
+# third-party runner bill. The monorepo now only mirrors source + pushes the
+# `v<X.Y.Z>` tag; the draft release, all four binaries and the publish flip all
+# happen here, on free runners. (Only *standard* labels are free — never switch
+# these to larger runners, those are billed even on public repos.)
+#
+# ⚠️ SSOT: this file lives in the MONOREPO at mafold-cli/.github/workflows/release.yml
+# and is mirrored into the public repo by .github/workflows/release-cli.yml.
+# Edit it in the monorepo — an edit made in the public repo is overwritten by
+# the next release.
+#
+# Layout: the mirror vendors the two private path-deps under crates/
+# (mafold-core → mafold-types) and rewrites the ONE path in Cargo.toml, so this
+# repo builds standalone. Do NOT run `cargo test` here: the core's
+# registry_matches_api_route_table pins the api route table with include_str!,
+# which resolves at COMPILE time and mafold-api is not mirrored — the test
+# target would fail to build. That pin belongs to the monorepo. `cargo build`
+# never compiles it.
+#
+# Secrets — set on THIS repo (Settings → Secrets → Actions). Fork PRs can never
+# read them, and this workflow has no pull_request trigger by design:
+#   MACOS_CERT_P12_BASE64 + MACOS_CERT_PASSWORD        REQUIRED — see build-mac
+#   MACOS_NOTARY_KEY_P8_BASE64 / _KEY_ID / _ISSUER_ID  optional (notarization)
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # Rescue path: re-build/re-upload assets for a tag that already exists.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing tag to (re)build, e.g. v0.9.70"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  # One creator → no matrix race. (A matrix that each create-if-missing once
+  # silently dropped an asset: v0.9.8 shipped without its linux binary.)
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure the release exists (draft)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Draft: fires no `published` webhook and stays out of /releases/latest
+          # until the publish job flips it with every asset attached.
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
+                 --title "$TAG" --notes "Automated release $TAG."
+
+  # ubuntu-latest is Ubuntu 24.04 / glibc 2.39 — the SAME floor as the node11
+  # box that used to build this, so the shipped binary's compatibility is
+  # unchanged. Never move this to an older image without re-checking that.
+  build-linux:
+    needs: draft
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-x86_64-unknown-linux-gnu
+      - run: cargo build --release --target x86_64-unknown-linux-gnu
+      - run: cp "target/x86_64-unknown-linux-gnu/release/mafold" "mafold-x86_64-unknown-linux-gnu"
+      - run: sha256sum "mafold-x86_64-unknown-linux-gnu" | awk '{print $1}' > "mafold-x86_64-unknown-linux-gnu.sha256"
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG" \
+            "mafold-x86_64-unknown-linux-gnu" \
+            "mafold-x86_64-unknown-linux-gnu.sha256" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+  # ONE macOS runner builds BOTH apple targets (arm64 native + x86_64 cross —
+  # first-class on macOS toolchains).
+  #
+  # Code signing (Developer ID) + notarization: an ADHOC-signed binary is keyed
+  # in macOS TCC by its cdhash, so every auto-update (new bytes) INVALIDATES a
+  # Full-Disk-Access grant and re-prompts the user. Signing with a stable
+  # Developer ID identity + a FIXED identifier gives TCC a durable "designated
+  # requirement" — the FDA grant then survives every update. Notarization keeps
+  # Gatekeeper happy on downloaded binaries.
+  build-mac:
+    needs: draft
+    runs-on: macos-latest
+    env:
+      # STABLE across ALL releases — TCC keys the FDA grant on (identifier +
+      # Team ID). NEVER change these or every user's grant breaks.
+      MAC_IDENTIFIER: com.mafold.cli
+      MAC_TEAM_ID: UGZPUZZYDD
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-mac
+      - name: Build both apple targets
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --target "$target"
+            cp "target/$target/release/mafold" "mafold-$target"
+          done
+      - name: Sign (Developer ID) + notarize
+        env:
+          CERT_P12:      ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PW:       ${{ secrets.MACOS_CERT_PASSWORD }}
+          NOTARY_P8:     ${{ secrets.MACOS_NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          # HARD FAIL, not a warning: shipping an adhoc binary silently breaks
+          # the Full-Disk-Access grant of every existing user. A release that
+          # can't sign must not happen at all.
+          if [ -z "${CERT_P12:-}" ]; then
+            echo "::error::MACOS_CERT_P12_BASE64 / MACOS_CERT_PASSWORD are not set on this repo. Signing is mandatory — an adhoc binary invalidates every user's Full Disk Access grant. Add the Developer ID secrets and re-run."
+            exit 1
+          fi
+          # Import the Developer ID cert into a throwaway keychain.
+          KC="$RUNNER_TEMP/mafold.keychain-db"; KCPW="$(uuidgen)"
+          security create-keychain -p "$KCPW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KCPW" "$KC"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$CERT_PW" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KCPW" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | sed s/\"//g)
+          IDENTITY="$(security find-identity -v -p codesigning "$KC" | grep 'Developer ID Application' | head -1 | grep -oE '[0-9A-F]{40}')"
+          echo "signing identity: $IDENTITY"
+          NOTARIZE=0
+          if [ -n "${NOTARY_P8:-}" ]; then echo "$NOTARY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"; NOTARIZE=1; fi
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            f="mafold-$target"
+            codesign --force --timestamp --options runtime \
+              --identifier "$MAC_IDENTIFIER" --sign "$IDENTITY" "$f"
+            codesign --verify --strict --verbose=2 "$f"
+            if [ "$NOTARIZE" = "1" ]; then
+              ditto -c -k --keepParent "$f" "$f.zip"   # notarytool needs an archive, not a bare Mach-O
+              xcrun notarytool submit "$f.zip" \
+                --key "$RUNNER_TEMP/notary.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" --wait
+              rm -f "$f.zip"   # can't staple a bare executable — Gatekeeper checks the ticket online
+            else
+              echo "::warning::notary secrets unset — signed but NOT notarized (Gatekeeper may warn on download; TCC/FDA still works from the Developer ID signature)."
+            fi
+          done
+      - name: Checksums (post-signing bytes)
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            shasum -a 256 "mafold-$target" | awk '{print $1}' > "mafold-$target.sha256"
+          done
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG" \
+            mafold-aarch64-apple-darwin mafold-aarch64-apple-darwin.sha256 \
+            mafold-x86_64-apple-darwin mafold-x86_64-apple-darwin.sha256 \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+  # The Windows binary is mafold.exe; the asset keeps the extension-less
+  # `mafold-<target>` name so the updater's lookup (mafold-{triple}) matches.
+  # bash (Git Bash) so cp/sha256sum/awk/gh work — default pwsh lacks them.
+  build-win:
+    needs: draft
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-x86_64-pc-windows-msvc
+      - run: cargo build --release --target x86_64-pc-windows-msvc
+      - run: cp "target/x86_64-pc-windows-msvc/release/mafold.exe" "mafold-x86_64-pc-windows-msvc"
+      - run: sha256sum "mafold-x86_64-pc-windows-msvc" | awk '{print $1}' > "mafold-x86_64-pc-windows-msvc.sha256"
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$TAG" \
+            "mafold-x86_64-pc-windows-msvc" \
+            "mafold-x86_64-pc-windows-msvc.sha256" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+  # Flip the draft live ONLY after every asset is uploaded, so the `release
+  # published` webhook (→ api /githubWebhook → events.cliUpdate → daemons
+  # auto-update) fires when the binaries actually exist.
+  publish:
+    needs: [build-linux, build-mac, build-win]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All eight assets present?
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          HAVE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | sort)"
+          for t in x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc; do
+            for f in "mafold-$t" "mafold-$t.sha256"; do
+              echo "$HAVE" | grep -qx "$f" || { echo "::error::missing asset $f — not publishing"; exit 1; }
+            done
+          done
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
