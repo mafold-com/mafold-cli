@@ -1,0 +1,80 @@
+[package]
+name = "mafold-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared local-first client core for Mafold. Decoupled: portable async logic over a `Storage` KV trait. native = SQLite (UniFFI → iOS/Android), web = IndexedDB (wasm-bindgen)."
+
+# wasm-pack runs `wasm-opt` after wasm-bindgen. Modern wasm-bindgen emits a
+# second table (reference types) that the wasm-opt bundled with wasm-pack
+# rejects in MVP mode ("Only 1 table definition allowed in MVP") — a toolchain
+# drift that randomly broke the web deploy (built fine, then failed minutes
+# later on identical code). This core is tiny, so skip wasm-opt: the lost size
+# optimization is negligible and the build stops being fragile.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+name = "mafold_core"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+futures = "0.3"
+# Shared wire/protocol model (same crate the backend re-exports as its `models`).
+# The core converts these server shapes → its FFI types (see wire.rs). Lean deps
+# (no uuid v4 / chrono clock) so it stays clean for both native + wasm.
+mafold-types = { path = "../mafold-types" }
+# Typed method params/results (methods.rs) use wire ids directly. Same lean
+# config as mafold-types: serde only, no v4/getrandom — wasm-clean.
+uuid = { version = "1", default-features = false, features = ["serde"] }
+
+# Native (iOS/Android): SQLite KV backend + UniFFI binding + a tiny block_on so
+# the UniFFI surface stays SYNCHRONOUS (callers unchanged) over the async core.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+uniffi = { version = "0.28", features = ["cli", "tokio"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+pollster = "0.3"
+# Shared-room CRDT engine (native/iOS). Same Automerge wire format as the web
+# automerge-wasm — convergence is by the change binary, not a shared core.
+automerge = "0.5"
+base64 = "0.22"
+# Sync engine: native HTTP (reqwest + a tokio runtime for the async UniFFI export).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+
+# Web: wasm-bindgen binding (async → JS Promises). IndexedDB Storage impl next;
+# for now the wasm build uses the in-memory backend to prove it compiles + runs.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+idb = "0.6"
+serde-wasm-bindgen = "0.6"
+gloo-net = { version = "0.6", default-features = false, features = ["http", "websocket"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+# Already in the tree via gloo-net; declared here only to turn on the abort
+# types, so a timed-out fetch is actually CANCELLED rather than left pending
+# for the life of the page (see net.rs `rpc_ex`).
+web-sys = { version = "0.3", features = ["AbortController", "AbortSignal"] }
+
+# ── test/bench-only ──
+# Benches are native-only; target-gating keeps criterion's native dep tree out
+# of `wasm-pack test` (which compiles dev-deps for wasm32).
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = "0.8"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+# tests/wasm.rs — runs in a headless browser (IdbStore needs real IndexedDB):
+#   wasm-pack test --headless --chrome -- --test wasm
+wasm-bindgen-test = "0.3"
+
+[[bench]]
+name = "core_benches"
+harness = false

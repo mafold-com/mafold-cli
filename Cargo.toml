@@ -1,6 +1,6 @@
 [package]
 name = "mafold-cli"
-version = "0.9.70"
+version = "0.9.71"
 edition = "2021"
 description = "Mafold from your terminal — a CLI client (chats / send) + a Claude Code agent daemon."
 license = "MIT"
@@ -14,7 +14,7 @@ path = "src/main.rs"
 # name typo dies locally, not as a server 404), typed methods over the
 # mafold-types wire model (re-exported), and the pooled HTTP client every other
 # client uses. Same-language consumer: no FFI, plain crate dep.
-mafold-core = { path = "../mafold-core" }
+mafold-core = { path = "crates/mafold-core" }
 uuid = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "io-util", "signal"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }

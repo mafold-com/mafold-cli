@@ -1,6 +1,6 @@
 //! `mafold channels` — manage a forum's channels from the CLI, so a bot (or a
 //! human with a token) can run its own group: list/create/rename/icon/close/
-//! pin/delete. Authority is the SERVER's, account-symmetric: managers always,
+//! pin/archive/delete. Authority is the SERVER's, account-symmetric: managers always,
 //! ordinary members when the forum's member-channels toggle is on, and a
 //! channel's creator may rename/close their own (Telegram parity).
 //!
@@ -37,6 +37,11 @@ pub enum ChannelsCmd {
     Pin { chat: String, channel: String },
     /// Unpin a channel.
     Unpin { chat: String, channel: String },
+    /// Archive a channel (out of the main list into the Archive drawer; it
+    /// stays writable — `close` is the read-only lock).
+    Archive { chat: String, channel: String },
+    /// Bring an archived channel back into the main list.
+    Unarchive { chat: String, channel: String },
     /// Delete a channel AND all its contents. Destructive — requires --yes.
     Delete {
         chat: String,
@@ -65,6 +70,9 @@ pub async fn run(cmd: ChannelsCmd, client: &Client) -> Result<()> {
                 }
                 if c["closed"].as_bool() == Some(true) {
                     marks.push("closed".into());
+                }
+                if c["archived"].as_bool() == Some(true) {
+                    marks.push("archived".into());
                 }
                 let unread = c["unread_count"].as_u64().unwrap_or(0);
                 if unread > 0 {
@@ -114,6 +122,16 @@ pub async fn run(cmd: ChannelsCmd, client: &Client) -> Result<()> {
             let (chat_id, ch) = resolve(client, &chat, &channel).await?;
             client.set_channel_pinned(&chat_id, &id(&ch)?, false).await?;
             println!("✓ unpinned #{}", ch["name"].as_str().unwrap_or("?"));
+        }
+        ChannelsCmd::Archive { chat, channel } => {
+            let (chat_id, ch) = resolve(client, &chat, &channel).await?;
+            client.set_channel_archived(&chat_id, &id(&ch)?, true).await?;
+            println!("✓ archived #{} (still writable; `unarchive` to bring it back)", ch["name"].as_str().unwrap_or("?"));
+        }
+        ChannelsCmd::Unarchive { chat, channel } => {
+            let (chat_id, ch) = resolve(client, &chat, &channel).await?;
+            client.set_channel_archived(&chat_id, &id(&ch)?, false).await?;
+            println!("✓ unarchived #{}", ch["name"].as_str().unwrap_or("?"));
         }
         ChannelsCmd::Delete { chat, channel, yes } => {
             let (chat_id, ch) = resolve(client, &chat, &channel).await?;

@@ -4,6 +4,12 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
+/// Tries for an idempotent write before giving up (400ms → 800ms → 1.6s → 3.2s:
+/// ~6s of cover). Sized for the failure actually observed — a short uplink blip
+/// / proxy TLS reset — not for a long outage, where the server-side stale-draft
+/// reaper (`mafold-api`'s presence sweep) is the backstop instead.
+const RETRY_ATTEMPTS: u32 = 5;
+
 /// Outcome of `me_probed`: the identity, or a definitive auth rejection.
 pub enum MeProbe {
     Me(Value),
@@ -46,6 +52,42 @@ impl Client {
             Ok(result) => serde_json::from_str(&result).with_context(|| format!("{method} returned non-JSON")),
             Err(e) => Err(anyhow::Error::new(e).context(format!("{method} failed"))),
         }
+    }
+
+    /// `post`, but retried with backoff on ANY transport failure — for calls
+    /// that are IDEMPOTENT, where a duplicate delivery is a no-op.
+    ///
+    /// The `is_connect_error` split below exists because a *non*-idempotent call
+    /// (botCreateDraft) can only be retried when the request provably never left
+    /// the machine. A full-snapshot write has no such constraint: replaying it
+    /// re-asserts the same final state. So these retry on timeouts and dropped
+    /// responses too — the failure modes that a connect-only retry misses and
+    /// that leave a turn's LAST push (the one that removes `{% generating %}`)
+    /// silently dropped, stranding the bubble mid-animation forever.
+    async fn post_idempotent(&self, method: &str, body: Value) -> Result<Value> {
+        let mut delay = std::time::Duration::from_millis(400);
+        for attempt in 1..=RETRY_ATTEMPTS {
+            match self.post(method, body.clone()).await {
+                Ok(v) => return Ok(v),
+                // An API-level rejection (permission, 404, malformed) is a verdict,
+                // not a blip: the server answered. Retrying just burns the backoff
+                // and hides the real error. Only transport failures get another go.
+                Err(e) if attempt == RETRY_ATTEMPTS || Self::is_api_error(&e) => return Err(e),
+                Err(e) => {
+                    eprintln!("{method} failed ({e}) — retry {attempt}/{RETRY_ATTEMPTS} in {delay:?}…");
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+            }
+        }
+        unreachable!("loop returns on the final attempt")
+    }
+
+    /// Did the SERVER answer with a refusal (as opposed to the request dying in
+    /// transit)? Such a call must not be retried — the answer won't change.
+    fn is_api_error(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<mafold_core::RpcError>()
+            .is_some_and(|re| matches!(re, mafold_core::RpcError::Api(_)))
     }
 
     /// Generic authenticated RPC for callers outside this module (login, report…).
@@ -156,6 +198,9 @@ impl Client {
     }
     pub async fn set_channel_pinned(&self, chat_id: &str, channel_id: &str, pinned: bool) -> Result<Value> {
         self.post("setChannelPinned", json!({ "chat_id": chat_id, "channel_id": channel_id, "pinned": pinned })).await
+    }
+    pub async fn set_channel_archived(&self, chat_id: &str, channel_id: &str, archived: bool) -> Result<Value> {
+        self.post("setChannelArchived", json!({ "chat_id": chat_id, "channel_id": channel_id, "archived": archived })).await
     }
 
     // ── shared-room CRDT relay (the AI's room peer; see room.rs) ──
@@ -328,12 +373,19 @@ impl Client {
     /// Replace a streaming draft's FULL content (Telegram `sendMessageDraft`
     /// style — each push is the complete snapshot, so we can rewrite earlier
     /// output, e.g. swap a trailing `{% generating %}` card for `{% result %}`).
+    ///
+    /// RETRIED (see `post_idempotent`): a snapshot write is idempotent, and the
+    /// final one of a turn is what takes the `{% generating %}` card away. Losing
+    /// it to a two-second uplink blip left the bubble animating forever with a
+    /// Stop button that could never resolve — the failure this retry exists for.
     pub async fn edit_draft(&self, message_id: &str, content: &str) -> Result<()> {
-        self.post("botEditDraft", json!({ "message_id": message_id, "content": content })).await?;
+        self.post_idempotent("botEditDraft", json!({ "message_id": message_id, "content": content })).await?;
         Ok(())
     }
+    /// RETRIED: finalizing an already-finalized message is a no-op server-side,
+    /// and an unfinalized draft is precisely the "forever generating" bubble.
     pub async fn finalize(&self, message_id: &str) -> Result<()> {
-        self.post("botFinalize", json!({ "message_id": message_id })).await?;
+        self.post_idempotent("botFinalize", json!({ "message_id": message_id })).await?;
         Ok(())
     }
 

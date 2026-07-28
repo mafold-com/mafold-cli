@@ -1,0 +1,6 @@
+/target
+Cargo.lock
+generated/
+generated-kotlin/
+headers/
+MafoldCoreFFI.xcframework/
