@@ -19,7 +19,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{Mutex, Notify, RwLock};
 
-use crate::client::Client;
+use crate::client::{Client, Dest};
 use crate::harness::{AgentEvent, Harness, Turn};
 
 #[derive(Deserialize)]
@@ -356,6 +356,9 @@ struct ChatState {
     /// that same sender may relay the pasted OAuth code (a shared-group bot must
     /// not let a bystander inject a code into someone else's sign-in).
     login_owner: Option<String>,
+    /// The forum channel `/login` was started in (None = `#all`) — the code-paste
+    /// acknowledgements answer there, not on the main timeline.
+    login_channel: Option<String>,
     /// In-flight turns, keyed by their draft message id. Concurrent turns coexist.
     turns: HashMap<String, TurnHandle>,
     /// Cached group-dispatch gate for this conversation (kind + always-on),
@@ -950,10 +953,12 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
 
     // Re-arm completion wakeups lost to a restart: detached background tasks
     // (bash-hook registry) run on across daemon restarts, but the armed monitor
-    // lived in the old process. Every conversation with leftover registrations
-    // — live OR finished-but-unreported — gets a fresh monitor (tag == chat id;
-    // uuids survive the sanitization unchanged). Config layering is skipped
-    // here (defaults); the wrap-up resumes an existing session anyway.
+    // lived in the old process. Every SURFACE with leftover registrations —
+    // live OR finished-but-unreported — gets a fresh monitor; the tag carries
+    // the conversation and (in a forum) the channel, so the wrap-up comes back
+    // on the timeline the task was started from instead of always on `#all`.
+    // Config layering is skipped here (defaults); the wrap-up resumes an
+    // existing session anyway.
     {
         let mut tags: HashMap<String, u64> = HashMap::new();
         if let Ok(home) = std::env::var("HOME") {
@@ -968,14 +973,15 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
         }
         let stopper = owner_username.clone().unwrap_or_else(|| my_username.clone());
         for (tag, n) in tags {
-            println!("↻ re-arming background-task wakeup for chat {tag} ({n} registration(s))");
+            let (conv, channel) = surface_split(&tag);
+            println!("↻ re-arming background-task wakeup for {tag} ({n} registration(s))");
             arm_bg_wakeup(
                 client.clone(),
                 workdir.clone(),
                 false,
-                tag,
+                conv,
                 None,
-                None,
+                channel,
                 sessions.clone(),
                 coord.clone(),
                 chat_states.clone(),
@@ -1653,7 +1659,10 @@ async fn connect_and_run(
             if !sender_is_bot && !is_blocked && mentions_me(&m.content, my_username) {
                 let content = format!("{{% gate user=\"{}\" msg=\"{}\" /%}}", m.sender.username, m.id);
                 match client
-                    .send_reply_in(&m.conversation_id, m.channel_id.as_deref(), &m.id, &content)
+                    .send_to(
+                        Dest::chat(&m.conversation_id).channel(m.channel_id.as_deref()).reply_to(&m.id),
+                        &content,
+                    )
                     .await
                 {
                     Ok(_) => {
@@ -1699,21 +1708,25 @@ async fn connect_and_run(
             let states = chat_states.lock().await;
             states.get(&m.conversation_id).and_then(|s| {
                 match (&s.login_code_tx, &s.login_owner) {
-                    (Some(tx), Some(o)) if *o == sender_lc => Some(tx.clone()),
+                    (Some(tx), Some(o)) if *o == sender_lc => Some((tx.clone(), s.login_channel.clone())),
                     _ => None,
                 }
             })
         };
-        if let Some(tx) = pending_login {
+        if let Some((tx, login_channel)) = pending_login {
+            // Answer where the sign-in is happening — the channel `/login` was
+            // started in, not wherever the code happened to be pasted.
+            let dest = Dest::chat(&m.conversation_id).channel(login_channel.as_deref());
             if trimmed.eq_ignore_ascii_case("/stop") || trimmed.eq_ignore_ascii_case("/cancel") {
                 if let Some(s) = chat_states.lock().await.get_mut(&m.conversation_id) {
                     s.login_code_tx = None;
                     s.login_owner = None;
+                    s.login_channel = None;
                 }
-                let _ = client.send(&m.conversation_id, "Cancelled sign-in.").await;
+                let _ = client.send_to(dest, "Cancelled sign-in.").await;
             } else {
                 let _ = tx.send(trimmed.to_string()).await;
-                let _ = client.send(&m.conversation_id, "🔑 Got the code — finishing sign-in…").await;
+                let _ = client.send_to(dest, "🔑 Got the code — finishing sign-in…").await;
             }
             continue;
         }
@@ -1759,9 +1772,14 @@ async fn connect_and_run(
             let name = it.next().unwrap_or("").to_lowercase();
             let arg = it.next().unwrap_or("").trim();
             if name == "login" {
-                let (client, chat_id, arg, chat_states, login_owner) =
-                    (client.clone(), m.conversation_id.clone(), arg.to_string(), chat_states.clone(), sender_lc.clone());
-                tokio::spawn(async move { login_flow(client, chat_id, arg, chat_states, login_owner).await; });
+                // The whole flow (link, code prompt, result) answers in the
+                // channel `/login` was typed in — it is a conversation, not a
+                // notice, and half of it landing in `#all` is unusable.
+                let (client, chat_id, channel, arg, chat_states, login_owner) = (
+                    client.clone(), m.conversation_id.clone(), m.channel_id.clone(),
+                    arg.to_string(), chat_states.clone(), sender_lc.clone(),
+                );
+                tokio::spawn(async move { login_flow(client, chat_id, channel, arg, chat_states, login_owner).await; });
                 continue;
             }
             if is_control(&name) {
@@ -1842,7 +1860,15 @@ async fn connect_and_run(
                 let name = it.next().unwrap_or("").to_lowercase();
                 let arg = it.next().unwrap_or("").trim();
                 match harness.command(&client, &chat_id, &name, arg, &workdir).await {
-                    crate::harness::CommandOutcome::Reply(text) => { let _ = client.send_threaded(&chat_id, &text, thread_root.as_deref()).await; return; }
+                    // Answer on the surface the command was typed on. This one
+                    // carried the thread but not the channel, so `/usage` asked
+                    // in #a came back in `#all` — the whole class of bug `Dest`
+                    // exists to end.
+                    crate::harness::CommandOutcome::Reply(text) => {
+                        let dest = Dest::chat(&chat_id).channel(channel_id.as_deref()).thread(thread_root.as_deref());
+                        let _ = client.send_to(dest, &text).await;
+                        return;
+                    }
                     crate::harness::CommandOutcome::Handled => return,
                     crate::harness::CommandOutcome::Forward => {}
                 }
@@ -1995,7 +2021,7 @@ async fn handle_control(
                 let mut s = sessions.lock().await;
                 if s.remove(&skey).is_some() { save_sessions(&s); }
             }
-            let _ = client.send_in(chat_id, channel_id, "🧹 Context cleared — starting fresh.").await;
+            let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), "🧹 Context cleared — starting fresh.").await;
         }
         "compact" => {
             // `/compact` runs Claude Code's own `/compact` on the resumed session —
@@ -2003,7 +2029,7 @@ async fn handle_control(
             // (thread rollout) and has no headless compaction verb, so a codex bot
             // must NOT spawn the `claude` binary here; tell the user instead.
             if harness.id() == "codex" {
-                let _ = client.send_in(chat_id, channel_id,
+                let _ = client.send_to(Dest::chat(chat_id).channel(channel_id),
                     "Codex manages its own context automatically — there's no `/compact` for it. Use `/clear` to start a fresh conversation when you want to reset.").await;
             } else {
                 // Genuinely compact this conversation's Claude session (summarize the
@@ -2019,7 +2045,7 @@ async fn handle_control(
             // on-disk transcripts. Codex (thread rollout) and Kimi (own home)
             // have nothing this could target.
             if harness.id() != "claude-code" {
-                let _ = client.send_in(chat_id, channel_id, "`/resume` is a Claude Code mechanic — this harness manages its own context. `/clear` starts fresh; otherwise the conversation already continues automatically.").await;
+                let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), "`/resume` is a Claude Code mechanic — this harness manages its own context. `/clear` starts fresh; otherwise the conversation already continues automatically.").await;
             } else {
                 let busy = {
                     let states = chat_states.lock().await;
@@ -2038,7 +2064,7 @@ async fn handle_control(
             // `/stop` stops EVERY in-flight turn in this conversation; each running
             // task finalizes its own draft with a stop notice.
             if cancel_all(chat_states, chat_id).await == 0 {
-                let _ = client.send_in(chat_id, channel_id, "Nothing is running right now.").await;
+                let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), "Nothing is running right now.").await;
             }
         }
         "model" => {
@@ -2047,13 +2073,13 @@ async fn handle_control(
             if arg.is_empty() {
                 let cur = st.model.clone().unwrap_or_else(|| "default".into());
                 let example = if harness.id() == "codex" { "gpt-5.6-sol" } else { "opus, sonnet, haiku" };
-                let _ = client.send_in(chat_id, channel_id, &format!("Model for this chat: {cur}\nSet with `/model <name>` (e.g. {example}) or `/model reset`.")).await;
+                let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), &format!("Model for this chat: {cur}\nSet with `/model <name>` (e.g. {example}) or `/model reset`.")).await;
             } else if arg.eq_ignore_ascii_case("reset") || arg.eq_ignore_ascii_case("default") {
                 st.model = None;
-                let _ = client.send_in(chat_id, channel_id, "Model reset to the agent default.").await;
+                let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), "Model reset to the agent default.").await;
             } else {
                 st.model = Some(arg.to_string());
-                let _ = client.send_in(chat_id, channel_id, &format!("Model for this chat set to `{arg}`.")).await;
+                let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), &format!("Model for this chat set to `{arg}`.")).await;
             }
         }
         "think" => {
@@ -2062,7 +2088,7 @@ async fn handle_control(
             // Reasoning effort — so accepting `/think` would set a value the codex
             // daemon silently ignores. Redirect instead.
             if harness.id() == "codex" {
-                let _ = client.send_in(chat_id, channel_id,
+                let _ = client.send_to(Dest::chat(chat_id).channel(channel_id),
                     "Codex has no per-chat thinking budget. Its reasoning depth is set by **Reasoning effort** (minimal/low/medium/high) in this bot's Customize sheet.").await;
                 return;
             }
@@ -2077,23 +2103,23 @@ async fn handle_control(
                     Some(n) => format!("on ({n} tokens)"),
                     None => "off".into(),
                 };
-                let _ = client.send_in(chat_id, channel_id, &format!("Extended thinking for this chat: {cur}\nSet with `/think on`, `/think off`, or `/think <tokens>` (e.g. `/think 20000`).")).await;
+                let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), &format!("Extended thinking for this chat: {cur}\nSet with `/think on`, `/think off`, or `/think <tokens>` (e.g. `/think 20000`).")).await;
             } else if a == "off" || a == "reset" || a == "false" || a == "0" {
                 st.thinking = None;
-                let _ = client.send_in(chat_id, channel_id, "Extended thinking turned off for this chat.").await;
+                let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), "Extended thinking turned off for this chat.").await;
             } else if a == "on" || a == "true" {
                 st.thinking = Some(DEFAULT_THINKING);
-                let _ = client.send_in(chat_id, channel_id, &format!("Extended thinking on ({DEFAULT_THINKING} tokens) for this chat.")).await;
+                let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), &format!("Extended thinking on ({DEFAULT_THINKING} tokens) for this chat.")).await;
             } else if let Ok(n) = a.parse::<u32>() {
                 if n == 0 {
                     st.thinking = None;
-                    let _ = client.send_in(chat_id, channel_id, "Extended thinking turned off for this chat.").await;
+                    let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), "Extended thinking turned off for this chat.").await;
                 } else {
                     st.thinking = Some(n);
-                    let _ = client.send_in(chat_id, channel_id, &format!("Extended thinking on ({n} tokens) for this chat.")).await;
+                    let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), &format!("Extended thinking on ({n} tokens) for this chat.")).await;
                 }
             } else {
-                let _ = client.send_in(chat_id, channel_id, "Usage: `/think on` · `/think off` · `/think <tokens>` (e.g. `/think 20000`).").await;
+                let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), "Usage: `/think on` · `/think off` · `/think <tokens>` (e.g. `/think 20000`).").await;
             }
         }
         "status" => {
@@ -2145,7 +2171,7 @@ async fn handle_control(
                 crate::commands::fmt_dur(uptime),
             ));
             let _ = client
-                .send_in(chat_id, channel_id, &format!("{{% stats title=\"Status\" icon=\"target\" %}}\n{body}{{% /stats %}}"))
+                .send_to(Dest::chat(chat_id).channel(channel_id), &format!("{{% stats title=\"Status\" icon=\"target\" %}}\n{body}{{% /stats %}}"))
                 .await;
         }
         "cwd" => {
@@ -2159,7 +2185,7 @@ async fn handle_control(
             } else {
                 format!("Working directory: {eff}")
             };
-            let _ = client.send_in(chat_id, channel_id, &text).await;
+            let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), &text).await;
         }
         "help" => {
             // Harness-aware: codex has no /compact, no /think, and its headless
@@ -2169,7 +2195,7 @@ async fn handle_control(
             } else {
                 "I'm a Claude Code agent running on this machine — message me a task and I keep context across the conversation.\n\nControl commands:\n• /clear (or /new) — start fresh\n• /compact — summarize the context to free up room (keeps continuity)\n• /resume [id|last] — pick up an earlier session, including ones open in a terminal (they carry over their live state)\n• /stop — stop the running reply\n• /model <name> — switch model for this chat\n• /think on|off|<tokens> — toggle extended thinking for this chat\n• /status · /cwd — agent info\n\nEverything else in the `/` menu is a Claude Code skill or command — tap one to run it."
             };
-            let _ = client.send_in(chat_id, channel_id, text).await;
+            let _ = client.send_to(Dest::chat(chat_id).channel(channel_id), text).await;
         }
         _ => {}
     }
@@ -2184,11 +2210,11 @@ async fn compact_session(client: Client, workdir: String, chat_id: String, skey:
     let prior = sessions.lock().await.get(&skey).cloned();
     let Some(sid) = prior else {
         let _ = client
-            .send_in(&chat_id, channel_id, "Nothing to compact yet — send me a task first, then /compact to summarize the context.")
+            .send_to(Dest::chat(&chat_id).channel(channel_id), "Nothing to compact yet — send me a task first, then /compact to summarize the context.")
             .await;
         return;
     };
-    let _ = client.send_in(&chat_id, channel_id, "🗜️ Compacting the conversation…").await;
+    let _ = client.send_to(Dest::chat(&chat_id).channel(channel_id), "🗜️ Compacting the conversation…").await;
     let mut cmd = tokio::process::Command::new("claude");
     cmd.arg("-p").arg("/compact")
         .arg("--resume").arg(&sid)
@@ -2219,11 +2245,11 @@ async fn compact_session(client: Client, workdir: String, chat_id: String, skey:
             if before == 0 {
                 // e.g. "Not enough messages to compact." — nothing meaningful freed.
                 let _ = client
-                    .send_in(&chat_id, channel_id, "Not much to compact yet — keep chatting, then /compact to summarize the context.")
+                    .send_to(Dest::chat(&chat_id).channel(channel_id), "Not much to compact yet — keep chatting, then /compact to summarize the context.")
                     .await;
             } else {
                 let card = format!("{{% compact before=\"{before}\" after=\"{after}\" /%}}");
-                let _ = client.send_in(&chat_id, channel_id, &card).await;
+                let _ = client.send_to(Dest::chat(&chat_id).channel(channel_id), &card).await;
             }
         }
         Ok(o) => {
@@ -2234,10 +2260,10 @@ async fn compact_session(client: Client, workdir: String, chat_id: String, skey:
             } else {
                 format!("Compaction failed — the context is unchanged.\n{err}")
             };
-            let _ = client.send_in(&chat_id, channel_id, &msg).await;
+            let _ = client.send_to(Dest::chat(&chat_id).channel(channel_id), &msg).await;
         }
         Err(e) => {
-            let _ = client.send_in(&chat_id, channel_id, &format!("Couldn't run compaction: {e}")).await;
+            let _ = client.send_to(Dest::chat(&chat_id).channel(channel_id), &format!("Couldn't run compaction: {e}")).await;
         }
     }
 }
@@ -2266,7 +2292,7 @@ async fn resume_session(client: Client, workdir: String, owner_cwd: Option<Strin
     let (dir, _) = resolve_turn_workdir(cc.cwd.as_deref(), owner_cwd.as_deref(), &workdir);
     let metas = list_project_sessions(&dir);
     if metas.is_empty() {
-        let _ = client.send_in(&chat_id, channel_id, &format!("No resumable sessions for `{dir}` yet — nothing under its Claude project dir.")).await;
+        let _ = client.send_to(Dest::chat(&chat_id).channel(channel_id), &format!("No resumable sessions for `{dir}` yet — nothing under its Claude project dir.")).await;
         return;
     }
     let live: HashMap<String, String> = live_tui_sessions().into_iter().filter(|l| l.cwd == dir).map(|l| (l.session_id, l.status)).collect();
@@ -2297,18 +2323,18 @@ async fn resume_session(client: Client, workdir: String, owner_cwd: Option<Strin
             out.push_str(&format!("_{} more in `{}` — `/resume <session-id>` (any unique prefix) also works._\n", metas.len() - 6, dir));
         }
         out.push_str("_🖥️ = open in a terminal right now; resuming forks from its latest state — everything from the TUI carries over, and the terminal keeps its own thread._");
-        let _ = client.send_in(&chat_id, channel_id, &out).await;
+        let _ = client.send_to(Dest::chat(&chat_id).channel(channel_id), &out).await;
         return;
     }
 
     let m = match resolve_session(&metas, a) {
         Resolve::One(m) => m,
         Resolve::NotFound => {
-            let _ = client.send_in(&chat_id, channel_id, &format!("No session matching `{a}` under `{dir}` — bare `/resume` lists them.")).await;
+            let _ = client.send_to(Dest::chat(&chat_id).channel(channel_id), &format!("No session matching `{a}` under `{dir}` — bare `/resume` lists them.")).await;
             return;
         }
         Resolve::Ambiguous(n) => {
-            let _ = client.send_in(&chat_id, channel_id, &format!("`{a}` matches {n} sessions — give a longer prefix (bare `/resume` lists them).")).await;
+            let _ = client.send_to(Dest::chat(&chat_id).channel(channel_id), &format!("`{a}` matches {n} sessions — give a longer prefix (bare `/resume` lists them).")).await;
             return;
         }
     };
@@ -2316,7 +2342,7 @@ async fn resume_session(client: Client, workdir: String, owner_cwd: Option<Strin
     let tui = live.get(&m.id).map(String::as_str);
     if current.as_deref() == Some(m.id.as_str()) {
         let extra = if tui.is_some() { " It's open in a TUI too — the next message picks up whatever happened there." } else { "" };
-        let _ = client.send_in(&chat_id, channel_id, &format!("`{id8}…` is already this chat's session.{extra}")).await;
+        let _ = client.send_to(Dest::chat(&chat_id).channel(channel_id), &format!("`{id8}…` is already this chat's session.{extra}")).await;
         return;
     }
     {
@@ -2343,16 +2369,26 @@ async fn resume_session(client: Client, workdir: String, owner_cwd: Option<Strin
             msg.push_str(&format!("\n(previous session `{p8}…` is set aside — `/resume {p8}` switches back)"));
         }
     }
-    let _ = client.send_in(&chat_id, channel_id, &msg).await;
+    let _ = client.send_to(Dest::chat(&chat_id).channel(channel_id), &msg).await;
 }
 
 /// Interactive `/login`: drive `claude auth login`, post the sign-in URL to the
 /// chat (host browser suppressed), then write the Authentication Code the user
 /// pastes back into the login process's stdin. Re-auths the agent's own `claude`.
-async fn login_flow(client: Client, chat_id: String, arg: String, chat_states: ChatStates, login_owner: String) {
+async fn login_flow(
+    client: Client,
+    chat_id: String,
+    // The channel `/login` was typed in — every message of the flow goes back
+    // there, and it is remembered in `ChatState` so the code-paste replies do too.
+    channel_id: Option<String>,
+    arg: String,
+    chat_states: ChatStates,
+    login_owner: String,
+) {
     use tokio::io::AsyncWriteExt;
+    let dest = || Dest::chat(&chat_id).channel(channel_id.as_deref());
     let mode = if arg.contains("console") { "--console" } else { "--claudeai" };
-    let _ = client.send(&chat_id, "🔐 Starting Anthropic sign-in… I'll post the link here; approve it, then paste the Authentication Code back to me. (This also re-authenticates the agent's own `claude`.)").await;
+    let _ = client.send_to(dest(), "🔐 Starting Anthropic sign-in… I'll post the link here; approve it, then paste the Authentication Code back to me. (This also re-authenticates the agent's own `claude`.)").await;
 
     // Suppress the host browser pop-up (macOS opens via `open <url>`): prepend a
     // no-op `open` to PATH + neutralize $BROWSER. COLUMNS keeps the URL unwrapped.
@@ -2376,7 +2412,7 @@ async fn login_flow(client: Client, chat_id: String, arg: String, chat_states: C
     crate::platform::no_window(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => { let _ = client.send(&chat_id, &format!("Couldn't start `claude auth login`: {e}")).await; return; }
+        Err(e) => { let _ = client.send_to(dest(), &format!("Couldn't start `claude auth login`: {e}")).await; return; }
     };
     let mut stdin = child.stdin.take();
 
@@ -2400,13 +2436,14 @@ async fn login_flow(client: Client, chat_id: String, arg: String, chat_states: C
         let st = states.entry(chat_id.clone()).or_default();
         st.login_code_tx = Some(code_tx);
         st.login_owner = Some(login_owner.clone());
+        st.login_channel = channel_id.clone();
     }
 
     // Phase 1: read output until we find + post the sign-in URL (60s budget).
     let post_url = async {
         while let Some(line) = rx.recv().await {
             if let Some(url) = extract_auth_url(&crate::commands::strip_ansi(&line)) {
-                let _ = client.send(&chat_id, &format!("🔗 Open this to sign in (any device works):\n{url}\n\nAfter you approve, paste the Authentication Code here.")).await;
+                let _ = client.send_to(dest(), &format!("🔗 Open this to sign in (any device works):\n{url}\n\nAfter you approve, paste the Authentication Code here.")).await;
                 return true;
             }
         }
@@ -2415,7 +2452,7 @@ async fn login_flow(client: Client, chat_id: String, arg: String, chat_states: C
     if !tokio::time::timeout(Duration::from_secs(60), post_url).await.unwrap_or(false) {
         let _ = child.start_kill();
         clear_login(&chat_states, &chat_id).await;
-        let _ = client.send(&chat_id, "Couldn't get a sign-in link — this environment may need a TTY. Run `claude auth login` on the host.").await;
+        let _ = client.send_to(dest(), "Couldn't get a sign-in link — this environment may need a TTY. Run `claude auth login` on the host.").await;
         return;
     }
 
@@ -2432,7 +2469,7 @@ async fn login_flow(client: Client, chat_id: String, arg: String, chat_states: C
         Err(_) => {
             let _ = child.start_kill();
             clear_login(&chat_states, &chat_id).await;
-            let _ = client.send(&chat_id, "Sign-in timed out — no code within 5 min. Try `/login` again.").await;
+            let _ = client.send_to(dest(), "Sign-in timed out — no code within 5 min. Try `/login` again.").await;
             return;
         }
     }
@@ -2443,9 +2480,9 @@ async fn login_flow(client: Client, chat_id: String, arg: String, chat_states: C
     clear_login(&chat_states, &chat_id).await;
     if ok {
         let status = crate::commands::auth_status_line().await;
-        let _ = client.send(&chat_id, &format!("✓ Signed in.{}", if status.is_empty() { String::new() } else { format!(" {status}") })).await;
+        let _ = client.send_to(dest(), &format!("✓ Signed in.{}", if status.is_empty() { String::new() } else { format!(" {status}") })).await;
     } else {
-        let _ = client.send(&chat_id, "Sign-in didn't complete — the code may have been wrong or expired. Try `/login` again.").await;
+        let _ = client.send_to(dest(), "Sign-in didn't complete — the code may have been wrong or expired. Try `/login` again.").await;
     }
 }
 
@@ -2453,6 +2490,7 @@ async fn clear_login(chat_states: &ChatStates, chat_id: &str) {
     if let Some(s) = chat_states.lock().await.get_mut(chat_id) {
         s.login_code_tx = None;
         s.login_owner = None;
+        s.login_channel = None;
     }
 }
 
@@ -2891,6 +2929,10 @@ async fn handle(
         session_key(chat_id, channel_id)
     };
     let prior = sessions.lock().await.get(&skey).cloned();
+    // The surface this turn runs on — same (conversation, channel) pair the
+    // session is keyed at. Exported to the agent so any background task it
+    // detaches is registered here and reported back HERE (see `surface_tag`).
+    let surface = surface_tag(chat_id, channel_id);
 
     // Per-turn answer file for the AskUserQuestion hook (unique → never stale).
     let ask_file = {
@@ -2927,6 +2969,7 @@ async fn handle(
         // (relying on it still being queued in the session lost it sometimes).
         prompt: full_prompt.clone(),
         conv: chat_id.to_string(),
+        surface: surface.clone(),
         workdir: workdir.to_string(),
         session: prior.clone(),
         // Cloned (not moved): the empty-turn retry below rebuilds a Turn from
@@ -2957,7 +3000,8 @@ async fn handle(
         let ask_file = ask_file.clone();
         let bg_shells = bg_shells.clone();
         let final_md = final_md.clone();
-        tokio::spawn(render_loop(ev_rx, client, msg_id, chat_states, chat_id, ask_file, bg_shells, final_md))
+        let surface = surface.clone();
+        tokio::spawn(render_loop(ev_rx, client, msg_id, chat_states, chat_id, surface, ask_file, bg_shells, final_md))
     };
 
     let mut result = harness.run(turn, ev_tx).await;
@@ -3005,7 +3049,8 @@ async fn handle(
                 let ask_file = ask_file.clone();
                 let bg_shells = bg_shells.clone();
                 let final_md = final_md.clone();
-                tokio::spawn(render_loop(ev_rx2, client, msg_id, chat_states, chat_id, ask_file, bg_shells, final_md))
+                let surface = surface.clone();
+                tokio::spawn(render_loop(ev_rx2, client, msg_id, chat_states, chat_id, surface, ask_file, bg_shells, final_md))
             };
             let retry = Turn {
                 // Re-carry the user's message VERBATIM: the first attempt's
@@ -3019,6 +3064,7 @@ async fn handle(
                      is repeated below; answer it now.)\n\n{full_prompt}"
                 ),
                 conv: chat_id.to_string(),
+                surface: surface.clone(),
                 workdir: workdir.to_string(),
                 session,
                 model: model.clone(),
@@ -3074,11 +3120,13 @@ async fn handle(
             let ask_file = ask_file.clone();
             let bg_shells = bg_shells.clone();
             let final_md = final_md.clone();
-            tokio::spawn(render_loop(ev_rx3, client, msg_id, chat_states, chat_id, ask_file, bg_shells, final_md))
+            let surface = surface.clone();
+            tokio::spawn(render_loop(ev_rx3, client, msg_id, chat_states, chat_id, surface, ask_file, bg_shells, final_md))
         };
         let fresh = Turn {
             prompt: full_prompt.clone(),
             conv: chat_id.to_string(),
+            surface: surface.clone(),
             workdir: workdir.to_string(),
             session: None, // ← FRESH: no --resume, so the corrupt session can't poison it
             model: model.clone(),
@@ -3160,7 +3208,7 @@ async fn handle(
     // older claude that ignores `updatedInput`, hook not installed) still showed
     // the card and then silently stood down — a promise with nobody to keep it.
     if clean_end {
-        let shells = bgtasks_snapshot(&conv_tag(chat_id)).len() as u64;
+        let shells = bgtasks_snapshot(&surface).len() as u64;
         if shells > 0 {
             // The reply that carries the `{% bgtasks %}` card, for live edits.
             let snapshot = final_md.lock().unwrap().clone();
@@ -3237,13 +3285,40 @@ fn bgtasks_cleanup(pid_paths: &[PathBuf]) {
     }
 }
 
-/// The `~/.mafold/bgtasks` registry key for a conversation — MUST mirror
-/// `bash_hook`'s sanitization of `MAFOLD_CONV` (uuids pass through unchanged).
-fn conv_tag(chat_id: &str) -> String {
-    chat_id
-        .chars()
+/// The `~/.mafold/bgtasks` registry key for a SURFACE — the conversation, plus
+/// the forum channel when the turn runs in one. Exported to the agent as
+/// `MAFOLD_SURFACE`, which `bash_hook` writes its registrations under, so the
+/// two sides always agree (uuids pass the sanitization through unchanged).
+///
+/// Why the channel belongs in the key: the registry is what a completion
+/// monitor scans to decide "my tasks are done, wake the chat". Keyed by
+/// conversation alone, #b's monitor collected #a's finished tasks, fired ITS
+/// wrap-up turn (in #b, resuming #b's session) reporting #a's logs, and then
+/// deleted the registrations #a's own monitor was still waiting on. One
+/// registry per surface makes that impossible by construction rather than by
+/// filtering after the fact. The granularity deliberately matches
+/// `session_key` — the wrap-up resumes that surface's harness session, so
+/// splitting any finer would put two turns on one session.
+fn surface_tag(chat_id: &str, channel_id: Option<&str>) -> String {
+    let raw = match channel_id {
+        Some(ch) => format!("{chat_id}__{ch}"),
+        None => chat_id.to_string(),
+    };
+    raw.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
         .collect()
+}
+
+/// Inverse of `surface_tag`, for the restart re-arm: it only has the filenames
+/// left on disk and must put each wrap-up back on the timeline the task was
+/// started from. A legacy conversation-only registration (written before the
+/// channel joined the key) splits to `(conv, None)` and lands on `#all`, which
+/// is exactly where those tasks used to report.
+fn surface_split(tag: &str) -> (String, Option<String>) {
+    match tag.split_once("__") {
+        Some((conv, ch)) => (conv.to_string(), Some(ch.to_string())),
+        None => (tag.to_string(), None),
+    }
 }
 
 /// One detached task's registry entry, snapshotted for the `{% bgtasks %}` card:
@@ -3463,16 +3538,20 @@ fn arm_bg_wakeup(
     static LIVE: OnceLock<StdMutex<HashMap<String, Vec<(String, String)>>>> = OnceLock::new();
     let armed = || ARMED.get_or_init(|| StdMutex::new(HashSet::new()));
     let live_slot = || LIVE.get_or_init(|| StdMutex::new(HashMap::new()));
-    let key = format!("{chat_id}#{}@{workdir}", channel_id.as_deref().unwrap_or(""));
+    // Registry tag — the surface this turn ran on (conv + forum channel), the
+    // same key `bash_hook` registered its detached tasks under.
+    let tag = surface_tag(&chat_id, channel_id.as_deref());
+    // The monitor key IS the registry key (plus the workdir, which can differ
+    // per chat): one monitor per registry, so two monitors can never race for
+    // the same registrations.
+    let key = format!("{tag}@{workdir}");
     if let Some(lm) = live_msg {
         live_slot().lock().unwrap().entry(key.clone()).or_default().push(lm);
     }
     if !armed().lock().unwrap().insert(key.clone()) {
         return; // rides the existing monitor (which now edits this reply too)
     }
-    // Registry tag — MUST mirror bash_hook's sanitization of MAFOLD_CONV.
-    let tag = conv_tag(&chat_id);
-    println!("⏳ {shells} background task(s) outlive the turn in chat {chat_id} — wakeup armed");
+    println!("⏳ {shells} background task(s) outlive the turn in {tag} — wakeup armed");
     tokio::spawn(async move {
         // Wait until EVERY detached task for this chat has exited (10s cadence,
         // 2h cap). The scan is non-destructive now, so `finished` is collected
@@ -3539,7 +3618,7 @@ fn arm_bg_wakeup(
             // waiting on a reply that is never coming.
             let note = "⏳ 后台任务超过 2 小时仍未结束，我不再等待了。需要结果的话问我一声，\
                         我去读它的日志。";
-            if let Err(e) = client.send_in(&chat_id, channel_id.as_deref(), note).await {
+            if let Err(e) = client.send_to(Dest::chat(&chat_id).channel(channel_id.as_deref()), note).await {
                 eprintln!("bgtasks: could not post the give-up notice: {e}");
             }
             return;
@@ -3607,6 +3686,10 @@ async fn render_loop(
     msg_id: String,
     chat_states: ChatStates,
     chat_id: String,
+    // The `~/.mafold/bgtasks` registry key for THIS turn's surface (conv +
+    // forum channel) — the `{% bgtasks %}` card must list this channel's
+    // detached tasks, not every task in the conversation.
+    surface: String,
     ask_file: String,
     // Out-param: background shells started this turn — `handle()` reads it
     // after the renderer exits to decide whether to arm the completion-wakeup
@@ -3767,7 +3850,7 @@ async fn render_loop(
                     // this platform, an older claude that ignores `updatedInput`,
                     // hook not installed. Silence beats a promise nobody holds.
                     if shells > 0 {
-                        let snap = bgtasks_snapshot(&conv_tag(&chat_id));
+                        let snap = bgtasks_snapshot(&surface);
                         if !snap.is_empty() {
                             full.push_str(&format!("\n{}\n", bgtasks_block(&snap)));
                         }
@@ -3822,6 +3905,55 @@ async fn render_loop(
     commit_group!();
     let _ = client.edit_draft(&msg_id, &full).await;
     *final_md.lock().unwrap() = full;
+}
+
+#[cfg(test)]
+mod surface_tag_tests {
+    use super::{surface_split, surface_tag};
+
+    /// The `#all` main timeline keeps the bare conversation id — registrations
+    /// written by an older hook (conversation-only) stay readable.
+    #[test]
+    fn main_timeline_is_the_bare_conversation() {
+        let conv = "72355ef4-c43f-44ba-a0d5-b2c061026cd6";
+        assert_eq!(surface_tag(conv, None), conv);
+        assert_eq!(surface_split(conv), (conv.to_string(), None));
+    }
+
+    /// THE BUG: two channels of one conversation must not share a registry.
+    /// `bgtasks_scan` matches on the `{tag}.` prefix, so #all's prefix must not
+    /// swallow a channel's files either.
+    #[test]
+    fn channels_get_their_own_registry() {
+        let conv = "72355ef4-c43f-44ba-a0d5-b2c061026cd6";
+        let (a, b) = ("11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222");
+        let ta = surface_tag(conv, Some(a));
+        let tb = surface_tag(conv, Some(b));
+        assert_ne!(ta, tb);
+        assert!(!ta.starts_with(&format!("{conv}.")), "a channel's file must not match #all's prefix");
+        assert!(!tb.starts_with(&ta), "one channel's prefix must not swallow another's");
+        assert_eq!(surface_split(&ta), (conv.to_string(), Some(a.to_string())));
+    }
+
+    /// The restart re-arm only has filenames to go on: whatever the hook wrote
+    /// must split back into the timeline the wrap-up has to be posted on.
+    #[test]
+    fn split_is_the_inverse_of_tag() {
+        let conv = "conv-1";
+        for ch in [None, Some("chan-9")] {
+            let (c, k) = surface_split(&surface_tag(conv, ch));
+            assert_eq!((c.as_str(), k.as_deref()), (conv, ch));
+        }
+    }
+
+    /// Sanitization must survive the join — the hook writes `{tag}.{ts}.pid`,
+    /// so a tag containing a `.` would break the filename split both ways.
+    #[test]
+    fn odd_ids_are_sanitized_and_still_split() {
+        let t = surface_tag("a.b/c", Some("d.e"));
+        assert!(!t.contains('.') && !t.contains('/'));
+        assert_eq!(surface_split(&t), ("a_b_c".to_string(), Some("d_e".to_string())));
+    }
 }
 
 #[cfg(test)]

@@ -27,7 +27,7 @@ impl Harness for ClaudeCode {
     }
 
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
-        let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, conv } = turn;
+        let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, conv, surface } = turn;
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");
         }
@@ -54,6 +54,10 @@ impl Harness for ClaudeCode {
         // via the room skill) defaults to THIS room. Per-turn (not a global env)
         // because concurrent turns run different conversations.
         cmd.env("MAFOLD_CONV", &conv);
+        // The surface (conv + forum channel) the reply lands on — the bash-hook
+        // registers detached background tasks under it, so their wrap-up turn
+        // comes back to THIS channel instead of leaking into another one.
+        cmd.env("MAFOLD_SURFACE", &surface);
         // Extended thinking: a non-zero budget makes the model think before each
         // reply (streamed as `thinking` blocks). No env = Claude Code's default.
         if let Some(budget) = thinking {

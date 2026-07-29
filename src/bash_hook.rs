@@ -68,10 +68,17 @@ fn detach(v: &Value, ti: &Value) -> Option<String> {
     std::fs::create_dir_all(&dir).ok()?;
     sweep_old(&dir);
 
-    // Same registry key the daemon scans for (agent::bgtasks_scan): the
-    // conversation id claude was launched with, sanitized identically.
-    let tag: String = std::env::var("MAFOLD_CONV")
-        .unwrap_or_else(|_| "untagged".into())
+    // Same registry key the daemon scans for (agent::bgtasks_scan): the SURFACE
+    // claude was launched on — the conversation plus, in a forum, the channel
+    // (`agent::surface_tag`). Keying by conversation alone let a task started in
+    // #a be collected by #b's completion monitor, which then reported #a's logs
+    // into #b (and deleted the registration #a was waiting on). Falls back to
+    // the bare conversation for an older daemon that doesn't export it.
+    let tag: String = std::env::var("MAFOLD_SURFACE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("MAFOLD_CONV").ok())
+        .unwrap_or_else(|| "untagged".into())
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
         .collect();

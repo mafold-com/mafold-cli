@@ -29,7 +29,7 @@ mod wallet;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use client::Client;
+use client::{Client, Dest};
 
 #[derive(Parser)]
 #[command(name = "mafold", version, about = "Mafold from your terminal — CLI client + coding-agent daemon (Claude Code, Codex, …)")]
@@ -473,12 +473,12 @@ async fn send(client: &Client, chat: &str, channel: Option<&str>, text: &str) ->
         Some(ch) => {
             let (chat_id, ch) = channels::resolve(client, chat, ch).await?;
             let name = ch["name"].as_str().unwrap_or("?");
-            client.send_in(&chat_id, ch["id"].as_str(), text).await?;
+            client.send_to(Dest::chat(&chat_id).channel(ch["id"].as_str()), text).await?;
             println!("✓ sent to {chat} #{name}");
         }
         None => {
             let chat_id = client.resolve_chat(chat).await?;
-            client.send(&chat_id, text).await?;
+            client.send_to(Dest::chat(&chat_id), text).await?;
             println!("✓ sent to {chat}");
         }
     }

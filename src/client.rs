@@ -16,6 +16,47 @@ pub enum MeProbe {
     AuthRejected,
 }
 
+/// Where a message goes. In a forum the conversation is only HALF an address:
+/// the channel, the thread it hangs under and the message it answers each narrow
+/// it further, and every one of them is part of "reply where you were asked".
+/// Carrying them in one value — built from the triggering message and passed
+/// down — is what keeps a reply on the surface it belongs to; the four
+/// half-addressed send helpers this replaced each dropped whatever they had no
+/// parameter for (see `Client::send_to`).
+#[derive(Clone, Copy, Default)]
+pub struct Dest<'a> {
+    pub chat_id: &'a str,
+    /// The forum channel; None = the `#all` main timeline.
+    pub channel_id: Option<&'a str>,
+    /// The thread root this message hangs under; None = the timeline itself.
+    pub thread_root_id: Option<&'a str>,
+    /// The message being answered (renders as a quote), if any.
+    pub reply_to_message_id: Option<&'a str>,
+}
+
+impl<'a> Dest<'a> {
+    /// A conversation's main timeline — narrow it with the builders below.
+    pub fn chat(chat_id: &'a str) -> Self {
+        Self { chat_id, ..Default::default() }
+    }
+    /// …in this forum channel (None = `#all`).
+    pub fn channel(mut self, channel_id: Option<&'a str>) -> Self {
+        self.channel_id = channel_id;
+        self
+    }
+    /// …under this thread root (None = the timeline itself). Any message in the
+    /// thread works; the server normalizes it to the root.
+    pub fn thread(mut self, thread_root_id: Option<&'a str>) -> Self {
+        self.thread_root_id = thread_root_id;
+        self
+    }
+    /// …as a reply to this message.
+    pub fn reply_to(mut self, message_id: &'a str) -> Self {
+        self.reply_to_message_id = Some(message_id);
+        self
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
     pub http: reqwest::Client,
@@ -228,49 +269,30 @@ impl Client {
         self.post("getBot", json!({ "username": username })).await
     }
 
-    pub async fn send(&self, chat_id: &str, text: &str) -> Result<Value> {
-        self.send_threaded(chat_id, text, None).await
-    }
-
-    /// Send a message, optionally as a Slack-style thread reply under
-    /// `thread_root_id` (any message in the thread; the server normalizes it).
-    pub async fn send_threaded(&self, chat_id: &str, text: &str, thread_root_id: Option<&str>) -> Result<Value> {
-        let mut body = json!({ "chat_id": chat_id, "text": text });
-        if let Some(root) = thread_root_id {
+    /// Post a message at `dest` — THE send path.
+    ///
+    /// Every dimension the destination carries goes on the wire, so "answer
+    /// where you were asked" is what a call site gets by default. This used to
+    /// be four overlapping helpers (`send` / `send_threaded` / `send_in` /
+    /// `send_reply_in`), each carrying only part of the address: picking one
+    /// silently dropped whatever it had no parameter for, which is how `/usage`
+    /// asked in #a kept answering in `#all`. A single destination-complete call
+    /// makes that a compile-time impossibility rather than a review item.
+    ///
+    /// Go through this, never a hand-rolled body: a hand-written gate payload
+    /// used conversation_id/content/reply_to_id instead of the API's
+    /// chat_id/text/reply_to_message_id and silently 422'd for three releases
+    /// (0.9.56→0.9.63; diagnosed in the field by @linsky:opus48).
+    pub async fn send_to(&self, dest: Dest<'_>, text: &str) -> Result<Value> {
+        let mut body = json!({ "chat_id": dest.chat_id, "text": text });
+        if let Some(ch) = dest.channel_id {
+            body["channel_id"] = json!(ch);
+        }
+        if let Some(root) = dest.thread_root_id {
             body["thread_root_id"] = json!(root);
         }
-        self.post("sendMessage", body).await
-    }
-
-    /// Send into a forum channel (None = the `#all` main timeline) — control
-    /// replies (/clear, /status, …) must answer in the channel they were asked in.
-    pub async fn send_in(&self, chat_id: &str, channel_id: Option<&str>, text: &str) -> Result<Value> {
-        let mut body = json!({ "chat_id": chat_id, "text": text });
-        if let Some(ch) = channel_id {
-            body["channel_id"] = json!(ch);
-        }
-        self.post("sendMessage", body).await
-    }
-
-    /// Send into a channel as a REPLY to a specific message (the access-gate
-    /// card path). Go through a helper, never a hand-rolled body: a hand-written
-    /// gate payload used conversation_id/content/reply_to_id instead of the
-    /// API's chat_id/text/reply_to_message_id and silently 422'd for three
-    /// releases (0.9.56→0.9.63; diagnosed in the field by @linsky:opus48).
-    pub async fn send_reply_in(
-        &self,
-        chat_id: &str,
-        channel_id: Option<&str>,
-        reply_to_message_id: &str,
-        text: &str,
-    ) -> Result<Value> {
-        let mut body = json!({
-            "chat_id": chat_id,
-            "text": text,
-            "reply_to_message_id": reply_to_message_id,
-        });
-        if let Some(ch) = channel_id {
-            body["channel_id"] = json!(ch);
+        if let Some(rid) = dest.reply_to_message_id {
+            body["reply_to_message_id"] = json!(rid);
         }
         self.post("sendMessage", body).await
     }

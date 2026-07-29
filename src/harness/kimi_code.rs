@@ -49,7 +49,9 @@ impl Harness for KimiCode {
 
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
         // `effort` (Kimi has no reasoning tiers) and `ask_file` (no AskUserQuestion
-        // PreToolUse hook) don't apply — accepted and ignored.
+        // PreToolUse hook) don't apply — accepted and ignored. `surface` likewise:
+        // the bash-hook that detaches background tasks is only wired for Claude
+        // Code, so nothing here registers any.
         let Turn {
             prompt,
             workdir,
@@ -61,6 +63,7 @@ impl Harness for KimiCode {
             system,
             ask_file: _,
             conv,
+            surface: _,
         } = turn;
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");

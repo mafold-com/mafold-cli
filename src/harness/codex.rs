@@ -43,7 +43,9 @@ impl Harness for Codex {
 
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
         // `thinking` and `ask_file` don't apply to Codex (no extended-thinking
-        // budget; no AskUserQuestion tool / PreToolUse hook) — accepted and ignored.
+        // budget; no AskUserQuestion tool / PreToolUse hook) — accepted and
+        // ignored. `surface` likewise: the bash-hook that detaches background
+        // tasks is only wired for Claude Code, so nothing here registers any.
         let Turn {
             prompt,
             workdir,
@@ -55,6 +57,7 @@ impl Harness for Codex {
             system,
             ask_file: _,
             conv,
+            surface: _,
         } = turn;
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");

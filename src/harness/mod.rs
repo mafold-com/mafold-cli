@@ -90,6 +90,13 @@ pub struct Turn {
     /// The conversation id this turn runs in — exported to the agent's process
     /// env as `MAFOLD_CONV` so `mafold room …` (the room skill) targets it.
     pub conv: String,
+    /// The SURFACE this turn runs on: the conversation plus, in a forum, the
+    /// channel (`agent::surface_tag`). Exported as `MAFOLD_SURFACE` and used by
+    /// the bash-hook as the `~/.mafold/bgtasks` registry key, so a background
+    /// task detached in #a is never picked up by #b's completion monitor — it
+    /// is the same granularity the harness session is keyed at, which is why
+    /// the wrap-up turn can safely resume that session.
+    pub surface: String,
     pub workdir: String,
     /// The harness's prior session id for this conversation, to resume context.
     pub session: Option<String>,
