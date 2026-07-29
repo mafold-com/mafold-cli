@@ -258,6 +258,18 @@ fn mafold_home() -> PathBuf {
 }
 
 /// Ensure a usable esbuild binary exists, fetching it once to ~/.mafold/bin.
+///
+/// Concurrency-safe: several `mafold cards publish` processes routinely run at
+/// once (the cards pipeline publishes the whole set in parallel), and on a cold
+/// machine they all miss the cache together. Every process therefore stages its
+/// download in a PRIVATE directory, chmods there, and only then renames into
+/// place — an atomic swap on the same filesystem. Losers of the race just
+/// overwrite with identical bytes.
+///
+/// The previous version shared one staging path, chmodded only after the rename,
+/// and deleted the staging dir at the end — so racing processes hit
+/// `Text file busy` (exec'ing a file another process still had open for writing)
+/// and `No such file or directory` (their extracted file removed underneath).
 pub(crate) async fn ensure_esbuild() -> Result<PathBuf> {
     let bin = mafold_home().join("bin").join("esbuild");
     if bin.exists() {
@@ -265,42 +277,56 @@ pub(crate) async fn ensure_esbuild() -> Result<PathBuf> {
     }
     let plat = esbuild_platform().context("no esbuild build for this platform")?;
     let dir = bin.parent().unwrap().to_path_buf();
-    std::fs::create_dir_all(&dir)?;
+    // Private per-process staging area; nothing here is shared with a sibling.
+    let stage = dir.join(format!(".esbuild-stage-{}", std::process::id()));
+    std::fs::create_dir_all(&stage)?;
+    // Best-effort cleanup on every exit path below.
+    let cleanup = |stage: &Path| {
+        let _ = std::fs::remove_dir_all(stage);
+    };
 
     let url = format!("https://registry.npmjs.org/@esbuild/{plat}/-/{plat}-{ESBUILD_VERSION}.tgz");
     eprintln!("→ fetching esbuild {ESBUILD_VERSION} ({plat})…");
-    let bytes = reqwest::Client::new()
-        .get(&url)
-        .header("User-Agent", "mafold-cli")
-        .send()
-        .await?
-        .error_for_status()
-        .context("esbuild download failed")?
-        .bytes()
-        .await?;
+    let fetched = async {
+        let bytes = reqwest::Client::new()
+            .get(&url)
+            .header("User-Agent", "mafold-cli")
+            .send()
+            .await?
+            .error_for_status()
+            .context("esbuild download failed")?
+            .bytes()
+            .await?;
 
-    let tgz = dir.join("esbuild.tgz");
-    std::fs::write(&tgz, &bytes)?;
-    // The npm tarball stores the binary at package/bin/esbuild.
-    let status = std::process::Command::new("tar")
-        .arg("-xzf")
-        .arg(&tgz)
-        .arg("-C")
-        .arg(&dir)
-        .arg("package/bin/esbuild")
-        .status()
-        .context("tar not found — install tar or esbuild manually")?;
-    if !status.success() {
-        anyhow::bail!("failed to extract esbuild");
+        let tgz = stage.join("esbuild.tgz");
+        std::fs::write(&tgz, &bytes)?;
+        // The npm tarball stores the binary at package/bin/esbuild.
+        let status = std::process::Command::new("tar")
+            .arg("-xzf")
+            .arg(&tgz)
+            .arg("-C")
+            .arg(&stage)
+            .arg("package/bin/esbuild")
+            .status()
+            .context("tar not found — install tar or esbuild manually")?;
+        if !status.success() {
+            anyhow::bail!("failed to extract esbuild");
+        }
+        let staged = stage.join("package/bin/esbuild");
+        // chmod BEFORE publishing it: once the rename lands, a sibling may exec
+        // it immediately.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+        }
+        std::fs::rename(&staged, &bin)?;
+        Ok::<(), anyhow::Error>(())
     }
-    std::fs::rename(dir.join("package/bin/esbuild"), &bin)?;
-    let _ = std::fs::remove_dir_all(dir.join("package"));
-    let _ = std::fs::remove_file(&tgz);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))?;
-    }
+    .await;
+
+    cleanup(&stage);
+    fetched?;
     Ok(bin)
 }
 

@@ -127,8 +127,10 @@ pub struct Conversation {
     /// back to "any participant can manage", preserving prior behaviour).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
-    /// Lowercased usernames the owner has promoted to admin. An admin has every
-    /// owner power EXCEPT `transferGroupOwner` and `disbandGroup` (owner-only).
+    /// Lowercased usernames the owner has promoted to admin. An admin runs the
+    /// group day to day; `transferGroupOwner`, `disbandGroup` and
+    /// `setGroupAdmin` stay owner-only, so admins can't appoint, demote or kick
+    /// each other.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub admins: Vec<String>,
     /// Disbanded: retired group — no sends, no management, but the conversation

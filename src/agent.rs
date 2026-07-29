@@ -425,19 +425,31 @@ struct ConvGate {
     at: std::time::Instant,
 }
 
-/// True if the bot's own @handle appears in the text (word-boundary `@`, then a
-/// username with optional `:namespace`). Mirrors the server's mention rule, so a
-/// daemon bot fires on the same mentions an internal brain would.
+/// True if a byte can appear INSIDE an @handle (alphanum, `_`, `-`, `:` for the
+/// namespace separator). Anything else ends the handle — and, before an `@`,
+/// marks a mention boundary. Note a multi-byte char (CJK, emoji) is never one of
+/// these, so its trailing byte counts as a boundary: `帮我看看@ops:claude` fires.
+fn is_handle_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'-' || c == b':'
+}
+
+/// True if the bot's own @handle appears in the text (an `@` that isn't glued to
+/// another handle, then a username with optional `:namespace`). Mirrors the
+/// server's `extract_mentions`, so a daemon bot fires on the same mentions an
+/// internal brain would. The boundary is "the previous byte isn't a handle
+/// byte", NOT "the previous byte is whitespace" — the whitespace rule silently
+/// dropped the two ways people actually write mentions: right after CJK text
+/// (`帮我看看@ops:claude`) and back-to-back handles (`@a@ops:claude`), so
+/// server-side brains answered and daemon bots stayed mute in the same message.
 fn mentions_me(text: &str, my_username: &str) -> bool {
     let me = my_username.to_lowercase();
     let b = text.as_bytes();
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'@' && (i == 0 || b[i - 1].is_ascii_whitespace()) {
+        if b[i] == b'@' && (i == 0 || !is_handle_byte(b[i - 1])) {
             let mut j = i + 1;
-            while j < b.len() {
-                let c = b[j];
-                if c.is_ascii_alphanumeric() || c == b'_' || c == b':' || c == b'-' { j += 1; } else { break; }
+            while j < b.len() && is_handle_byte(b[j]) {
+                j += 1;
             }
             if j > i + 1 && text[i + 1..j].eq_ignore_ascii_case(&me) {
                 return true;
@@ -4004,14 +4016,22 @@ mod gate_tests {
 
     #[test]
     fn mention_matching() {
-        // fires: word-boundary @ + full handle (case-insensitive)
+        // fires: boundary @ + full handle (case-insensitive)
         assert!(mentions_me("hey @ops:claude can you help", "ops:claude"));
         assert!(mentions_me("@ops:claude", "ops:claude"));
         assert!(mentions_me("yo @OPS:CLAUDE", "ops:claude"));
         assert!(mentions_me("a @x then @ops:claude", "ops:claude"));
         assert!(mentions_me("plain @ada too", "ada"));
+        // fires: straight after CJK — Chinese writing types no space before "@",
+        // so this is the COMMON case. It used to be dropped here while the
+        // server's brains answered the very same message ("@了三个只来两个").
+        assert!(mentions_me("帮我看看@ops:claude", "ops:claude"));
+        assert!(mentions_me("看看这个bug，@ops:claude", "ops:claude"));
+        // fires: punctuation is a boundary too
+        assert!(mentions_me("(@ops:claude)", "ops:claude"));
+        assert!(mentions_me("cc @ops:claude, 看下", "ops:claude"));
         // does NOT fire
-        assert!(!mentions_me("mail me at a@ops:claude.com", "ops:claude")); // not a boundary
+        assert!(!mentions_me("mail me at a@ops:claude.com", "ops:claude")); // @ glued to a handle
         assert!(!mentions_me("ping @claude", "ops:claude"));                 // partial ≠ full handle
         assert!(!mentions_me("just chatting, no mention", "ops:claude"));
         assert!(!mentions_me("@opsclaudex", "ops:claude"));                  // longer handle ≠
