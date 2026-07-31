@@ -1556,6 +1556,33 @@ async fn connect_and_run(
             }
             continue;
         }
+        // In-card refresh: re-run the card's own command and rewrite THAT message,
+        // so the card updates under the finger instead of a second one appearing
+        // below it. The command re-executes in full — there is no separate refresh
+        // path that could drift from the one that produced the card.
+        if method == "events.cardRefresh" {
+            let conv_id = env["params"]["conversation_id"].as_str().unwrap_or("").to_string();
+            let msg_id = env["params"]["message_id"].as_str().unwrap_or("").to_string();
+            let from = env["params"]["from"].as_str().unwrap_or("").to_string();
+            let command = env["params"]["command"].as_str().unwrap_or("").to_string();
+            // Same gate as every other tap that makes this daemon do work.
+            if !allow.read().await.allows(&from, None) { continue; }
+            let Some(rest) = command.trim().strip_prefix('/') else { continue };
+            let mut it = rest.splitn(2, char::is_whitespace);
+            let name = it.next().unwrap_or("").to_lowercase();
+            let arg = it.next().unwrap_or("").trim().to_string();
+            let (client, harness, workdir) = (client.clone(), harness.clone(), workdir.to_string());
+            let sessions = sessions.clone();
+            tokio::spawn(async move {
+                let session = sessions.lock().await.get(&conv_id).cloned();
+                if let crate::harness::CommandOutcome::Reply(text) =
+                    harness.command(&client, &conv_id, &name, &arg, &workdir, session.as_deref()).await
+                {
+                    let _ = client.edit_draft(&msg_id, &text).await;
+                }
+            });
+            continue;
+        }
         // Inline query: the user is typing `@me …` (not sent yet). The API relays
         // it here and waits briefly for an answer; we reply with card(s)/results
         // via answerInlineQuery. Spawned so a slow handler never stalls the loop.
