@@ -375,6 +375,12 @@ struct Agg {
     longest_sess: i64,
     /// Earliest activity, ISO — the card's "since".
     first_iso: String,
+    /// Today's assistant turns, and how many ran with >150k of input-side
+    /// context. Replaces the ">N% of your usage was at >150k context" line the
+    /// prose `/usage` used to give us — the structured endpoint carries limits
+    /// but no behaviour profile, and we see every turn's usage anyway.
+    today_turns: u64,
+    today_big_ctx: u64,
 }
 
 impl Agg {
@@ -393,6 +399,8 @@ impl Agg {
         if !o.first_iso.is_empty() && (self.first_iso.is_empty() || o.first_iso < self.first_iso) {
             self.first_iso = o.first_iso;
         }
+        self.today_turns += o.today_turns;
+        self.today_big_ctx += o.today_big_ctx;
     }
     fn tokens_io(&self) -> u64 { self.models.values().map(|b| b.io()).sum() }
     fn cost(&self) -> f64 { self.models.iter().map(|(m, b)| bucket_cost(m, b)).sum() }
@@ -414,6 +422,7 @@ impl Agg {
 fn scan_transcripts(files: &[PathBuf], since_day: Option<i64>) -> Agg {
     use std::collections::HashMap;
     let since = since_day.unwrap_or(i64::MIN);
+    let today = today_epoch_day();
     let mut agg = Agg::default();
     let mut sess_first: HashMap<String, i64> = HashMap::new();
     let mut sess_span: HashMap<String, (i64, i64)> = HashMap::new();
@@ -468,6 +477,11 @@ fn scan_transcripts(files: &[PathBuf], since_day: Option<i64>) -> Agg {
             if b.any() {
                 if let Some(model) = m["model"].as_str() {
                     agg.models.entry(short_model(model)).or_default().merge(&b);
+                }
+                if day == today {
+                    agg.today_turns += 1;
+                    // Input side only — output doesn't sit in the context window.
+                    if b.input + b.cache_read + b.cache_write > 150_000 { agg.today_big_ctx += 1; }
                 }
             }
             if let Some(content) = m["content"].as_array() {
@@ -685,10 +699,19 @@ fn stats(limits_body: &str, workdir: &str, session: Option<&str>) -> String {
     for (m, tok) in &models {
         body.push_str(&format!("model|{}|{}|{}\n", m, humanize(*tok), tok));
     }
-    // Behavior key-values (plan, request windows, top skills/subagents/MCP) last.
+    // Behavior key-values (plan, updated-at) last, plus today's context profile —
+    // the structured limits endpoint carries no behaviour data, so this is
+    // derived from the transcripts we already walked.
     for l in limits_body.lines().filter(|l| l.starts_with("kv|")) {
         body.push_str(l);
         body.push('\n');
+    }
+    if agg.today_turns > 0 {
+        body.push_str(&format!(
+            "kv|Today|{} turns · {}% at >150k ctx\n",
+            agg.today_turns,
+            agg.today_big_ctx * 100 / agg.today_turns,
+        ));
     }
 
     format!(
@@ -700,12 +723,140 @@ fn stats(limits_body: &str, workdir: &str, session: Option<&str>) -> String {
 
 // ───────────────────────── rate limits (live) ─────────────────────────
 
-/// Fetch the subscription rate-limit report by piping `/usage` into a headless
-/// `claude -p` (~3.5s) and parse it into card body lines. The percentages exist
-/// NOWHERE on disk — this spawn is the only programmatic source. Best-effort:
-/// any failure/timeout/format drift returns "" and the card simply omits the
-/// limits section.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Claude Code's OAuth access token, from wherever the platform keeps it:
+/// `~/.claude/.credentials.json` on Linux/Windows, the login Keychain on macOS.
+///
+/// None when it is missing, unreadable, or already expired. We deliberately do
+/// NOT use the refresh token — minting credentials is Claude Code's job, and an
+/// expired one simply drops us to the cached copy on the next line.
+fn oauth_token() -> Option<String> {
+    let raw = match std::fs::read_to_string(home().join(".claude/.credentials.json")) {
+        Ok(s) => s,
+        Err(_) => {
+            if !cfg!(target_os = "macos") { return None; }
+            let out = std::process::Command::new("security")
+                .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+                .output().ok()?;
+            if !out.status.success() { return None; }
+            String::from_utf8(out.stdout).ok()?
+        }
+    };
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    let o = &v["claudeAiOauth"];
+    match o["expiresAt"].as_i64() {
+        Some(exp) if exp <= now_ms() => return None,
+        _ => {}
+    }
+    o["accessToken"].as_str().map(str::to_string)
+}
+
+/// `GET /api/oauth/usage` — the exact request Claude Code makes to refresh its
+/// own `cachedUsageUtilization` (its bundle: `fetchUtilization: GET
+/// /api/oauth/usage`, 5s timeout).
+///
+/// Measured at 0.70–0.93s, versus 5.32s to shell out to `claude -p /usage` —
+/// and unlike the spawn it starts no session and burns no quota, which matters
+/// because that spawn was measuring the thing by consuming it. None on any
+/// failure, so the caller falls through to the cache.
+async fn fetch_utilization_live() -> Option<serde_json::Value> {
+    let token = oauth_token()?;
+    let res = reqwest::Client::new()
+        .get("https://api.anthropic.com/api/oauth/usage")
+        .bearer_auth(token)
+        .header("Content-Type", "application/json")
+        .timeout(Duration::from_secs(5))
+        .send().await.ok()?;
+    if !res.status().is_success() { return None; }
+    res.json::<serde_json::Value>().await.ok()
+}
+
+/// Claude Code's cached copy of the same payload, plus its age in seconds.
+/// Instant, but it only refreshes when a Claude Code process starts — measured
+/// 14 minutes stale while sitting inside one long turn.
+fn cached_utilization() -> Option<(serde_json::Value, i64)> {
+    let raw = std::fs::read_to_string(home().join(".claude.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let c = &v["cachedUsageUtilization"];
+    let age = (now_ms() - c["fetchedAtMs"].as_i64()?) / 1000;
+    Some((c["utilization"].clone(), age.max(0)))
+}
+
+/// The plan's rate-limit tier as a label: `default_claude_max_20x` → "Max (20x)".
+/// (`seatTier` and `userRateLimitTier` sit next to it and are both null — this is
+/// the field that actually carries the tier.)
+fn plan_tier() -> Option<String> {
+    let raw = std::fs::read_to_string(home().join(".claude.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let t = v["oauthAccount"]["organizationRateLimitTier"].as_str()?;
+    let t = t.strip_prefix("default_").unwrap_or(t);
+    let t = t.strip_prefix("claude_").unwrap_or(t);
+    Some(match t.split_once('_') {
+        Some((base, mult)) if mult.ends_with('x') => format!("{} ({mult})", cap_first(base)),
+        _ => cap_first(t),
+    })
+}
+
+/// Render the structured utilization payload into `limit|`/`kv|` card lines.
+///
+/// `limits[]` is already exactly the three rows the UI wants — no prose to scrape:
+/// `{kind, percent, severity, resets_at, scope.model.display_name, is_active}`.
+/// Reset times are rendered RELATIVE ("resets in 4h 44m"): the payload is UTC and
+/// we have no timezone database, and it reads better anyway — it's how Claude's
+/// own panel puts it.
+fn parse_utilization(util: &serde_json::Value, age_secs: i64) -> String {
+    let now = now_ms() / 1000;
+    let mut out = String::new();
+    for l in util["limits"].as_array().into_iter().flatten() {
+        let Some(pct) = l["percent"].as_f64() else { continue };
+        let label = match l["kind"].as_str().unwrap_or("") {
+            "session" => "Session".to_string(),
+            "weekly_all" => "Week (all models)".to_string(),
+            "weekly_scoped" => format!(
+                "Week ({})",
+                l["scope"]["model"]["display_name"].as_str().unwrap_or("scoped"),
+            ),
+            other => cap_first(&other.replace('_', " ")),
+        };
+        let note = match l["resets_at"].as_str().and_then(iso_epoch_secs) {
+            Some(at) if at > now => format!("resets in {}", fmt_dur(at - now)),
+            _ if pct == 0.0 => "not used yet".to_string(),
+            _ => String::new(),
+        };
+        out.push_str(&format!("limit|{label}|{}|{note}\n", pct.round() as i64));
+    }
+    if out.is_empty() { return String::new(); }
+    if let Some(p) = plan_tier() { out.push_str(&format!("kv|Plan|{p}\n")); }
+    out.push_str(&format!(
+        "kv|Updated|{}\n",
+        if age_secs < 45 { "just now".to_string() } else { format!("{} ago", fmt_dur(age_secs)) },
+    ));
+    out
+}
+
+/// The subscription rate-limit rows, cheapest live source first.
+///
+/// 1. `/api/oauth/usage` (~0.8s, live, no quota) — the same call Claude Code makes.
+/// 2. Its on-disk cache (instant, up to ~15min stale) — labelled with its age.
+/// 3. Scraping `claude -p /usage` (5.3s, burns quota) — only if the first two are
+///    unavailable, e.g. no readable credential.
+///
+/// Best-effort throughout: "" means the card simply omits the limits section.
 async fn fetch_limits() -> String {
+    if let Some(u) = fetch_utilization_live().await {
+        let s = parse_utilization(&u, 0);
+        if !s.is_empty() { return s; }
+    }
+    if let Some((u, age)) = cached_utilization() {
+        let s = parse_utilization(&u, age);
+        if !s.is_empty() { return s; }
+    }
     parse_usage_text(&run_claude_stdin("/usage", 30).await)
 }
 
