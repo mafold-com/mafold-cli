@@ -563,6 +563,9 @@ struct SessionCost {
     wall: i64,
     added: u64,
     removed: u64,
+    /// The model this session actually ran on (most input+output tokens) — NOT
+    /// the all-time favourite, which is a different question entirely.
+    model: String,
 }
 
 fn session_cost(workdir: &str, session: Option<&str>) -> Option<SessionCost> {
@@ -606,11 +609,13 @@ fn session_cost(workdir: &str, session: Option<&str>) -> Option<SessionCost> {
         }
     }
     if models.is_empty() { return None; }
+    let model = models.iter().max_by_key(|(_, b)| b.io()).map(|(m, _)| m.clone()).unwrap_or_default();
     Some(SessionCost {
         usd: models.iter().map(|(m, b)| bucket_cost(m, b)).sum(),
         wall: if first <= last { last - first } else { 0 },
         added,
         removed,
+        model,
     })
 }
 
@@ -673,20 +678,20 @@ fn stats(limits_body: &str, workdir: &str, session: Option<&str>) -> String {
         body.push_str(l);
         body.push('\n');
     }
-    // This chat's session, then the all-time tiles.
+    // This chat's session gets its own group — it's a different time scale from
+    // the all-time totals and reads wrong mixed in with them.
     if let Some(s) = session_cost(workdir, session) {
-        body.push_str(&format!("tile|This session|{} · {}\n", fmt_usd(s.usd), fmt_dur(s.wall)));
+        body.push_str(&format!("sec|This session|{}\n", s.model));
+        body.push_str(&format!("tile|cost|{}\n", fmt_usd(s.usd)));
+        body.push_str(&format!("tile|elapsed|{}\n", fmt_dur(s.wall)));
         if s.added + s.removed > 0 {
-            body.push_str(&format!("tile|Code changes|+{} / −{}\n", s.added, s.removed));
+            body.push_str(&format!("tile|lines changed|+{} / −{}\n", s.added, s.removed));
         }
     }
+    // All time last: the card's prop-driven totals join whichever group is last.
+    body.push_str("sec|All time\n");
     let all_cost = agg.cost();
-    if all_cost > 0.0 { body.push_str(&format!("tile|All-time cost|{}\n", fmt_usd(all_cost))); }
-    if let Some(m) = agg.favorite() { body.push_str(&format!("tile|Favorite|{m}\n")); }
-    if let Some(d) = busiest_day { body.push_str(&format!("tile|Most active|{d}\n")); }
-    if cur_streak > 0 { body.push_str(&format!("tile|Streak|{cur_streak}d\n")); }
-    if best_streak > cur_streak { body.push_str(&format!("tile|Best streak|{best_streak}d\n")); }
-    if agg.longest_sess > 0 { body.push_str(&format!("tile|Longest session|{}\n", fmt_dur(agg.longest_sess))); }
+    if all_cost > 0.0 { body.push_str(&format!("tile|spent|{}\n", fmt_usd(all_cost))); }
     if heat.len() > 6 {
         body.push_str(&format!(
             "heat|{}|{}\n",
@@ -699,6 +704,21 @@ fn stats(limits_body: &str, workdir: &str, session: Option<&str>) -> String {
     for (m, tok) in &models {
         body.push_str(&format!("model|{}|{}|{}\n", m, humanize(*tok), tok));
     }
+    // The "interesting but not load-bearing" figures: a muted footnote rather
+    // than competing with cost and limits for the eye.
+    let mut trivia: Vec<String> = vec![];
+    if let Some(m) = agg.favorite() { trivia.push(format!("{m} most used")); }
+    if agg.longest_sess > 0 { trivia.push(format!("longest session {}", fmt_dur(agg.longest_sess))); }
+    if cur_streak > 0 { trivia.push(format!("streak {cur_streak}d")); }
+    if best_streak > cur_streak { trivia.push(format!("best {best_streak}d")); }
+    if let Some(d) = busiest_day { trivia.push(format!("most active {d}")); }
+    if !trivia.is_empty() { body.push_str(&format!("meta|{}\n", trivia.join(" · "))); }
+    let mut volume: Vec<String> = vec![];
+    if active_days > 0 { volume.push(format!("{active_days}/{span_days} active days")); }
+    if agg.messages > 0 { volume.push(format!("{} messages", humanize(agg.messages))); }
+    if agg.tools > 0 { volume.push(format!("{} tool calls", humanize(agg.tools))); }
+    if !hour.is_empty() { volume.push(format!("busiest {hour}")); }
+    if !volume.is_empty() { body.push_str(&format!("meta|{}\n", volume.join(" · "))); }
     // Behavior key-values (plan, updated-at) last, plus today's context profile —
     // the structured limits endpoint carries no behaviour data, so this is
     // derived from the transcripts we already walked.
@@ -714,10 +734,12 @@ fn stats(limits_body: &str, workdir: &str, session: Option<&str>) -> String {
         ));
     }
 
+    // Only the four figures that earn a big number stay props; messages, tool
+    // calls and the busiest hour moved into the `meta|` footnote above.
     format!(
-        "{{% stats sessions=\"{}\" messages=\"{}\" tools=\"{}\" tokens=\"{}\" days=\"{}\" since=\"{}\" hour=\"{}\" %}}\n{}{{% /stats %}}",
-        humanize(agg.sessions), humanize(agg.messages), humanize(agg.tools), humanize(agg.tokens_io()),
-        format_args!("{active_days}/{span_days}"), fmt_date(&agg.first_iso), hour, body,
+        "{{% stats sessions=\"{}\" tokens=\"{}\" days=\"{}\" since=\"{}\" %}}\n{}{{% /stats %}}",
+        humanize(agg.sessions), humanize(agg.tokens_io()),
+        format_args!("{active_days}/{span_days}"), fmt_date(&agg.first_iso), body,
     )
 }
 
@@ -832,7 +854,9 @@ fn parse_utilization(util: &serde_json::Value, age_secs: i64) -> String {
         out.push_str(&format!("limit|{label}|{}|{note}\n", pct.round() as i64));
     }
     if out.is_empty() { return String::new(); }
-    if let Some(p) = plan_tier() { out.push_str(&format!("kv|Plan|{p}\n")); }
+    // The tier rides in the header badge, not a key-value row — it labels the
+    // whole card, the way Claude's own panel puts "Max (20x)" next to the title.
+    if let Some(p) = plan_tier() { out.push_str(&format!("chip|{p}\n")); }
     out.push_str(&format!(
         "kv|Updated|{}\n",
         if age_secs < 45 { "just now".to_string() } else { format!("{} ago", fmt_dur(age_secs)) },
@@ -926,7 +950,9 @@ fn parse_usage_text(text: &str) -> String {
 
     let mut out = String::new();
     for l in &limits { out.push_str(l); out.push('\n'); }
-    if let Some(p) = plan { out.push_str(&format!("kv|Plan|{p}\n")); }
+    // Same header badge as the structured path — the prose only ever yields
+    // "subscription" here, never the tier, but it belongs in the same slot.
+    if let Some(p) = plan { out.push_str(&format!("chip|{p}\n")); }
     for (w, v) in &windows { out.push_str(&format!("kv|{w}|{v}\n")); }
     if !profile.is_empty() { out.push_str(&format!("kv|Profile (7d)|{}\n", profile.join(" · "))); }
     for (l, v) in &tops { out.push_str(&format!("kv|{l}|{}\n", v.replace(", ", " · "))); }
@@ -1505,7 +1531,7 @@ Last 7d · 7983 requests · 30 sessions
         assert!(body.contains("limit|Session|5|resets Jul 3 at 9:19am\n"), "{body}");
         assert!(body.contains("limit|Week (all models)|23|resets Jul 3 at 8:59pm\n"), "{body}");
         assert!(body.contains("limit|Week (Fable)|20|resets Jul 3 at 8:59pm\n"), "{body}");
-        assert!(body.contains("kv|Plan|subscription\n"), "{body}");
+        assert!(body.contains("chip|subscription\n"), "{body}");
         assert!(body.contains("kv|Last 24h|1634 requests · 11 sessions\n"), "{body}");
         assert!(body.contains("kv|Last 7d|7983 requests · 30 sessions\n"), "{body}");
         // Behavior profile + Top rows come from the LAST (7d) block.
