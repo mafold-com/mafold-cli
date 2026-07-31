@@ -733,6 +733,10 @@ fn stats(limits_body: &str, workdir: &str, session: Option<&str>) -> String {
             agg.today_big_ctx * 100 / agg.today_turns,
         ));
     }
+    // What the card's Refresh button re-runs. It posts as a message from the
+    // tapper, so the whole command re-executes and answers with a fresh card —
+    // no separate refresh path to keep in sync with this one.
+    body.push_str("refresh|/usage\n");
 
     // Only the four figures that earn a big number stay props; messages, tool
     // calls and the busiest hour moved into the `meta|` footnote above.
@@ -857,10 +861,10 @@ fn parse_utilization(util: &serde_json::Value, age_secs: i64) -> String {
     // The tier rides in the header badge, not a key-value row — it labels the
     // whole card, the way Claude's own panel puts "Max (20x)" next to the title.
     if let Some(p) = plan_tier() { out.push_str(&format!("chip|{p}\n")); }
-    out.push_str(&format!(
-        "kv|Updated|{}\n",
-        if age_secs < 45 { "just now".to_string() } else { format!("{} ago", fmt_dur(age_secs)) },
-    ));
+    // WHEN, not "how long ago": we only know the age at emit time, so a baked
+    // "just now" is still saying "just now" an hour later. The card holds the
+    // clock and renders the interval itself.
+    out.push_str(&format!("stamp|{}\n", now_ms() - age_secs * 1000));
     out
 }
 
