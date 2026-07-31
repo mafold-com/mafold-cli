@@ -22,10 +22,10 @@ pub enum Outcome {
 /// Route a slash command. `name` is lowercased, without the leading slash.
 /// (`/login` is handled in agent.rs — it needs the daemon's per-chat state to
 /// relay the pasted auth code into the login process.)
-pub async fn handle(name: &str, _arg: &str, workdir: &str) -> Outcome {
+pub async fn handle(name: &str, _arg: &str, workdir: &str, session: Option<&str>) -> Outcome {
     match name {
         // ── usage stats (rich card): local transcript scan + live rate limits ──
-        "stats" | "usage" | "cost" => Outcome::Reply(stats(&fetch_limits().await)),
+        "stats" | "usage" | "cost" => Outcome::Reply(stats(&fetch_limits().await, workdir, session)),
         // ── auth ──
         "logout" => Outcome::Reply(logout().await),
         // ── read local config / state ──
@@ -302,119 +302,356 @@ fn dump_file(title: &str, lang: &str, path: &Path) -> String {
 
 // ───────────────────────── usage stats ─────────────────────────
 
-/// `/stats` — Claude Code usage computed LIVE from the session transcripts under
-/// `~/.claude/projects/<project>/*.jsonl`, rendered as a `{% stats %}` card
-/// (rate-limit bars + totals grid + activity heatmap + sparkline + per-model
-/// split + behavior key-values).
-///
-/// We do NOT read `~/.claude/stats-cache.json`: that aggregate is only flushed
-/// periodically and routinely lags the real history by weeks, which made `/usage`
-/// show stale numbers. The transcripts are written every turn, so reading them is
-/// always current. Each assistant turn records its real token `usage` + `model`;
-/// we sum per-model tokens, count tool-call blocks, active days, busiest hour,
-/// streaks, the longest session span, and per-day activity (heatmap + sparkline).
-/// Cost: one full pass over the history per call (~1s); only
-/// `"type":"assistant"` lines are JSON-parsed. `limits_body` is the pre-fetched
-/// `limit|`/`kv|` lines from [`fetch_limits`] ("" = section omitted).
-fn stats(limits_body: &str) -> String {
-    use std::collections::{HashMap, HashSet};
+/// One model's four token buckets.
+#[derive(Default, Clone, Copy)]
+struct Buckets {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+}
 
-    let files = jsonl_transcripts(&home().join(".claude/projects"));
-    if files.is_empty() {
-        return "📊 No usage data yet (no transcripts under `~/.claude/projects/`).".into();
+impl Buckets {
+    fn add_usage(&mut self, u: &serde_json::Value) {
+        self.input += u["input_tokens"].as_u64().unwrap_or(0);
+        self.output += u["output_tokens"].as_u64().unwrap_or(0);
+        self.cache_read += u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+        self.cache_write += u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
     }
+    fn merge(&mut self, o: &Buckets) {
+        self.input += o.input;
+        self.output += o.output;
+        self.cache_read += o.cache_read;
+        self.cache_write += o.cache_write;
+    }
+    /// input + output — the metric Claude Code's own Stats screen calls "Total
+    /// tokens". Cache traffic is ~100× larger and would drown it.
+    fn io(&self) -> u64 { self.input + self.output }
+    fn any(&self) -> bool { self.io() + self.cache_read + self.cache_write > 0 }
+}
 
-    let mut model_tokens: HashMap<String, u64> = HashMap::new();
-    let mut total_tokens: u64 = 0;
-    let mut tools: u64 = 0;
-    let mut messages: u64 = 0;
-    let mut sessions: HashSet<String> = HashSet::new();
-    let mut sess_span: HashMap<String, (i64, i64)> = HashMap::new(); // sessionId → (first, last) epoch secs
-    let mut per_day: HashMap<String, u64> = HashMap::new(); // YYYY-MM-DD → assistant turns
-    let mut per_hour: [u64; 24] = [0; 24];
-    let mut first_date: Option<String> = None;
+/// USD per million tokens as (input, output), by short model name.
+///
+/// Cache reads bill at input × 0.1 and cache **writes at input × 2.0**: Claude
+/// Code writes 1-hour-TTL cache entries, so the 5-minute ×1.25 rate under-counts
+/// by ~7%. Checked against the TUI's own session total — $253.70 computed vs
+/// $253.65 shown, i.e. display rounding. An unrecognised id prices at the Opus
+/// tier so a newly released model never silently reads as free.
+fn model_price(short: &str) -> (f64, f64) {
+    if short.starts_with("fable") || short.starts_with("mythos") { (10.0, 50.0) }
+    else if short.starts_with("sonnet") { (3.0, 15.0) }
+    else if short.starts_with("haiku") { (1.0, 5.0) }
+    else { (5.0, 25.0) }
+}
 
-    for f in &files {
+/// Dollar cost of one model's token buckets.
+fn bucket_cost(short: &str, b: &Buckets) -> f64 {
+    let (inp, out) = model_price(short);
+    (b.input as f64 * inp
+        + b.output as f64 * out
+        + b.cache_read as f64 * inp * 0.1
+        + b.cache_write as f64 * inp * 2.0)
+        / 1e6
+}
+
+/// "$4.20" / "$59.2k" — compact once the cents stop mattering.
+fn fmt_usd(v: f64) -> String {
+    if v >= 1000.0 { format!("${:.1}k", v / 1000.0) } else { format!("${v:.2}") }
+}
+
+/// Everything the usage card needs, from either data source.
+#[derive(Default)]
+struct Agg {
+    /// epoch day → activity count. Assistant turns when scanned, Claude Code's
+    /// own message count when cached — only ever compared against itself
+    /// (heatmap shading, streaks, busiest day), never mixed into a total.
+    per_day: std::collections::HashMap<i64, u64>,
+    per_hour: [u64; 24],
+    models: std::collections::HashMap<String, Buckets>,
+    messages: u64,
+    tools: u64,
+    sessions: u64,
+    /// Longest single session by wall-clock span, seconds.
+    longest_sess: i64,
+    /// Earliest activity, ISO — the card's "since".
+    first_iso: String,
+}
+
+impl Agg {
+    fn merge(&mut self, o: Agg) {
+        for (h, n) in o.per_hour.iter().enumerate() { self.per_hour[h] += *n; }
+        for (d, n) in o.per_day { *self.per_day.entry(d).or_default() += n; }
+        for (m, b) in o.models { self.models.entry(m).or_default().merge(&b); }
+        self.messages += o.messages;
+        self.tools += o.tools;
+        self.sessions += o.sessions;
+        // The cache's own figure wins: a partial scan only sees the files it
+        // touched, so its widest span is not comparable (a daemon session idle
+        // for two months spans 63 days of wall-clock and would swamp it). The
+        // cache recomputes daily, so a genuinely longer session lands tomorrow.
+        if self.longest_sess == 0 { self.longest_sess = o.longest_sess; }
+        if !o.first_iso.is_empty() && (self.first_iso.is_empty() || o.first_iso < self.first_iso) {
+            self.first_iso = o.first_iso;
+        }
+    }
+    fn tokens_io(&self) -> u64 { self.models.values().map(|b| b.io()).sum() }
+    fn cost(&self) -> f64 { self.models.iter().map(|(m, b)| bucket_cost(m, b)).sum() }
+    /// Most-used model by input+output tokens — the TUI's "Favorite model".
+    fn favorite(&self) -> Option<&str> {
+        self.models.iter().filter(|(_, b)| b.io() > 0).max_by_key(|(_, b)| b.io()).map(|(m, _)| m.as_str())
+    }
+}
+
+/// Scan session transcripts under `~/.claude/projects/` into an [`Agg`].
+///
+/// `since_day` (epoch day, inclusive) bounds the work: a file last written
+/// before it is skipped on its mtime alone — that stat, not the read, is what
+/// makes the cache fast path cheap — and older lines inside a surviving file
+/// are ignored. Session bookkeeping still spans the whole file, so a session
+/// counts toward `sessions` only when its FIRST turn falls inside the window
+/// and one resumed across midnight isn't double-counted against the cache's
+/// own total. Only `"type":"assistant"` lines are JSON-parsed.
+fn scan_transcripts(files: &[PathBuf], since_day: Option<i64>) -> Agg {
+    use std::collections::HashMap;
+    let since = since_day.unwrap_or(i64::MIN);
+    let mut agg = Agg::default();
+    let mut sess_first: HashMap<String, i64> = HashMap::new();
+    let mut sess_span: HashMap<String, (i64, i64)> = HashMap::new();
+
+    for f in files {
+        if since_day.is_some() {
+            let stale = std::fs::metadata(f).ok()
+                .and_then(|md| md.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_some_and(|d| (d.as_secs() as i64) / 86_400 < since);
+            if stale { continue; }
+        }
         let Ok(bytes) = std::fs::read(f) else { continue };
         // Lossy so a single bad byte never drops a whole transcript.
         for line in String::from_utf8_lossy(&bytes).lines() {
+            // Per-day activity counts what Claude Code counts — every message
+            // line except its own bookkeeping — so a cached day and a scanned
+            // day are the same unit and the heatmap doesn't dip on the live
+            // tail. Verified against the cache: 991 user + 1504 assistant + 129
+            // attachment + 22 system = its 2646 for that date, exactly.
+            if let Some(day) = line_day(line) {
+                if day >= since
+                    && !line.contains("\"type\":\"queue-operation\"")
+                    && !line.contains("\"type\":\"file-history-delta\"")
+                {
+                    *agg.per_day.entry(day).or_default() += 1;
+                    agg.messages += 1;
+                }
+            }
             // Cheap pre-filter: skip the (many) non-assistant lines without parsing.
             if !line.contains("\"type\":\"assistant\"") { continue; }
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
             if v["type"].as_str() != Some("assistant") { continue; }
-            let m = &v["message"];
-            let u = &m["usage"];
+            let Some(ts) = v["timestamp"].as_str() else { continue };
+            if ts.len() < 10 { continue; }
+            let Some(day) = day_key_epoch(&ts[..10]) else { continue };
 
-            // Token total — same four buckets the old cache summed.
-            let tok: u64 = ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
-                .iter().filter_map(|k| u[*k].as_u64()).sum();
-            if tok > 0 {
-                total_tokens += tok;
-                if let Some(model) = m["model"].as_str() {
-                    *model_tokens.entry(short_model(model)).or_default() += tok;
+            if let Some(sid) = v["sessionId"].as_str() {
+                let seen = sess_first.entry(sid.to_string()).or_insert(day);
+                if day < *seen { *seen = day; }
+                if let Some(secs) = iso_epoch_secs(ts) {
+                    let span = sess_span.entry(sid.to_string()).or_insert((secs, secs));
+                    if secs < span.0 { span.0 = secs; }
+                    if secs > span.1 { span.1 = secs; }
                 }
             }
+            if day < since { continue; }
 
-            messages += 1;
-            if let Some(content) = m["content"].as_array() {
-                tools += content.iter().filter(|b| b["type"].as_str() == Some("tool_use")).count() as u64;
+            let m = &v["message"];
+            let mut b = Buckets::default();
+            b.add_usage(&m["usage"]);
+            if b.any() {
+                if let Some(model) = m["model"].as_str() {
+                    agg.models.entry(short_model(model)).or_default().merge(&b);
+                }
             }
-            if let Some(sid) = v["sessionId"].as_str() { sessions.insert(sid.to_string()); }
-            if let Some(ts) = v["timestamp"].as_str() {
-                if ts.len() >= 10 {
-                    *per_day.entry(ts[..10].to_string()).or_default() += 1;
-                    if ts.len() >= 13 {
-                        if let Ok(h) = ts[11..13].parse::<usize>() {
-                            if h < 24 { per_hour[h] += 1; }
-                        }
-                    }
-                    if first_date.as_deref().is_none_or(|f| ts < f) {
-                        first_date = Some(ts.to_string());
-                    }
-                    if let (Some(sid), Some(secs)) = (v["sessionId"].as_str(), iso_epoch_secs(ts)) {
-                        let e = sess_span.entry(sid.to_string()).or_insert((secs, secs));
-                        if secs < e.0 { e.0 = secs; }
-                        if secs > e.1 { e.1 = secs; }
-                    }
+            if let Some(content) = m["content"].as_array() {
+                agg.tools += content.iter().filter(|x| x["type"].as_str() == Some("tool_use")).count() as u64;
+            }
+            if ts.len() >= 13 {
+                if let Ok(h) = ts[11..13].parse::<usize>() {
+                    if h < 24 { agg.per_hour[h] += 1; }
+                }
+            }
+            if agg.first_iso.is_empty() || ts < agg.first_iso.as_str() {
+                agg.first_iso = ts.to_string();
+            }
+        }
+    }
+    agg.sessions = sess_first.values().filter(|d| **d >= since).count() as u64;
+    agg.longest_sess = sess_span.values().map(|(a, b)| b - a).max().unwrap_or(0);
+    agg
+}
+
+/// Claude Code's own aggregate at `~/.claude/stats-cache.json` as an [`Agg`],
+/// plus the epoch day it is complete THROUGH.
+///
+/// Schema v4 carries the entire Stats screen: `dailyActivity[]`, `modelUsage{}`
+/// (four token buckets per model), `hourCounts{}`, `totalSessions`,
+/// `totalMessages`, `longestSession.duration` (ms) and `firstSessionDate`. It is
+/// rewritten daily and `lastComputedDate` is the last COMPLETE day, so cache +
+/// today's transcripts is exactly what the TUI renders — verified field by field
+/// against it. Its `costUSD` entries are always 0, so cost is priced here from
+/// the buckets instead.
+///
+/// None on a missing file, a schema older than v4, or any shape drift; the
+/// caller then falls back to a full transcript scan.
+fn stats_cache() -> Option<(Agg, i64)> {
+    let raw = std::fs::read_to_string(home().join(".claude/stats-cache.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    if v["version"].as_u64()? < 4 { return None; }
+    let through = day_key_epoch(v["lastComputedDate"].as_str()?)?;
+
+    let mut agg = Agg::default();
+    for row in v["dailyActivity"].as_array()? {
+        let Some(day) = row["date"].as_str().and_then(day_key_epoch) else { continue };
+        *agg.per_day.entry(day).or_default() += row["messageCount"].as_u64().unwrap_or(0);
+        agg.tools += row["toolCallCount"].as_u64().unwrap_or(0);
+    }
+    if agg.per_day.is_empty() { return None; }
+    for (model, u) in v["modelUsage"].as_object()? {
+        let b = agg.models.entry(short_model(model)).or_default();
+        b.input += u["inputTokens"].as_u64().unwrap_or(0);
+        b.output += u["outputTokens"].as_u64().unwrap_or(0);
+        b.cache_read += u["cacheReadInputTokens"].as_u64().unwrap_or(0);
+        b.cache_write += u["cacheCreationInputTokens"].as_u64().unwrap_or(0);
+    }
+    if let Some(hours) = v["hourCounts"].as_object() {
+        for (h, n) in hours {
+            if let (Ok(h), Some(n)) = (h.parse::<usize>(), n.as_u64()) {
+                if h < 24 { agg.per_hour[h] += n; }
+            }
+        }
+    }
+    agg.messages = v["totalMessages"].as_u64().unwrap_or(0);
+    agg.sessions = v["totalSessions"].as_u64().unwrap_or(0);
+    agg.longest_sess = (v["longestSession"]["duration"].as_f64().unwrap_or(0.0) / 1000.0) as i64;
+    agg.first_iso = v["firstSessionDate"].as_str().unwrap_or("").to_string();
+    Some((agg, through))
+}
+
+/// This chat's own session — cost, wall-clock span and net code change.
+///
+/// `session` is the daemon's live session id for this chat; only when it has
+/// none do we fall back to the newest transcript in the workdir, which is a
+/// guess (sibling chats share a workdir and race for newest-mtime).
+///
+/// The TUI prints an API duration next to the wall duration; transcripts carry
+/// no per-request timing, so wall-clock (first turn → last turn) is the only
+/// honest figure and the only one we show.
+struct SessionCost {
+    usd: f64,
+    wall: i64,
+    added: u64,
+    removed: u64,
+}
+
+fn session_cost(workdir: &str, session: Option<&str>) -> Option<SessionCost> {
+    use std::collections::HashMap;
+    let id = match session {
+        // Session ids are UUIDs; refuse anything path-ish before joining it.
+        Some(s) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') => s.to_string(),
+        _ => list_project_sessions(workdir).into_iter().next()?.id,
+    };
+    let bytes = std::fs::read(project_dir(workdir).join(format!("{id}.jsonl"))).ok()?;
+
+    let mut models: HashMap<String, Buckets> = HashMap::new();
+    let (mut first, mut last) = (i64::MAX, i64::MIN);
+    let (mut added, mut removed) = (0u64, 0u64);
+    for line in String::from_utf8_lossy(&bytes).lines() {
+        // A single session can run to hundreds of megabytes — only parse the
+        // two line shapes that carry anything we need.
+        let assistant = line.contains("\"type\":\"assistant\"");
+        if !assistant && !line.contains("structuredPatch") { continue; }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if assistant && v["type"].as_str() == Some("assistant") {
+            if let Some(secs) = v["timestamp"].as_str().and_then(iso_epoch_secs) {
+                first = first.min(secs);
+                last = last.max(secs);
+            }
+            let m = &v["message"];
+            if let Some(model) = m["model"].as_str() {
+                models.entry(short_model(model)).or_default().add_usage(&m["usage"]);
+            }
+        }
+        // Edit/Write tool results carry the hunks they applied; their +/- lines
+        // are the same "code changes" figure the TUI reports.
+        for h in v["toolUseResult"]["structuredPatch"].as_array().into_iter().flatten() {
+            for l in h["lines"].as_array().into_iter().flatten() {
+                match l.as_str().and_then(|s| s.chars().next()) {
+                    Some('+') => added += 1,
+                    Some('-') => removed += 1,
+                    _ => {}
                 }
             }
         }
     }
+    if models.is_empty() { return None; }
+    Some(SessionCost {
+        usd: models.iter().map(|(m, b)| bucket_cost(m, b)).sum(),
+        wall: if first <= last { last - first } else { 0 },
+        added,
+        removed,
+    })
+}
 
-    // Per-model token totals (top 5).
-    let mut models: Vec<(String, u64)> = model_tokens.into_iter().collect();
+/// `/stats` (also `/usage`, `/cost`) — the whole Claude Code usage picture as a
+/// `{% stats %}` card: rate-limit bars, this session's cost, the all-time totals
+/// grid, activity heatmap, per-model split and behavior key-values.
+///
+/// History comes from Claude Code's own [`stats_cache`] when it is readable, plus
+/// a live scan of the days it doesn't cover yet — the same two-part assembly the
+/// TUI's Stats screen does, which is why the numbers land on it exactly. That
+/// also turns a multi-gigabyte pass over the full history into a 40 KB read. If
+/// the cache is missing or drifts we fall back to scanning everything, which
+/// computes the same fields the slow way.
+///
+/// `limits_body` is the pre-fetched `limit|`/`kv|` lines from [`fetch_limits`]
+/// ("" = section omitted).
+fn stats(limits_body: &str, workdir: &str, session: Option<&str>) -> String {
+    let files = jsonl_transcripts(&home().join(".claude/projects"));
+    let cached = stats_cache();
+    if files.is_empty() && cached.is_none() {
+        return "📊 No usage data yet (no transcripts under `~/.claude/projects/`).".into();
+    }
+    let agg = match cached {
+        Some((mut history, through)) => {
+            history.merge(scan_transcripts(&files, Some(through + 1)));
+            history
+        }
+        None => scan_transcripts(&files, None),
+    };
+
+    // Per-model bars, on the same input+output metric as the Tokens tile.
+    let mut models: Vec<(String, u64)> = agg.models.iter().map(|(m, b)| (m.clone(), b.io())).filter(|(_, t)| *t > 0).collect();
     models.sort_by(|a, b| b.1.cmp(&a.1));
     models.truncate(5);
 
-    // Active days + daily-turn sparkline (chronological, last 45 days).
-    let mut day_keys: Vec<String> = per_day.keys().cloned().collect();
-    day_keys.sort();
-    let days = day_keys.len() as u64;
-    let mut spark: Vec<u64> = day_keys.iter().map(|d| per_day[d]).collect();
-    if spark.len() > 45 { spark = spark[spark.len() - 45..].to_vec(); }
-
-    // Streaks (consecutive active days, UTC — same clock as the timestamps).
     let today = today_epoch_day();
-    let day_epochs: Vec<i64> = day_keys.iter().filter_map(|k| day_key_epoch(k)).collect();
+    let mut day_epochs: Vec<i64> = agg.per_day.keys().copied().collect();
+    day_epochs.sort_unstable();
+    let active_days = day_epochs.len() as u64;
     let (cur_streak, best_streak) = streaks(&day_epochs, today);
-
-    // Longest single session by wall-clock span (daemon-resumed sessions can
-    // legitimately span days).
-    let longest_sess = sess_span.values().map(|(a, b)| b - a).max().unwrap_or(0);
+    // Active days out of the calendar span since the first one — "141/191".
+    let span_days = day_epochs.first().map(|f| today - f + 1).unwrap_or(0).max(active_days as i64);
+    let busiest_day = agg.per_day.iter().max_by_key(|(_, n)| **n).map(|(d, _)| fmt_day_short(*d));
 
     // Heatmap: continuous per-day series ending today, last 20 weeks (the card
     // trims further to its width). offset = Monday-based weekday of the start.
-    let day_counts: HashMap<i64, u64> = per_day.iter()
-        .filter_map(|(k, v)| day_key_epoch(k).map(|d| (d, *v)))
-        .collect();
     let start = day_epochs.first().copied().unwrap_or(today).max(today - 139);
-    let heat: Vec<u64> = (start..=today).map(|d| day_counts.get(&d).copied().unwrap_or(0)).collect();
+    let heat: Vec<u64> = (start..=today).map(|d| agg.per_day.get(&d).copied().unwrap_or(0)).collect();
+    // Sparkline only as the short-history fallback — otherwise the two would
+    // show the SAME daily series twice.
+    let spark: Vec<u64> = day_epochs.iter().rev().take(45).rev().map(|d| agg.per_day[d]).collect();
 
-    // Busiest hour.
-    let hour = (0..24usize).filter(|&h| per_hour[h] > 0).max_by_key(|&h| per_hour[h])
+    let hour = (0..24usize).filter(|&h| agg.per_hour[h] > 0).max_by_key(|&h| agg.per_hour[h])
         .map(|h| format!("{h:02}:00"))
         .unwrap_or_default();
-    let since = fmt_date(first_date.as_deref().unwrap_or(""));
 
     let mut body = String::new();
     // Rate-limit bars first (the thing people actually check).
@@ -422,11 +659,20 @@ fn stats(limits_body: &str) -> String {
         body.push_str(l);
         body.push('\n');
     }
+    // This chat's session, then the all-time tiles.
+    if let Some(s) = session_cost(workdir, session) {
+        body.push_str(&format!("tile|This session|{} · {}\n", fmt_usd(s.usd), fmt_dur(s.wall)));
+        if s.added + s.removed > 0 {
+            body.push_str(&format!("tile|Code changes|+{} / −{}\n", s.added, s.removed));
+        }
+    }
+    let all_cost = agg.cost();
+    if all_cost > 0.0 { body.push_str(&format!("tile|All-time cost|{}\n", fmt_usd(all_cost))); }
+    if let Some(m) = agg.favorite() { body.push_str(&format!("tile|Favorite|{m}\n")); }
+    if let Some(d) = busiest_day { body.push_str(&format!("tile|Most active|{d}\n")); }
     if cur_streak > 0 { body.push_str(&format!("tile|Streak|{cur_streak}d\n")); }
     if best_streak > cur_streak { body.push_str(&format!("tile|Best streak|{best_streak}d\n")); }
-    if longest_sess > 0 { body.push_str(&format!("tile|Longest session|{}\n", fmt_dur(longest_sess))); }
-    // Heatmap when there's enough history; sparkline only as the short-history
-    // fallback (they'd otherwise show the SAME daily series twice).
+    if agg.longest_sess > 0 { body.push_str(&format!("tile|Longest session|{}\n", fmt_dur(agg.longest_sess))); }
     if heat.len() > 6 {
         body.push_str(&format!(
             "heat|{}|{}\n",
@@ -447,7 +693,8 @@ fn stats(limits_body: &str) -> String {
 
     format!(
         "{{% stats sessions=\"{}\" messages=\"{}\" tools=\"{}\" tokens=\"{}\" days=\"{}\" since=\"{}\" hour=\"{}\" %}}\n{}{{% /stats %}}",
-        humanize(sessions.len() as u64), humanize(messages), humanize(tools), humanize(total_tokens), days, since, hour, body,
+        humanize(agg.sessions), humanize(agg.messages), humanize(agg.tools), humanize(agg.tokens_io()),
+        format_args!("{active_days}/{span_days}"), fmt_date(&agg.first_iso), hour, body,
     )
 }
 
@@ -570,6 +817,34 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146097 + doe - 719468
+}
+
+/// Inverse of [`days_from_civil`] — epoch day → (year, month, day).
+fn civil_from_days(z: i64) -> (i64, usize, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2), m as usize, d)
+}
+
+/// epoch day → "Mar 9" (the year is implied by the card's "since").
+fn fmt_day_short(epoch_day: i64) -> String {
+    const MON: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let (_, m, d) = civil_from_days(epoch_day);
+    format!("{} {d}", MON[m.clamp(1, 12) - 1])
+}
+
+/// Epoch day of a transcript line's `"timestamp"`, read straight out of the raw
+/// JSON text — the per-day pass runs over every line of every transcript, so it
+/// cannot afford to parse them.
+fn line_day(line: &str) -> Option<i64> {
+    let i = line.find("\"timestamp\":\"")? + 13;
+    day_key_epoch(line.get(i..i + 10)?)
 }
 
 /// "YYYY-MM-DD" → epoch day.
@@ -1196,7 +1471,18 @@ Last 7d · 7983 requests · 30 sessions
     #[test]
     #[ignore = "reads this machine's ~/.claude transcripts"]
     fn stats_smoke_print() {
-        let s = stats("");
+        // The repo root, not the crate dir — that's the workdir the daemon runs
+        // in, so it's the one with transcripts behind the "This session" tiles.
+        let cwd = std::env::current_dir().unwrap();
+        let workdir = cwd.parent().unwrap_or(&cwd).display().to_string();
+        // Name the session the cost tiles priced, so the number can be checked
+        // against Claude Code's own `/usage` for that exact transcript.
+        if let Some(m) = list_project_sessions(&workdir).into_iter().next() {
+            if let Some(c) = session_cost(&workdir, Some(&m.id)) {
+                println!("session {} → {} · {} · +{}/-{}", m.id, fmt_usd(c.usd), fmt_dur(c.wall), c.added, c.removed);
+            }
+        }
+        let s = stats("", &workdir, None);
         println!("{s}");
         assert!(s.contains("{% stats "));
     }

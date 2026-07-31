@@ -109,7 +109,7 @@ impl Harness for KimiCode {
         Value::Array(vec![])
     }
 
-    async fn command(&self, _client: &Client, _chat_id: &str, _name: &str, _arg: &str, _workdir: &str) -> CommandOutcome {
+    async fn command(&self, _client: &Client, _chat_id: &str, _name: &str, _arg: &str, _workdir: &str, _session: Option<&str>) -> CommandOutcome {
         // No emulated slash commands — anything that isn't a daemon control command
         // is forwarded to `kimi --print` as a prompt.
         CommandOutcome::Forward

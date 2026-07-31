@@ -4,6 +4,7 @@
 //!   mafold cards dev             # bundle + watch + serve locally (live preview)
 //!   mafold cards publish         # bundle + upload to Mafold
 //!   mafold cards list            # your cards + global cards
+//!   mafold cards unpublish <tag> # retract it from your scope (clears a shadow)
 //!
 //! Cards are real React Native components (rendered via react-native-web on the
 //! web, Hermes on iOS). We bundle them with a bundled esbuild — fetched once to
@@ -57,6 +58,16 @@ pub enum CardsCmd {
     },
     /// List your cards plus global cards.
     List,
+    /// Retract a card from YOUR scope. Without `--version` the whole tag goes,
+    /// so a tag you accidentally published over resolves to the global card
+    /// again; with `--version` only that one version goes (a rollback).
+    Unpublish {
+        /// Card tag, e.g. `bash`.
+        tag: String,
+        /// Retract only this version instead of the whole tag.
+        #[arg(long)]
+        version: Option<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -78,6 +89,9 @@ pub async fn run(cmd: CardsCmd, base: String, token: Option<String>) -> Result<(
         CardsCmd::Dev { dir, port } => cmd_dev(&dir, port).await,
         CardsCmd::Publish { dir } => cmd_publish(&dir, base, token).await,
         CardsCmd::List => cmd_list(base, token).await,
+        CardsCmd::Unpublish { tag, version } => {
+            cmd_unpublish(&tag, version.as_deref(), base, token).await
+        }
     }
 }
 
@@ -191,6 +205,64 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
     if version != manifest.version {
         println!("  note: server stored {version} (manifest says {}) — content-drift auto-bump", manifest.version);
     }
+    // The accident that has no symptoms: publishing a first-party tag with your
+    // OWN token succeeds, looks identical to a real publish, and then freezes
+    // that tag for your whole family while the pipeline keeps shipping a global
+    // copy you no longer resolve. Say it loudly, and say how to undo it.
+    if r["shadows_global"].as_bool().unwrap_or(false) {
+        println!(
+            "\n⚠ this SHADOWS the global `{}` card for everyone in the `{scope}` family.\n  \
+             They will stop receiving global updates to it until you run:\n      \
+             mafold cards unpublish {}",
+            manifest.tag, manifest.tag
+        );
+    }
+    Ok(())
+}
+
+// ───────────────────────────── unpublish ─────────────────────────────
+
+async fn cmd_unpublish(
+    tag: &str,
+    version: Option<&str>,
+    base: String,
+    token: Option<String>,
+) -> Result<()> {
+    let token = token
+        .context("unpublish needs your bot token — pass --token or set $MAFOLD_BOT_TOKEN")?;
+    let client = Client::new(base, token);
+    let r = client.unpublish_card(tag, version).await?;
+    let scope = r["scope"].as_str().unwrap_or("?");
+    let removed: Vec<&str> = r["removed"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    println!(
+        "✓ retracted {tag} {} from the {scope} scope: {}",
+        if removed.len() == 1 { "version" } else { "versions" },
+        removed.join(", "),
+    );
+    // What it resolves to NOW is the only answer that matters — clearing a
+    // shadow is pointless if nothing falls in behind it.
+    match r["now_resolves_to"].as_object() {
+        Some(n) => println!(
+            "  {{% {tag} /%}} now resolves to {} [{}]",
+            n["version"].as_str().unwrap_or("?"),
+            n["scope"].as_str().unwrap_or("?"),
+        ),
+        None => println!(
+            "  ⚠ {{% {tag} /%}} now resolves to NOTHING{} — clients without a cached\n  \
+             copy will render it as unavailable. Publishing again brings it back.",
+            if scope == "global" { ", for every account" } else { ", and there is no global card to fall back to" },
+        ),
+    }
+    // Retracted labels stay spent: clients refetch only when the version string
+    // moves, so handing an old label to new bytes would strand everyone holding
+    // the old ones. Say so, because the next publish will visibly skip a number.
+    println!("  the retracted version number{} will not be reused — the next publish climbs past {}",
+        if removed.len() == 1 { "" } else { "s" },
+        removed.last().copied().unwrap_or("it"),
+    );
     Ok(())
 }
 

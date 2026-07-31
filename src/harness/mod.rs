@@ -167,7 +167,10 @@ pub trait Harness: Send + Sync {
 
     /// Try to handle a slash command locally (config dumps, /login, /stats…),
     /// or return `Forward` to run it as a prompt.
-    async fn command(&self, client: &Client, chat_id: &str, name: &str, arg: &str, workdir: &str) -> CommandOutcome;
+    /// `session` is this chat's live harness session id, when it has one — the
+    /// only reliable way to report on it, since sibling chats can share a
+    /// workdir and their transcripts race for newest-mtime.
+    async fn command(&self, client: &Client, chat_id: &str, name: &str, arg: &str, workdir: &str, session: Option<&str>) -> CommandOutcome;
 
     /// One-line status (e.g. auth account) appended to `/status`. Empty = none.
     async fn status_line(&self) -> String {

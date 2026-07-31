@@ -464,6 +464,12 @@ impl Client {
         self.post("listCards", json!({})).await
     }
 
+    /// Retract a card from YOUR scope — one version, or the whole tag. Used to
+    /// clear a family shadow so the tag resolves to the global card again.
+    pub async fn unpublish_card(&self, tag: &str, version: Option<&str>) -> Result<Value> {
+        self.post("unpublishCard", json!({ "tag": tag, "version": version })).await
+    }
+
     // ── developer mini-app registry ──
     /// Publish a compiled mini-app bundle. `meta` is the full AppManifest JSON
     /// (carrying `id` = `owner/slug` and `version`); the server gates publish on

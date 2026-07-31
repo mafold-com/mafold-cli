@@ -203,6 +203,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "unpinApp",
     "unpinChat",
     "unpinMessage",
+    "unpublishCard",
     "updateProfile",
     "uploadFile",
     "walletBalances",

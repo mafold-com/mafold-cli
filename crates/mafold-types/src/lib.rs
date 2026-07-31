@@ -73,6 +73,134 @@ pub struct BotCommand {
     pub arg_hint: Option<String>,
 }
 
+// MARK: - Inline query
+
+/// What picking an inline result does to the composer. Declared BY THE RESULT,
+/// so no client ever branches on which bot produced it: a gif bot's row sends,
+/// a document bot's row drops a link into the sentence you were writing.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InlinePick {
+    /// Send `content` immediately as the user's own message (Telegram's default).
+    #[default]
+    Send,
+    /// Put `content` in the draft and let the user keep typing around it.
+    Insert,
+}
+
+/// One candidate row in an inline-query picker.
+///
+/// `content` is the message body that gets sent or inserted — everything else is
+/// presentation for the row. Whatever is picked is sent AS THE USER; the queried
+/// bot never appears in the conversation, which is what lets a connector answer
+/// `@notion …` in a group it isn't a member of.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct InlineResult {
+    /// Stable, content-derived id. Clients de-duplicate on it and use it to keep
+    /// the highlighted row from jumping while later keystrokes re-answer.
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Display-ready image URL — the API decides it, clients render it verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumb: Option<String>,
+    pub content: String,
+    /// Seconds a client MAY reuse this answer for an unchanged query. `None` =
+    /// don't cache. Set by whoever answers, because only it knows whether the
+    /// underlying data is a fixed command list or a live search.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<u32>,
+    pub on_pick: InlinePick,
+}
+
+/// Longest title a picker row can show before it has to be clipped.
+const INLINE_TITLE_CHARS: usize = 80;
+
+impl InlineResult {
+    /// A plain message body as a single picker row — its own title, sent on pick.
+    pub fn from_body(content: String) -> Self {
+        Self {
+            id: fnv1a_hex(content.as_bytes()),
+            title: inline_first_line(&content),
+            description: None,
+            thumb: None,
+            content,
+            cache_ttl: None,
+            on_pick: InlinePick::Send,
+        }
+    }
+}
+
+/// The first non-empty line, clipped to a picker row's worth. Clipped by CHARS,
+/// never bytes — a CJK title cut mid-codepoint would panic on the slice.
+fn inline_first_line(content: &str) -> String {
+    let line = content
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let mut out: String = line.chars().take(INLINE_TITLE_CHARS).collect();
+    if line.chars().count() > INLINE_TITLE_CHARS {
+        out.push('…');
+    }
+    out
+}
+
+impl<'de> Deserialize<'de> for InlineResult {
+    /// Accepts the structured object OR a bare string.
+    ///
+    /// The bare string is what `answerInlineQuery` took before there was a
+    /// picker to fill, and daemons are user-installed software that updates on
+    /// its own schedule — so an old daemon's answer must degrade to one plain
+    /// row, not fail the whole query. Partial objects fill in the same way: a
+    /// result carrying only a title still sends something rather than an empty
+    /// message.
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Obj {
+            #[serde(default)]
+            id: Option<String>,
+            #[serde(default)]
+            title: Option<String>,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            thumb: Option<String>,
+            #[serde(default)]
+            content: Option<String>,
+            #[serde(default)]
+            cache_ttl: Option<u32>,
+            #[serde(default)]
+            on_pick: InlinePick,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Bare(String),
+            Obj(Obj),
+        }
+        Ok(match Wire::deserialize(d)? {
+            Wire::Bare(s) => Self::from_body(s),
+            Wire::Obj(o) => {
+                let content = o.content.or_else(|| o.title.clone()).unwrap_or_default();
+                Self {
+                    id: o.id.unwrap_or_else(|| fnv1a_hex(content.as_bytes())),
+                    title: o.title.unwrap_or_else(|| inline_first_line(&content)),
+                    description: o.description,
+                    thumb: o.thumb,
+                    content,
+                    cache_ttl: o.cache_ttl,
+                    on_pick: o.on_pick,
+                }
+            }
+        })
+    }
+}
+
 // MARK: - Conversation
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -529,12 +657,110 @@ pub fn langpack_checksum(strings: &serde_json::Map<String, serde_json::Value>) -
     }
     let mut canonical = String::new();
     canon(&serde_json::Value::Object(strings.clone()), &mut canonical);
+    fnv1a_hex(canonical.as_bytes())
+}
+
+/// FNV-1a as lowercase hex.
+///
+/// Spelled out rather than reaching for `DefaultHasher` because these digests
+/// cross process AND version boundaries — a seeded langpack's checksum, a
+/// client-cached inline result's id — and `DefaultHasher`'s output is explicitly
+/// not stable across Rust releases. One that shifted under a toolchain bump
+/// would silently invalidate every cache keyed on it.
+pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
-    for b in canonical.as_bytes() {
+    for b in bytes {
         h ^= u64::from(*b);
         h = h.wrapping_mul(0x100000001b3);
     }
     format!("{h:016x}")
+}
+
+#[cfg(test)]
+mod inline_result_tests {
+    use super::{InlinePick, InlineResult};
+
+    fn parse(json: &str) -> InlineResult {
+        serde_json::from_str(json).expect("InlineResult")
+    }
+
+    /// THE COMPATIBILITY CASE. Daemons are user-installed and update on their
+    /// own schedule, so the pre-picker `Vec<String>` answer must still parse —
+    /// as one plain row that is its own title.
+    #[test]
+    fn a_bare_string_becomes_one_plain_row() {
+        let r = parse(r#""看这个 https://example.com""#);
+        assert_eq!(r.content, "看这个 https://example.com");
+        assert_eq!(r.title, "看这个 https://example.com");
+        assert_eq!(r.on_pick, InlinePick::Send);
+        assert!(r.description.is_none());
+        assert!(!r.id.is_empty());
+    }
+
+    /// A whole answer must not fail because one result skipped fields. Title
+    /// falls back to the body, and `on_pick` to the Telegram default.
+    #[test]
+    fn a_partial_object_fills_in_rather_than_erroring() {
+        let r = parse(r#"{"content":"周报 2026-W31"}"#);
+        assert_eq!(r.title, "周报 2026-W31");
+        assert_eq!(r.on_pick, InlinePick::Send);
+    }
+
+    /// The inverse: a row that carried only a title still SENDS something. An
+    /// empty `content` would post a blank message on pick.
+    #[test]
+    fn title_only_still_has_a_body_to_send() {
+        let r = parse(r#"{"title":"/usage"}"#);
+        assert_eq!(r.content, "/usage");
+    }
+
+    /// Presentation and payload are separate: the row reads as a page title, the
+    /// message that gets inserted is a link.
+    #[test]
+    fn a_full_object_keeps_content_and_presentation_apart() {
+        let r = parse(
+            r#"{"id":"pg1","title":"周报模板","description":"Notion · 团队",
+                "thumb":"https://x/i.png","content":"[周报模板](https://notion.so/pg1)",
+                "cache_ttl":30,"on_pick":"insert"}"#,
+        );
+        assert_eq!(r.id, "pg1");
+        assert_eq!(r.title, "周报模板");
+        assert_eq!(r.description.as_deref(), Some("Notion · 团队"));
+        assert_eq!(r.content, "[周报模板](https://notion.so/pg1)");
+        assert_eq!(r.cache_ttl, Some(30));
+        assert_eq!(r.on_pick, InlinePick::Insert);
+    }
+
+    /// A long CJK body must be clipped by CHARS. Slicing bytes at 80 would land
+    /// mid-codepoint and panic — the crash this test exists to pin down.
+    #[test]
+    fn a_long_cjk_title_is_clipped_without_panicking() {
+        let body = "中".repeat(200);
+        let r = InlineResult::from_body(body);
+        assert_eq!(r.title.chars().count(), 81); // 80 + the ellipsis
+        assert!(r.title.ends_with('…'));
+    }
+
+    /// The title is the first line WITH CONTENT — a body that opens with blank
+    /// lines (or a card tag on line 2) must not produce an empty row.
+    #[test]
+    fn leading_blank_lines_are_skipped_for_the_title() {
+        let r = InlineResult::from_body("\n\n  实际标题\n更多正文".into());
+        assert_eq!(r.title, "实际标题");
+    }
+
+    /// Ids are content-derived and must not drift: clients cache by them.
+    #[test]
+    fn ids_are_stable_and_content_sensitive() {
+        assert_eq!(
+            InlineResult::from_body("同样的内容".into()).id,
+            InlineResult::from_body("同样的内容".into()).id
+        );
+        assert_ne!(
+            InlineResult::from_body("内容 A".into()).id,
+            InlineResult::from_body("内容 B".into()).id
+        );
+    }
 }
 
 #[cfg(test)]

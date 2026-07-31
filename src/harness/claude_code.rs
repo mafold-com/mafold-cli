@@ -334,8 +334,8 @@ impl Harness for ClaudeCode {
         crate::discover::all(workdir)
     }
 
-    async fn command(&self, _client: &Client, _chat_id: &str, name: &str, arg: &str, workdir: &str) -> CommandOutcome {
-        match crate::commands::handle(name, arg, workdir).await {
+    async fn command(&self, _client: &Client, _chat_id: &str, name: &str, arg: &str, workdir: &str, session: Option<&str>) -> CommandOutcome {
+        match crate::commands::handle(name, arg, workdir, session).await {
             crate::commands::Outcome::Reply(text) => CommandOutcome::Reply(text),
             crate::commands::Outcome::Forward => CommandOutcome::Forward,
         }

@@ -1859,7 +1859,15 @@ async fn connect_and_run(
                 let mut it = rest.splitn(2, char::is_whitespace);
                 let name = it.next().unwrap_or("").to_lowercase();
                 let arg = it.next().unwrap_or("").trim();
-                match harness.command(&client, &chat_id, &name, arg, &workdir).await {
+                // THIS chat's session, not "whichever transcript was touched
+                // last": several chats routinely share a workdir, and their
+                // daemon sessions race for newest-mtime. `/usage` reporting a
+                // sibling chat's cost is the bug that buys.
+                let session = {
+                    let skey = session_key(&chat_id, channel_id.as_deref());
+                    sessions.lock().await.get(&skey).cloned()
+                };
+                match harness.command(&client, &chat_id, &name, arg, &workdir, session.as_deref()).await {
                     // Answer on the surface the command was typed on. This one
                     // carried the thread but not the channel, so `/usage` asked
                     // in #a came back in `#all` — the whole class of bug `Dest`
@@ -2596,6 +2604,8 @@ you CANNOT set it yourself — it is owner-only. Emit a one-tap card instead: \
 `{% customize field=\"<key>\" value=\"<value>\" hint=\"…\" /%}` — the owner taps Apply, the server \
 sets that field and marks the card applied. Allowed fields: whitelist, blacklist, model, effort, \
 system_prompt, greeting (never secrets). \
+To CLEAR a field, pass an empty value (`value=\"\"`) — that is a real one-tap action, not a no-op; \
+omitting `value` entirely is what makes the card informational. \
 Example — user: \"open the whitelist to everyone\" → \
 {% customize field=\"whitelist\" value=\"*\" hint=\"所有人都能驱动它（在你机器上跑代码）\" /%}",
     );
