@@ -404,6 +404,18 @@ impl Client {
         self.post_idempotent("botEditDraft", json!({ "message_id": message_id, "content": content })).await?;
         Ok(())
     }
+    /// Close the loop on a card tap: the API is holding the tapper's request open
+    /// on this `action_id`. `result` is `{"kind":"patch","content":…}`,
+    /// `{"kind":"error","message":…}` or `{"kind":"ok"}` — a patch is both
+    /// returned to the tapper and written into the message by the server, so the
+    /// daemon must NOT also edit it here.
+    ///
+    /// Not retried: the caller is parked on a timeout, so a slow retry answers an
+    /// audience that already left.
+    pub async fn answer_card_action(&self, action_id: &str, result: serde_json::Value) -> Result<()> {
+        self.post("answerCardAction", json!({ "action_id": action_id, "result": result })).await?;
+        Ok(())
+    }
     /// RETRIED: finalizing an already-finalized message is a no-op server-side,
     /// and an unfinalized draft is precisely the "forever generating" bubble.
     pub async fn finalize(&self, message_id: &str) -> Result<()> {

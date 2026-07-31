@@ -1562,28 +1562,38 @@ async fn connect_and_run(
         // path that could drift from the one that produced the card.
         if method == "events.cardAction" {
             let conv_id = env["params"]["conversation_id"].as_str().unwrap_or("").to_string();
-            let msg_id = env["params"]["message_id"].as_str().unwrap_or("").to_string();
+            let action_id = env["params"]["action_id"].as_str().unwrap_or("").to_string();
             let from = env["params"]["from"].as_str().unwrap_or("").to_string();
             let action = env["params"]["action"].as_str().unwrap_or("").to_string();
-            // Same gate as every other tap that makes this daemon do work.
-            if !allow.read().await.allows(&from, None) { continue; }
-            // `refresh|<command>` is a contract between the card and THIS daemon;
-            // the server relayed it without knowing what it meant. Anything else
-            // is for a card we don't serve — ignore rather than guess.
-            let Some(command) = action.strip_prefix("refresh|") else { continue };
-            let Some(rest) = command.trim().strip_prefix('/') else { continue };
-            let mut it = rest.splitn(2, char::is_whitespace);
-            let name = it.next().unwrap_or("").to_lowercase();
-            let arg = it.next().unwrap_or("").trim().to_string();
             let (client, harness, workdir) = (client.clone(), harness.clone(), workdir.to_string());
             let sessions = sessions.clone();
+            let allowed = allow.read().await.allows(&from, None);
+            // ALWAYS answer — the tapper's request is parked on this id. Staying
+            // silent buys them the full timeout and then an "unavailable" that
+            // blames the daemon for being offline when it was right here saying no.
             tokio::spawn(async move {
-                let session = sessions.lock().await.get(&conv_id).cloned();
-                if let crate::harness::CommandOutcome::Reply(text) =
-                    harness.command(&client, &conv_id, &name, &arg, &workdir, session.as_deref()).await
-                {
-                    let _ = client.edit_draft(&msg_id, &text).await;
-                }
+                let result = if !allowed {
+                    serde_json::json!({ "kind": "error", "message": "Only the bot's owner (or an allow-listed user) can do that." })
+                } else if let Some(command) = action.strip_prefix("refresh|") {
+                    // `refresh|<command>` is a contract between the card and THIS
+                    // daemon; the server relayed it without knowing what it meant.
+                    let rest = command.trim().trim_start_matches('/');
+                    let mut it = rest.splitn(2, char::is_whitespace);
+                    let name = it.next().unwrap_or("").to_lowercase();
+                    let arg = it.next().unwrap_or("").trim().to_string();
+                    let session = sessions.lock().await.get(&conv_id).cloned();
+                    match harness.command(&client, &conv_id, &name, &arg, &workdir, session.as_deref()).await {
+                        crate::harness::CommandOutcome::Reply(text) => serde_json::json!({ "kind": "patch", "content": text }),
+                        // The harness doesn't emulate it — re-running it as a turn
+                        // would answer in the chat, not in the card.
+                        _ => serde_json::json!({ "kind": "error", "message": "This card can't refresh itself." }),
+                    }
+                } else {
+                    // For a card this daemon doesn't serve. Answering `ok` beats
+                    // hanging: nothing changed, and the tapper learns that now.
+                    serde_json::json!({ "kind": "ok" })
+                };
+                let _ = client.answer_card_action(&action_id, result).await;
             });
             continue;
         }
