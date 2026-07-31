@@ -1560,13 +1560,17 @@ async fn connect_and_run(
         // so the card updates under the finger instead of a second one appearing
         // below it. The command re-executes in full — there is no separate refresh
         // path that could drift from the one that produced the card.
-        if method == "events.cardRefresh" {
+        if method == "events.cardAction" {
             let conv_id = env["params"]["conversation_id"].as_str().unwrap_or("").to_string();
             let msg_id = env["params"]["message_id"].as_str().unwrap_or("").to_string();
             let from = env["params"]["from"].as_str().unwrap_or("").to_string();
-            let command = env["params"]["command"].as_str().unwrap_or("").to_string();
+            let action = env["params"]["action"].as_str().unwrap_or("").to_string();
             // Same gate as every other tap that makes this daemon do work.
             if !allow.read().await.allows(&from, None) { continue; }
+            // `refresh|<command>` is a contract between the card and THIS daemon;
+            // the server relayed it without knowing what it meant. Anything else
+            // is for a card we don't serve — ignore rather than guess.
+            let Some(command) = action.strip_prefix("refresh|") else { continue };
             let Some(rest) = command.trim().strip_prefix('/') else { continue };
             let mut it = rest.splitn(2, char::is_whitespace);
             let name = it.next().unwrap_or("").to_lowercase();
