@@ -51,6 +51,20 @@ impl LangPack {
     pub fn base_lang(&self) -> &str { &self.base_lang }
     pub fn rtl(&self) -> bool { self.rtl }
 
+    /// Whether this pack can actually resolve strings — i.e. some tier of the
+    /// cloud pack has been delivered (from cache or network). Hosts GATE THEIR
+    /// FIRST PAINT on this: there is no bundled baseline by design, so a frame
+    /// painted before it is true is a frame of raw `a.b.c` keys.
+    ///
+    /// EITHER tier counts. A zh session that got the en base but lost the zh
+    /// fetch paints English — English is the pack's real base tier, not an
+    /// invented fallback — and flips to Chinese when the retry lands. Waiting
+    /// for the active tier instead would hold the whole UI hostage to the
+    /// weaker of two requests and show nothing at all.
+    pub fn is_loaded(&self) -> bool {
+        !self.base.is_empty() || !self.active.is_empty()
+    }
+
     /// Raw value for `key`: active language first, then the base (English).
     fn raw(&self, key: &str) -> Option<&Value> {
         self.active.get(key).or_else(|| self.base.get(key))

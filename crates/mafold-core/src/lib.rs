@@ -142,6 +142,69 @@ pub struct CoreConversation {
     pub forum_member_channels: bool,
 }
 
+/// A forum channel, cached so a conversation opens with its channel list
+/// already drawn instead of blank-until-the-network-answers — the same
+/// local-first contract messages and the dialog list already have.
+///
+/// Deliberately the SERVER's shape minus the fields no client renders from
+/// cache: the cache exists to paint instantly, and the refresh right behind it
+/// carries the authoritative row.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct CoreChannel {
+    pub id: String,
+    pub conversation_id: String,
+    pub name: String,
+    pub order: i32,
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = None))]
+    pub icon: Option<String>,
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = 0))]
+    pub unread_count: u32,
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = false))]
+    pub closed: bool,
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = false))]
+    pub pinned: bool,
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = false))]
+    pub archived: bool,
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = None))]
+    pub created_by: Option<String>,
+    /// When this channel last saw activity — its newest message, or its own
+    /// creation if nobody has posted yet. The picker sorts by this (a just-made
+    /// channel is NEW, not stale), so the cache has to carry it or a cached
+    /// list would come back in a different order than a fresh one.
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = 0))]
+    pub activity_at_ms: i64,
+}
+
+/// A mini-app installed into a conversation, cached for the same reason: the
+/// launcher should be there on open, not one network round-trip later.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct CoreConvApp {
+    /// Namespaced app id (`owner/slug`) — the cache key.
+    pub app_id: String,
+    /// Sort position as the server listed it. Pinning is a server concept; the
+    /// cache only preserves the order it was given.
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = 0))]
+    pub order: i32,
+    /// The install entry VERBATIM, as the server returned it.
+    ///
+    /// The core deliberately does NOT model app manifests: capabilities, panel
+    /// size, runtime and the rest evolve on the app platform's schedule, and a
+    /// cache that re-declared them would silently drop every field it didn't
+    /// know about. Each client parses this with the same code it uses for a
+    /// live response, so cached and fresh apps can't diverge.
+    pub entry_json: String,
+}
+
 /// Smoke test exposed to the host — the core crate version.
 #[cfg_attr(not(target_arch = "wasm32"), uniffi::export)]
 pub fn core_version() -> String {
@@ -165,7 +228,7 @@ mod native {
     use std::sync::Arc;
     use crate::store::Store;
     use crate::storage::SqliteStore;
-    use crate::{CoreAccount, CoreConversation, CoreError, CoreMessage};
+    use crate::{CoreAccount, CoreChannel, CoreConvApp, CoreConversation, CoreError, CoreMessage};
 
     /// The local store. The UniFFI surface is identical to before (sync methods),
     /// so the Swift/Kotlin host is unchanged; internally it drives the async core
@@ -239,6 +302,12 @@ mod native {
         pub fn active_language(&self) -> String {
             self.inner.active_language()
         }
+        /// Whether the cloud pack is delivered and `t()` resolves real strings.
+        /// Gate the first paint on this — there is no bundled baseline, so a
+        /// frame painted before it is a frame of raw `a.b.c` keys.
+        pub fn langpack_loaded(&self) -> bool {
+            self.inner.langpack_loaded()
+        }
         /// Hydrate the active pack from the on-device cache (offline-first; no
         /// network — storage futures are always-ready, so the block_on is free).
         pub fn load_cached_language(&self) {
@@ -288,6 +357,23 @@ mod native {
         /// The channel last open in `conversation_id` (None = #all / unset).
         pub fn last_channel(&self, conversation_id: String) -> Option<String> {
             pollster::block_on(self.inner.last_channel(&conversation_id))
+        }
+
+        /// Cache a conversation's forum channels (whole-list reconcile).
+        pub fn save_channels(&self, conversation_id: String, channels: Vec<CoreChannel>) {
+            pollster::block_on(self.inner.replace_channels(&conversation_id, &channels));
+        }
+        /// Cached channels, pinned first then by `order`. Empty = nothing cached.
+        pub fn load_channels(&self, conversation_id: String) -> Vec<CoreChannel> {
+            pollster::block_on(self.inner.channels(&conversation_id))
+        }
+        /// Cache a conversation's installed mini-apps (whole-list reconcile).
+        pub fn save_conv_apps(&self, conversation_id: String, apps: Vec<CoreConvApp>) {
+            pollster::block_on(self.inner.replace_conv_apps(&conversation_id, &apps));
+        }
+        /// Cached mini-apps in the server's listed order. Empty = nothing cached.
+        pub fn load_conv_apps(&self, conversation_id: String) -> Vec<CoreConvApp> {
+            pollster::block_on(self.inner.conv_apps(&conversation_id))
         }
     }
 
@@ -486,6 +572,13 @@ mod web {
         pub fn active_language(&self) -> String {
             self.inner.active_language()
         }
+        /// Whether the cloud pack is delivered and `t()` resolves real strings.
+        /// Gate the first paint on this — there is no bundled baseline, so a
+        /// frame painted before it is a frame of raw `a.b.c` keys.
+        #[wasm_bindgen(js_name = langpackLoaded)]
+        pub fn langpack_loaded(&self) -> bool {
+            self.inner.langpack_loaded()
+        }
         /// Switch language: delta-sync the English base + chosen language, persist,
         /// swap the active pack. Returns a Promise (network I/O).
         #[wasm_bindgen(js_name = setLanguage)]
@@ -577,6 +670,48 @@ mod web {
                     Some(c) => JsValue::from_str(&c),
                     None => JsValue::UNDEFINED,
                 })
+            })
+        }
+
+        // ── local-first caches: paint on open, refresh behind ──
+        /// Cache a conversation's forum channels (whole-list reconcile).
+        #[wasm_bindgen(js_name = saveChannels)]
+        pub fn save_channels(&self, conv: String, channels_json: String) -> js_sys::Promise {
+            let inner = self.inner.clone();
+            future_to_promise(async move {
+                let list: Vec<crate::CoreChannel> =
+                    serde_json::from_str(&channels_json).unwrap_or_default();
+                inner.replace_channels(&conv, &list).await;
+                Ok(JsValue::UNDEFINED)
+            })
+        }
+        /// Promise<string> — cached channels as JSON, pinned first then `order`.
+        #[wasm_bindgen(js_name = loadChannels)]
+        pub fn load_channels(&self, conv: String) -> js_sys::Promise {
+            let inner = self.inner.clone();
+            future_to_promise(async move {
+                let list = inner.channels(&conv).await;
+                Ok(JsValue::from_str(&serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())))
+            })
+        }
+        /// Cache a conversation's installed mini-apps (whole-list reconcile).
+        #[wasm_bindgen(js_name = saveConvApps)]
+        pub fn save_conv_apps(&self, conv: String, apps_json: String) -> js_sys::Promise {
+            let inner = self.inner.clone();
+            future_to_promise(async move {
+                let list: Vec<crate::CoreConvApp> =
+                    serde_json::from_str(&apps_json).unwrap_or_default();
+                inner.replace_conv_apps(&conv, &list).await;
+                Ok(JsValue::UNDEFINED)
+            })
+        }
+        /// Promise<string> — cached mini-apps as JSON, in the server's order.
+        #[wasm_bindgen(js_name = loadConvApps)]
+        pub fn load_conv_apps(&self, conv: String) -> js_sys::Promise {
+            let inner = self.inner.clone();
+            future_to_promise(async move {
+                let list = inner.conv_apps(&conv).await;
+                Ok(JsValue::from_str(&serde_json::to_string(&list).unwrap_or_else(|_| "[]".into())))
             })
         }
     }
@@ -762,6 +897,59 @@ mod tests {
         assert_eq!(core.plural("profile.members.count".into(), 1.0, None), "1 member");
         assert_eq!(core.plural("profile.members.count".into(), 5.0, None), "5 members");
         println!("set_language_e2e_live_api: OK");
+    }
+
+    /// The channel/app caches are WHOLE-LIST reconciles, not merges: whatever
+    /// the server last listed is exactly what's cached. A channel that was
+    /// deleted server-side must not survive in the picker, and one conversation's
+    /// list must never bleed into another's.
+    #[test]
+    fn channel_and_app_caches_replace_and_scope() {
+        let core = MafoldCore::open(":memory:".into()).unwrap();
+        let ch = |id: &str, order: i32, pinned: bool, activity: i64| CoreChannel {
+            id: id.into(),
+            conversation_id: "c1".into(),
+            name: id.into(),
+            order,
+            icon: None,
+            unread_count: 0,
+            closed: false,
+            pinned,
+            archived: false,
+            created_by: None,
+            activity_at_ms: activity,
+        };
+
+        core.save_channels("c1".into(), vec![
+            ch("stale", 1, false, 100),
+            ch("fresh", 2, false, 900),
+            ch("p", 9, true, 1),          // pinned outranks recency
+        ]);
+        core.save_channels("c2".into(), vec![ch("z", 0, false, 0)]);
+
+        // Pinned → most recent → order. Note `fresh` beats `stale` DESPITE a
+        // higher `order`: recency outranks it, and order only breaks ties.
+        let got: Vec<String> = core.load_channels("c1".into()).iter().map(|c| c.id.clone()).collect();
+        assert_eq!(got, ["p", "fresh", "stale"], "pinned, then most-recently-active");
+        // Scoped per conversation.
+        assert_eq!(core.load_channels("c2".into()).len(), 1);
+
+        // Re-save WITHOUT "a" → it's gone, not merged back in.
+        core.save_channels("c1".into(), vec![ch("fresh", 2, false, 900)]);
+        let got: Vec<String> = core.load_channels("c1".into()).iter().map(|c| c.id.clone()).collect();
+        assert_eq!(got, ["fresh"], "dropped channels must not survive the reconcile");
+        assert_eq!(core.load_channels("c2".into()).len(), 1, "other conversations untouched");
+
+        let app = |id: &str, order: i32| CoreConvApp {
+            app_id: id.into(),
+            order,
+            entry_json: format!(r#"{{"id":"{id}"}}"#),
+        };
+        core.save_conv_apps("c1".into(), vec![app("o/two", 1), app("o/one", 0)]);
+        let got: Vec<String> = core.load_conv_apps("c1".into()).iter().map(|a| a.app_id.clone()).collect();
+        assert_eq!(got, ["o/one", "o/two"], "server order preserved");
+        core.save_conv_apps("c1".into(), vec![]);
+        assert!(core.load_conv_apps("c1".into()).is_empty(), "uninstalling clears the cache");
     }
 
     #[test]

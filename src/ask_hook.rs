@@ -3,7 +3,7 @@
 //! The native AskUserQuestion auto-declines in headless `claude -p` (no client to
 //! collect the answer). We register this command as a PreToolUse hook matching
 //! AskUserQuestion (see `harness::claude_code`); claude runs it BEFORE the tool.
-//! It blocks until the user answers the `{% ask %}` chat card — the daemon writes
+//! It blocks until the user answers the `{% mafold/ask %}` chat card — the daemon writes
 //! their pick to `$MAFOLD_ASK_FILE` — then returns a `deny` whose reason carries
 //! the answer. claude feeds that reason back to the model as the tool's result,
 //! so the model continues the SAME turn with the user's choice. (Validated: a

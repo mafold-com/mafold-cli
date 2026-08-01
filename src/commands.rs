@@ -171,7 +171,7 @@ fn dump_settings(workdir: &str) -> String {
         rows.push((k.clone(), val, k.clone()));
     }
 
-    let mut out = String::from("{% stats title=\"Settings\" icon=\"wrench\" %}\n");
+    let mut out = String::from("{% mafold/stats title=\"Settings\" icon=\"wrench\" %}\n");
     for (label, val, key) in rows {
         let tag = match src.get(&key) {
             Some(&l) if l != "user" => format!(" · {l}"),
@@ -179,7 +179,7 @@ fn dump_settings(workdir: &str) -> String {
         };
         out.push_str(&format!("kv|{label}|{}{tag}\n", clip(&val, 90)));
     }
-    out.push_str("{% /stats %}\n");
+    out.push_str("{% /mafold/stats %}\n");
     for (label, p, body) in raws {
         out.push_str(&format!("\n**{label}** · `{}`\n{}\n", p.display(), fence("json", &body)));
     }
@@ -741,7 +741,7 @@ fn stats(limits_body: &str, workdir: &str, session: Option<&str>) -> String {
     // Only the four figures that earn a big number stay props; messages, tool
     // calls and the busiest hour moved into the `meta|` footnote above.
     format!(
-        "{{% stats sessions=\"{}\" tokens=\"{}\" days=\"{}\" since=\"{}\" %}}\n{}{{% /stats %}}",
+        "{{% mafold/stats sessions=\"{}\" tokens=\"{}\" days=\"{}\" since=\"{}\" %}}\n{}{{% /mafold/stats %}}",
         humanize(agg.sessions), humanize(agg.tokens_io()),
         format_args!("{active_days}/{span_days}"), fmt_date(&agg.first_iso), body,
     )
@@ -1498,6 +1498,100 @@ pub fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// Gate: every card tag this crate EMITS must be fully qualified (`owner/slug`).
+///
+/// The `owner/slug` migration was done in batches ("② 第一批,render/hooks") and
+/// the `{% stats %}` emitters behind `/usage`, `/settings` and `/status` were
+/// simply never in a batch — so `/usage` kept rendering as raw markup in the
+/// bubble long after bare resolution was removed. Nothing failed: a bare tag is
+/// not an error, it is just text that never becomes a card.
+///
+/// Scans this crate's own source instead of testing each builder, because the
+/// builders need live machine state (settings.json, `claude -p`) and are all
+/// `#[ignore]`d — a source scan is the only check that actually runs in CI.
+#[cfg(test)]
+mod card_tag_lint {
+    /// `//`-comments are prose ABOUT tags (`/// the {% bash %} card`), not
+    /// emissions. Rust doc/line comments are line-based, so dropping from `//`
+    /// to end-of-line is exact for them; `format!` placeholders like `{{%` are
+    /// normalized to `{%` first so the emitted shape is what gets checked.
+    fn emitted_tags(src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for line in src.lines() {
+            // Checked on the RAW line, before comments are stripped: the escape
+            // hatch has to survive its own stripping. Used only by this module's
+            // self-test fixtures, which are deliberately bare.
+            if line.contains("LINT-IGNORE") {
+                continue;
+            }
+            let code = match line.find("//") {
+                Some(i) => &line[..i],
+                None => line,
+            };
+            let code = code.replace("{{%", "{%");
+            let mut rest = code.as_str();
+            while let Some(i) = rest.find("{%") {
+                rest = &rest[i + 2..];
+                let name: String = rest
+                    .trim_start()
+                    .trim_start_matches('/')
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '/')
+                    .collect();
+                if !name.is_empty() {
+                    out.push(name);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_emitted_card_tag_is_fully_qualified() {
+        // The files that actually emit cards. `include_str!` resolves relative to
+        // THIS file, so adding an emitter file here is a one-line change.
+        const SOURCES: &[(&str, &str)] = &[
+            ("commands.rs", include_str!("commands.rs")),
+            ("agent.rs", include_str!("agent.rs")),
+            ("render.rs", include_str!("render.rs")),
+            ("bash_hook.rs", include_str!("bash_hook.rs")),
+            ("ask_hook.rs", include_str!("ask_hook.rs")),
+            ("wallet.rs", include_str!("wallet.rs")),
+        ];
+        let mut bare = Vec::new();
+        for (name, src) in SOURCES {
+            for tag in emitted_tags(src) {
+                // `owner/cardname` is the preamble's placeholder for "any card".
+                if !tag.contains('/') {
+                    bare.push(format!("{name}: {{% {tag} %}}"));
+                }
+            }
+        }
+        assert!(
+            bare.is_empty(),
+            "bare card tags emitted (a card reference is `owner/slug`, \
+             see .docs/card-namespace-v1.md §4):\n  {}",
+            bare.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn the_lint_itself_detects_a_bare_tag() {
+        // Guard the guard: a scanner that silently matches nothing would "pass"
+        // forever. Comments must stay invisible, emissions must not.
+        assert_eq!(emitted_tags("let s = \"{% stats a=1 %}\";"), vec!["stats"]); // LINT-IGNORE
+        assert_eq!(emitted_tags("format!(\"{{% stats %}}\")"), vec!["stats"]); // LINT-IGNORE
+        assert_eq!(emitted_tags("/// the {% bash %} card"), Vec::<String>::new()); // LINT-IGNORE
+        assert_eq!(
+            emitted_tags("let s = \"{% mafold/stats %}…{% /mafold/stats %}\";"), // LINT-IGNORE
+            vec!["mafold/stats", "mafold/stats"]
+        );
+        // The escape hatch must not be a blanket off-switch for a whole file.
+        assert_eq!(emitted_tags("\"{% stats %}\" // LINT-IGNORE"), Vec::<String>::new());
+        assert_eq!(emitted_tags("\"{% stats %}\""), vec!["stats"]); // LINT-IGNORE
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1665,7 +1759,7 @@ Last 7d · 7983 requests · 30 sessions
         }
         let s = stats("", &workdir, None);
         println!("{s}");
-        assert!(s.contains("{% stats "));
+        assert!(s.contains("{% mafold/stats "));
     }
 
     #[test]
@@ -1673,7 +1767,7 @@ Last 7d · 7983 requests · 30 sessions
     fn settings_smoke_print() {
         let s = dump_settings(".");
         println!("{s}");
-        assert!(s.contains("{% stats title=\"Settings\""));
+        assert!(s.contains("{% mafold/stats title=\"Settings\""));
     }
 
     #[tokio::test]

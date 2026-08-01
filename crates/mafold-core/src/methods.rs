@@ -27,6 +27,7 @@ use crate::net::{self, RpcError};
 pub static KNOWN_METHODS: &[&str] = &[
     "addChatMembers",
     "addGroupBot",
+    "answerCardAction",
     "answerInlineQuery",
     "appRoom.get",
     "appRoom.increment",

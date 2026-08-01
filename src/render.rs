@@ -25,14 +25,14 @@ pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<St
             if out.is_empty() {
                 return None;
             }
-            Some(format!("\n{{% bash %}}\n{}{{% /bash %}}\n", block_esc(&cap_lines(out, 20))))
+            Some(format!("\n{{% mafold/bash %}}\n{}{{% /mafold/bash %}}\n", block_esc(&cap_lines(out, 20))))
         }
         AgentEvent::Thinking(t) => {
             let t = t.trim();
             if t.is_empty() {
                 return None;
             }
-            Some(format!("\n{{% thinking %}}\n{}{{% /thinking %}}\n", block_esc(&cap_lines(t, 14))))
+            Some(format!("\n{{% mafold/thinking %}}\n{}{{% /mafold/thinking %}}\n", block_esc(&cap_lines(t, 14))))
         }
         AgentEvent::Done { duration_ms, cost_usd, tokens } => result_tag(*duration_ms, *cost_usd, *tokens),
         AgentEvent::Session(_) => None,
@@ -45,18 +45,18 @@ pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<St
     }
 }
 
-/// Stamp the user's answer into the pending (last unanswered) `{% ask %}` card
-/// in `full` by rewriting its opening tag to `{% ask answered="…" %}`. The
+/// Stamp the user's answer into the pending (last unanswered) `{% mafold/ask %}` card
+/// in `full` by rewriting its opening tag to `{% mafold/ask answered="…" %}`. The
 /// message content itself is the durable record — a reloaded page or another
 /// device renders the card answered instead of re-offering the buttons. A
-/// stamped opener no longer matches the bare `{% ask %}` needle, so an
+/// stamped opener no longer matches the bare `{% mafold/ask %}` needle, so an
 /// already-answered card can never be re-stamped. Returns false when no
 /// unanswered ask card is present.
 pub fn stamp_ask_answered(full: &mut String, answer: &str) -> bool {
-    const OPEN: &str = "{% ask %}";
+    const OPEN: &str = "{% mafold/ask %}";
     let Some(pos) = full.rfind(OPEN) else { return false };
     let val = answered_attr(answer);
-    full.replace_range(pos..pos + OPEN.len(), &format!("{{% ask answered=\"{val}\" %}}"));
+    full.replace_range(pos..pos + OPEN.len(), &format!("{{% mafold/ask answered=\"{val}\" %}}"));
     true
 }
 
@@ -88,7 +88,7 @@ fn answered_attr(answer: &str) -> String {
     }
 }
 
-/// The summary category for a tool call — drives the `{% run %}` group label.
+/// The summary category for a tool call — drives the `{% mafold/run %}` group label.
 /// `None` for anything that isn't a counted action (text, tool results, thinking,
 /// the interactive ask).
 pub fn tool_kind(ev: &AgentEvent) -> Option<&'static str> {
@@ -130,11 +130,11 @@ pub fn run_summary(counts: &HashMap<&'static str, usize>) -> String {
     ch.next().map(|f| f.to_uppercase().collect::<String>() + ch.as_str()).unwrap_or(joined)
 }
 
-/// Wrap one consecutive group of primitive cards in a collapsible `{% run %}`
+/// Wrap one consecutive group of primitive cards in a collapsible `{% mafold/run %}`
 /// with its human summary. `body` is already valid markdoc (the nested cards),
 /// so it is NOT escaped; each primitive escapes its own body.
 pub fn run_card(summary: &str, body: &str) -> String {
-    format!("\n{{% run summary=\"{}\" %}}\n{}{{% /run %}}\n", attr_esc(summary), body)
+    format!("\n{{% mafold/run summary=\"{}\" %}}\n{}{{% /mafold/run %}}\n", attr_esc(summary), body)
 }
 
 /// A tool call → the right card.
@@ -144,22 +144,22 @@ fn tool_use_tag(name: &str, input: &Value) -> String {
         "edit" | "multiedit" => diff_tag_edit(&name.to_lowercase(), input),
         "write" => diff_tag_write(input),
         "task" => format!(
-            "\n{{% task subagent=\"{}\" desc=\"{}\" /%}}\n",
+            "\n{{% mafold/task subagent=\"{}\" desc=\"{}\" /%}}\n",
             attr_esc(input["subagent_type"].as_str().unwrap_or("agent")),
             attr_esc(input["description"].as_str().unwrap_or("")),
         ),
-        "webfetch" => format!("\n{{% web url=\"{}\" /%}}\n", attr_esc(input["url"].as_str().unwrap_or(""))),
-        "websearch" => format!("\n{{% web query=\"{}\" /%}}\n", attr_esc(input["query"].as_str().unwrap_or(""))),
+        "webfetch" => format!("\n{{% mafold/web url=\"{}\" /%}}\n", attr_esc(input["url"].as_str().unwrap_or(""))),
+        "websearch" => format!("\n{{% mafold/web query=\"{}\" /%}}\n", attr_esc(input["query"].as_str().unwrap_or(""))),
         "skill" => {
             let sname = input["command"].as_str()
                 .or_else(|| input["skill"].as_str())
                 .or_else(|| input["name"].as_str())
                 .unwrap_or("skill");
             let args = input["args"].as_str().or_else(|| input["arguments"].as_str()).unwrap_or("");
-            format!("\n{{% skill name=\"{}\" args=\"{}\" /%}}\n", attr_esc(sname), attr_esc(args))
+            format!("\n{{% mafold/skill name=\"{}\" args=\"{}\" /%}}\n", attr_esc(sname), attr_esc(args))
         }
         "askuserquestion" => ask_tag(input),
-        _ => format!("\n{{% tool name=\"{}\" detail=\"{}\" /%}}\n", attr_esc(name), attr_esc(&tool_detail(name, input))),
+        _ => format!("\n{{% mafold/tool name=\"{}\" detail=\"{}\" /%}}\n", attr_esc(name), attr_esc(&tool_detail(name, input))),
     }
 }
 
@@ -185,7 +185,7 @@ fn ask_tag(input: &Value) -> String {
             }
         }
     }
-    format!("\n{{% ask %}}\n{}{{% /ask %}}\n", block_esc(&body))
+    format!("\n{{% mafold/ask %}}\n{}{{% /mafold/ask %}}\n", block_esc(&body))
 }
 
 /// One pipe-delimited cell: newlines/tabs/pipes collapse to spaces (the `|`
@@ -216,7 +216,7 @@ fn todo_tag(input: &Value) -> String {
             body.push_str(&format!("[{mark}] {}\n", line_esc(content)));
         }
     }
-    format!("\n{{% todo %}}\n{}{{% /todo %}}\n", block_esc(&body))
+    format!("\n{{% mafold/todo %}}\n{}{{% /mafold/todo %}}\n", block_esc(&body))
 }
 
 fn diff_tag_edit(lname: &str, input: &Value) -> String {
@@ -247,7 +247,7 @@ fn diff_tag_write(input: &Value) -> String {
 
 fn diff_tag(file: &str, added: usize, removed: usize, body: &str) -> String {
     format!(
-        "\n{{% diff file=\"{}\" added={} removed={} %}}\n{}{{% /diff %}}\n",
+        "\n{{% mafold/diff file=\"{}\" added={} removed={} %}}\n{}{{% /mafold/diff %}}\n",
         attr_esc(file), added, removed, block_esc(&cap_lines(body, 24)),
     )
 }
@@ -270,7 +270,7 @@ fn result_tag(dur: Option<f64>, cost: Option<f64>, tokens: Option<u64>) -> Optio
     if let Some(d) = dur { attrs.push_str(&format!(" duration=\"{:.1}s\"", d / 1000.0)); }
     if let Some(t) = tokens { attrs.push_str(&format!(" tokens=\"{}\"", fmt_count(t))); }
     if let Some(c) = cost { attrs.push_str(&format!(" cost=\"${c:.4}\"")); }
-    Some(format!("\n{{% result{attrs} /%}}\n"))
+    Some(format!("\n{{% mafold/result{attrs} /%}}\n"))
 }
 
 /// A short, human-readable detail for a generic tool card (file, command, …).
@@ -339,14 +339,14 @@ fn attr_esc(s: &str) -> String {
 mod stamp_tests {
     use super::{stamp_ask_answered, stamp_unanswered_ask};
 
-    const CARD: &str = "hi\n{% ask %}\nq|Deploy|0|Ship?\no|Yes|now\no|Hold|later\n{% /ask %}\n";
+    const CARD: &str = "hi\n{% mafold/ask %}\nq|Deploy|0|Ship?\no|Yes|now\no|Hold|later\n{% /mafold/ask %}\n";
 
     #[test]
     fn rewrites_opener_with_answered_attr() {
         let mut full = CARD.to_string();
         assert!(stamp_ask_answered(&mut full, "Yes"));
-        assert!(full.contains("{% ask answered=\"Yes\" %}\nq|Deploy|0|Ship?"));
-        assert!(!full.contains("{% ask %}"));
+        assert!(full.contains("{% mafold/ask answered=\"Yes\" %}\nq|Deploy|0|Ship?"));
+        assert!(!full.contains("{% mafold/ask %}"));
     }
 
     #[test]
@@ -355,14 +355,14 @@ mod stamp_tests {
         assert!(stamp_ask_answered(&mut full, "Say \"go\"\nRegion: EU"));
         // first card untouched, second stamped; quotes → ', newlines → space
         assert!(full.starts_with(CARD));
-        assert!(full.contains("{% ask answered=\"Say 'go' Region: EU\" %}"));
+        assert!(full.contains("{% mafold/ask answered=\"Say 'go' Region: EU\" %}"));
     }
 
     #[test]
     fn empty_answer_still_marks_answered() {
         let mut full = CARD.to_string();
         assert!(stamp_ask_answered(&mut full, "  \n "));
-        assert!(full.contains("{% ask answered=\"✓\" %}"));
+        assert!(full.contains("{% mafold/ask answered=\"✓\" %}"));
     }
 
     #[test]
@@ -375,7 +375,7 @@ mod stamp_tests {
     #[test]
     fn finalized_stamps_once_only() {
         let first = stamp_unanswered_ask(CARD, "Hold").expect("unanswered card should stamp");
-        assert!(first.contains("{% ask answered=\"Hold\" %}"));
+        assert!(first.contains("{% mafold/ask answered=\"Hold\" %}"));
         // a stamped opener no longer matches the bare needle → never re-stamped
         assert!(stamp_unanswered_ask(&first, "Yes").is_none());
         assert!(stamp_unanswered_ask("no card here", "Yes").is_none());

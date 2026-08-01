@@ -46,7 +46,7 @@ fn rewrite(input: &str) -> Option<String> {
 /// Can a `run_in_background` Bash actually be moved out of claude's kill radius
 /// on this platform? THE SINGLE SOURCE OF TRUTH for the whole promise chain —
 /// `agent.rs` states it to the model in the system prompt, and only emits the
-/// `{% bgtasks %}` card ("结果会出现在下一条回复里") for tasks this returned true
+/// `{% mafold/bgtasks %}` card ("结果会出现在下一条回复里") for tasks this returned true
 /// for. When it is false the agent must not claim a follow-up is coming.
 pub const fn bg_detach_supported() -> bool {
     cfg!(unix)

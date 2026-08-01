@@ -10,13 +10,15 @@
 //!   "acct" : username                     -> CoreAccount
 //!   "conv" : id                           -> ConvMeta (head + participants inline)
 //!   "msg"  : "{convId}|{padded ts}|{id}"   -> CoreMessage (sender inline) — key sorts by time
+//!   "chan" : "{convId}|{channelId}"        -> CoreChannel  (forum channel list)
+//!   "capp" : "{convId}|{appId}"            -> CoreConvApp  (installed mini-apps)
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use futures::lock::Mutex;
 use crate::storage::Storage;
 use crate::i18n::parse_args;
-use crate::{CoreAccount, CoreConversation, CoreMessage};
+use crate::{CoreAccount, CoreChannel, CoreConvApp, CoreConversation, CoreMessage};
 
 /// Server `getLangPackDiff` result (changed keys + removed keys + new version).
 #[derive(Deserialize)]
@@ -151,22 +153,69 @@ impl<S: Storage> Store<S> {
     /// the server (delta since our cached version), persist both, swap the in-memory
     /// pack. English is always loaded as the fallback base.
     pub async fn set_language(&self, base: &str, token: &str, code: &str) -> Result<(), String> {
-        let en = self.sync_pack(base, token, "en").await?;
-        let (active_strings, active_version) = if code == "en" {
-            (Map::new(), en.version)
-        } else {
-            let p = self.sync_pack(base, token, code).await?;
-            (p.strings, p.version)
+        // The CHOICE is persisted first and unconditionally: a sync that dies
+        // half-way must not also lose which language the user picked, or the next
+        // open silently re-hydrates the wrong one.
+        self.store.put("i18n", "active", code.as_bytes().to_vec()).await;
+
+        // Fetch BOTH tiers before giving up on either. This used to be two `?`
+        // early-returns, which meant a half-reachable network (en 200, zh 503)
+        // applied NOTHING — the pack stayed empty and every surface painted raw
+        // `a.b.c` keys, even though one tier had arrived intact. Whatever we got
+        // goes in; whatever we missed falls back to the on-device cache of the
+        // same cloud pack; the error is reported so the host can retry.
+        let en = self.sync_pack(base, token, "en").await;
+        let active = match code {
+            "en" => None,
+            _ => Some(self.sync_pack(base, token, code).await),
         };
+
+        // Cache reads happen HERE, before the lock: `lang` is a std RwLock whose
+        // guard must never be held across an `.await` (it isn't Send, and holding
+        // it would block every synchronous `t()` on I/O).
+        let en_cached = match &en {
+            Err(_) => Some(self.cached_pack("en").await),
+            Ok(_) => None,
+        };
+        let active_cached = match &active {
+            Some(Err(_)) => Some(self.cached_pack(code).await),
+            _ => None,
+        };
+
         {
             let mut lp = self.lang.write().unwrap_or_else(|e| e.into_inner());
-            lp.set_base("en", en.strings);
+            match (&en, en_cached) {
+                (Ok(p), _) => lp.set_base("en", p.strings.clone()),
+                // Network lost: fall back to the on-device cache of the same
+                // cloud pack rather than blanking one we already had.
+                (Err(_), Some(c)) if !lp.is_loaded() && !c.strings.is_empty() => {
+                    lp.set_base("en", c.strings)
+                }
+                (Err(_), _) => {}
+            }
             // rtl=false for v0 (en/zh both LTR); RTL metadata comes from
             // resolveLangPacks/listLanguages when an RTL language is added.
-            lp.set_active(code, active_version, active_strings, false);
+            match (&en, &active, active_cached) {
+                (_, Some(Ok(p)), _) => lp.set_active(code, p.version, p.strings.clone(), false),
+                (_, Some(Err(_)), Some(c)) if !c.strings.is_empty() => {
+                    lp.set_active(code, c.version, c.strings, false)
+                }
+                (Ok(p), None, _) => lp.set_active("en", p.version, Map::new(), false),
+                _ => {}
+            }
         }
-        self.store.put("i18n", "active", code.as_bytes().to_vec()).await;
-        Ok(())
+
+        match (en, active) {
+            (Err(e), _) | (_, Some(Err(e))) => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether the cloud pack is delivered and `t()` resolves real strings. There
+    /// is NO bundled baseline by design (one pack, cloud-only), so a host that
+    /// paints before this is true paints raw keys — gate the first frame on it.
+    pub fn langpack_loaded(&self) -> bool {
+        self.lang.read().unwrap_or_else(|e| e.into_inner()).is_loaded()
     }
 
     /// Hydrate the in-memory pack from the on-device cache (offline-first): the
@@ -489,6 +538,79 @@ impl<S: Storage> Store<S> {
         }
     }
 
+    /// Replace the cached channel list for `conv`. Whole-list reconcile, like
+    /// `replace_conversations`: channels the server no longer lists are dropped,
+    /// so a deleted channel can't linger in the picker.
+    pub async fn replace_channels(&self, conv: &str, channels: &[CoreChannel]) {
+        let _g = self.write_lock.lock().await;
+        let prefix = format!("{conv}|");
+        for ch in channels {
+            self.store
+                .put("chan", &format!("{prefix}{}", ch.id), ser(ch))
+                .await;
+        }
+        let keep: std::collections::HashSet<&str> = channels.iter().map(|c| c.id.as_str()).collect();
+        for (key, _) in self.store.scan_prefix("chan", &prefix).await {
+            let id = key.rsplit('|').next().unwrap_or("");
+            if !keep.contains(id) {
+                self.store.delete("chan", &key).await;
+            }
+        }
+    }
+
+    /// The cached channels of `conv`, in the order the picker wants them:
+    /// pinned first, then MOST-RECENTLY-ACTIVE first, `order` only breaking
+    /// ties. Same rule as web's `sortChannels` — a cached list that came back
+    /// in a different order than a fresh one would make the picker visibly
+    /// reshuffle the moment the network answered. Empty = nothing cached yet.
+    pub async fn channels(&self, conv: &str) -> Vec<CoreChannel> {
+        let mut out: Vec<CoreChannel> = self
+            .store
+            .scan_prefix("chan", &format!("{conv}|"))
+            .await
+            .iter()
+            .filter_map(|(_, v)| de::<CoreChannel>(v))
+            .collect();
+        out.sort_by(|a, b| {
+            b.pinned
+                .cmp(&a.pinned)
+                .then(b.activity_at_ms.cmp(&a.activity_at_ms))
+                .then(a.order.cmp(&b.order))
+        });
+        out
+    }
+
+    /// Replace the cached mini-app list for `conv` (same reconcile contract).
+    pub async fn replace_conv_apps(&self, conv: &str, apps: &[CoreConvApp]) {
+        let _g = self.write_lock.lock().await;
+        let prefix = format!("{conv}|");
+        for a in apps {
+            self.store
+                .put("capp", &format!("{prefix}{}", a.app_id), ser(a))
+                .await;
+        }
+        let keep: std::collections::HashSet<&str> = apps.iter().map(|a| a.app_id.as_str()).collect();
+        for (key, _) in self.store.scan_prefix("capp", &prefix).await {
+            let id = key.strip_prefix(&prefix).unwrap_or("");
+            if !keep.contains(id) {
+                self.store.delete("capp", &key).await;
+            }
+        }
+    }
+
+    /// The cached mini-apps of `conv`, in the server's listed order.
+    pub async fn conv_apps(&self, conv: &str) -> Vec<CoreConvApp> {
+        let mut out: Vec<CoreConvApp> = self
+            .store
+            .scan_prefix("capp", &format!("{conv}|"))
+            .await
+            .iter()
+            .filter_map(|(_, v)| de::<CoreConvApp>(v))
+            .collect();
+        out.sort_by_key(|a| a.order);
+        out
+    }
+
     /// The channel last open in `conv` — `None` = #all (never set / cleared).
     pub async fn last_channel(&self, conv: &str) -> Option<String> {
         self.store
@@ -730,6 +852,69 @@ mod tests {
         let b2: serde_json::Value = serde_json::from_str(&mock.request(2).body).unwrap();
         assert_eq!(b2["from_version"], 15, "cached version must drive the delta request");
         assert_eq!(s.t("settings.title", None), "设置", "empty delta must keep merged strings");
+    }
+
+    #[tokio::test]
+    async fn set_language_partial_failure_keeps_the_tier_that_arrived() {
+        use crate::testutil::{ok, spawn_mock};
+        let s = store();
+        // en 200, the active language 503 — the half-reachable network that used
+        // to `?` out of set_language and leave the pack EMPTY (every surface then
+        // painted raw `a.b.c` keys even though en had arrived intact).
+        let mock = spawn_mock(vec![
+            ok(r#"{"version":15,"strings":{"settings.title":"Settings"}}"#),
+            (503, "{\"ok\":false,\"error\":\"upstream\"}".into()),
+        ]);
+        let res = s.set_language(&mock.base, "tok", "zh-Hans").await;
+        assert!(res.is_err(), "the failure must still be reported so the host retries");
+        assert_eq!(
+            s.t("settings.title", None),
+            "Settings",
+            "the tier that arrived must be applied, NOT discarded"
+        );
+        assert!(s.langpack_loaded(), "en-only is still a usable pack, not a blank one");
+        // And the user's pick survives the failed sync for the next attempt.
+        assert_eq!(
+            s.store.get("i18n", "active").await.map(|b| String::from_utf8(b).unwrap()),
+            Some("zh-Hans".into()),
+        );
+    }
+
+    #[tokio::test]
+    async fn set_language_falls_back_to_cache_when_the_network_is_gone() {
+        use crate::testutil::spawn_mock;
+        let s = store();
+        let zh = CachedPack {
+            version: 9,
+            strings: serde_json::from_str(r#"{"settings.title":"设置"}"#).unwrap(),
+        };
+        let en = CachedPack {
+            version: 9,
+            strings: serde_json::from_str(r#"{"settings.title":"Settings"}"#).unwrap(),
+        };
+        s.store.put("i18n", "pack/en", ser(&en)).await;
+        s.store.put("i18n", "pack/zh-Hans", ser(&zh)).await;
+        // Both tiers fail: the cached CLOUD pack (not a bundled baseline) carries
+        // the session; a totally offline open must never paint raw keys.
+        let mock = spawn_mock(vec![(503, "{\"ok\":false,\"error\":\"down\"}".into())]);
+        assert!(s.set_language(&mock.base, "tok", "zh-Hans").await.is_err());
+        assert_eq!(s.t("settings.title", None), "设置");
+        assert!(s.langpack_loaded());
+    }
+
+    #[test]
+    fn langpack_loaded_is_false_until_the_cloud_pack_lands() {
+        let s = store();
+        assert!(!s.langpack_loaded(), "a fresh store has no pack — hosts must not paint yet");
+        pollster::block_on(async {
+            let en = CachedPack {
+                version: 1,
+                strings: serde_json::from_str(r#"{"settings.title":"Settings"}"#).unwrap(),
+            };
+            s.store.put("i18n", "pack/en", ser(&en)).await;
+            s.load_cached_language().await;
+        });
+        assert!(s.langpack_loaded(), "cached cloud pack ⇒ t() resolves ⇒ safe to paint");
     }
 
     #[tokio::test]

@@ -72,7 +72,9 @@ pub enum CardsCmd {
 
 #[derive(Deserialize)]
 struct CardManifest {
-    tag: String,
+    /// `owner/slug` — the same identity shape as an app id. The publisher states
+    /// its namespace; the server refuses a bare tag rather than guessing one.
+    id: String,
     version: String,
     #[serde(default = "default_entry")]
     entry: String,
@@ -81,6 +83,31 @@ struct CardManifest {
 }
 fn default_entry() -> String {
     "src/card.tsx".into()
+}
+
+impl CardManifest {
+    /// The slug half of `owner/slug` — used for bundle filenames and for the
+    /// `{% owner/slug %}` hint we print. Falls back to the whole id so a
+    /// malformed manifest still produces a readable filename before validation.
+    fn slug(&self) -> &str {
+        self.id.split_once('/').map(|(_, s)| s).unwrap_or(&self.id)
+    }
+}
+
+/// `owner/slug`, mirroring the server's `parse_app_id`: owner is an account
+/// username (one optional `:`), slug is card-tag shaped.
+fn valid_card_id(id: &str) -> bool {
+    let Some((owner, slug)) = id.split_once('/') else {
+        return false;
+    };
+    let owner_ok = !owner.is_empty()
+        && owner.split(':').count() <= 2
+        && owner.split(':').all(|s| {
+            !s.is_empty()
+                && s.starts_with(|c: char| c.is_ascii_lowercase())
+                && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        });
+    owner_ok && valid_tag(slug)
 }
 
 pub async fn run(cmd: CardsCmd, base: String, token: Option<String>) -> Result<()> {
@@ -131,9 +158,9 @@ async fn cmd_dev(dir: &str, port: u16) -> Result<()> {
         anyhow::bail!("entry not found: {}", entry.display());
     }
     let esbuild = ensure_esbuild().await?;
-    let out = format!("dist/{}.js", manifest.tag);
+    let out = format!("dist/{}.js", manifest.slug());
 
-    println!("→ serving {} on http://127.0.0.1:{port}/{}.js", manifest.tag, manifest.tag);
+    println!("→ serving {} on http://127.0.0.1:{port}/{}.js", manifest.id, manifest.slug());
     println!("  watching {} (Ctrl-C to stop)\n", manifest.entry);
 
     // esbuild runs the watch + static server itself; this blocks until Ctrl-C.
@@ -158,8 +185,11 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
         "publish needs your bot token — pass --token or set $MAFOLD_BOT_TOKEN",
     )?;
     let manifest = read_manifest(dir)?;
-    if !valid_tag(&manifest.tag) {
-        anyhow::bail!("mafold.card.json tag must match [a-z][a-z0-9-]*");
+    if !valid_card_id(&manifest.id) {
+        anyhow::bail!(
+            "mafold.card.json `id` must be `owner/slug` (e.g. \"mafold/ask\"), got {:?}",
+            manifest.id
+        );
     }
     let entry = Path::new(dir).join(&manifest.entry);
     if !entry.exists() {
@@ -169,13 +199,13 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
     let esbuild = ensure_esbuild().await?;
     let out_dir = Path::new(dir).join("dist");
     std::fs::create_dir_all(&out_dir)?;
-    let out = out_dir.join(format!("{}.js", manifest.tag));
+    let out = out_dir.join(format!("{}.js", manifest.slug()));
 
     println!("→ bundling {} …", manifest.entry);
     let status = tokio::process::Command::new(&esbuild)
         .current_dir(dir)
         .arg(&manifest.entry)
-        .args(bundle_args(&format!("dist/{}.js", manifest.tag)))
+        .args(bundle_args(&format!("dist/{}.js", manifest.slug())))
         .arg("--minify")
         .status()
         .await
@@ -188,7 +218,7 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
 
     let client = Client::new(base, token);
     let meta = json!({
-        "tag": manifest.tag,
+        "id": manifest.id,
         "version": manifest.version,
         "display_name": manifest.display_name,
     });
@@ -200,23 +230,14 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
     let version = r["version"].as_str().unwrap_or(&manifest.version);
     println!(
         "\n✓ published {}@{} ({} scope)\n  url:   {}\n  use:   {{% {} /%}}",
-        manifest.tag, version, scope, url, manifest.tag
+        manifest.id, version, scope, url, manifest.id
     );
     if version != manifest.version {
         println!("  note: server stored {version} (manifest says {}) — content-drift auto-bump", manifest.version);
     }
-    // The accident that has no symptoms: publishing a first-party tag with your
-    // OWN token succeeds, looks identical to a real publish, and then freezes
-    // that tag for your whole family while the pipeline keeps shipping a global
-    // copy you no longer resolve. Say it loudly, and say how to undo it.
-    if r["shadows_global"].as_bool().unwrap_or(false) {
-        println!(
-            "\n⚠ this SHADOWS the global `{}` card for everyone in the `{scope}` family.\n  \
-             They will stop receiving global updates to it until you run:\n      \
-             mafold cards unpublish {}",
-            manifest.tag, manifest.tag
-        );
-    }
+    // No shadow warning any more: the namespace is stated in the manifest, so
+    // publishing into one you don't manage is a hard 403 rather than a silent
+    // freeze. The accident that flag existed to catch cannot happen.
     Ok(())
 }
 
@@ -435,9 +456,12 @@ pub(crate) fn title_case(tag: &str) -> String {
         .join(" ")
 }
 
+/// The scaffold cannot know the author's account, and guessing one would be the
+/// very implicit-namespace habit this model removed — so it emits a placeholder
+/// owner that fails `valid_card_id` loudly on the first publish.
 fn manifest_json(tag: &str, title: &str) -> String {
     format!(
-        "{{\n  \"tag\": \"{tag}\",\n  \"version\": \"0.1.0\",\n  \"entry\": \"src/card.tsx\",\n  \"displayName\": \"{title}\"\n}}\n"
+        "{{\n  \"id\": \"YOUR-ACCOUNT/{tag}\",\n  \"version\": \"0.1.0\",\n  \"entry\": \"src/card.tsx\",\n  \"displayName\": \"{title}\"\n}}\n"
     )
 }
 

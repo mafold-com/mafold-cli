@@ -103,7 +103,7 @@ impl Client {
     /// the machine. A full-snapshot write has no such constraint: replaying it
     /// re-asserts the same final state. So these retry on timeouts and dropped
     /// responses too — the failure modes that a connect-only retry misses and
-    /// that leave a turn's LAST push (the one that removes `{% generating %}`)
+    /// that leave a turn's LAST push (the one that removes `{% mafold/generating %}`)
     /// silently dropped, stranding the bubble mid-animation forever.
     async fn post_idempotent(&self, method: &str, body: Value) -> Result<Value> {
         let mut delay = std::time::Duration::from_millis(400);
@@ -394,10 +394,10 @@ impl Client {
 
     /// Replace a streaming draft's FULL content (Telegram `sendMessageDraft`
     /// style — each push is the complete snapshot, so we can rewrite earlier
-    /// output, e.g. swap a trailing `{% generating %}` card for `{% result %}`).
+    /// output, e.g. swap a trailing `{% mafold/generating %}` card for `{% mafold/result %}`).
     ///
     /// RETRIED (see `post_idempotent`): a snapshot write is idempotent, and the
-    /// final one of a turn is what takes the `{% generating %}` card away. Losing
+    /// final one of a turn is what takes the `{% mafold/generating %}` card away. Losing
     /// it to a two-second uplink blip left the bubble animating forever with a
     /// Stop button that could never resolve — the failure this retry exists for.
     pub async fn edit_draft(&self, message_id: &str, content: &str) -> Result<()> {
