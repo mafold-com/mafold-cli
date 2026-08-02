@@ -67,6 +67,16 @@ pub enum AgentEvent {
     ToolResult { id: String, text: String },
     /// A thinking / chain-of-thought block (collapsed in the UI).
     Thinking(String),
+    /// An image the agent PRODUCED this turn, as a path on this machine. The
+    /// render loop uploads it and attaches it to the reply, so it arrives in
+    /// the same bubble as the text — identical to a person sending a photo.
+    ///
+    /// Harness-agnostic on purpose: each harness maps its own native image
+    /// output onto this one event (Codex's `image_gen` writes to
+    /// `$CODEX_HOME/generated_images/…`), exactly as each maps its own
+    /// file-edit shape onto `ToolCall`. Nothing downstream knows which model
+    /// drew the picture.
+    Image { path: std::path::PathBuf },
     /// Streaming activity that is NOT rendered as content (thinking / tool-arg
     /// deltas, usage updates): `chars` of raw stream progress plus, when the
     /// harness knows it, the REAL cumulative output-token count for the turn.
@@ -97,6 +107,12 @@ pub struct Turn {
     /// is the same granularity the harness session is keyed at, which is why
     /// the wrap-up turn can safely resume that session.
     pub surface: String,
+    /// The in-flight reply's message id — the draft this turn is streaming
+    /// into. Exported as `MAFOLD_DRAFT` so `mafold attach <file>` can hang
+    /// media on THIS reply, which is what lets an agent send a picture in the
+    /// same bubble as the words about it. The uniform door: every harness gets
+    /// it, whether or not it can also produce images natively.
+    pub draft: String,
     pub workdir: String,
     /// The harness's prior session id for this conversation, to resume context.
     pub session: Option<String>,

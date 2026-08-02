@@ -90,6 +90,18 @@ enum Cmd {
         #[arg(trailing_var_arg = true, required = true)]
         text: Vec<String>,
     },
+    /// Attach local image files to the reply you are streaming right now.
+    /// Run by an AGENT mid-turn (the daemon presets MAFOLD_DRAFT), so a picture
+    /// it just made arrives in the same bubble as the text about it.
+    Attach {
+        /// Image files on this machine.
+        #[arg(required = true)]
+        files: Vec<String>,
+        /// Message to attach to. Defaults to `$MAFOLD_DRAFT` — the in-flight
+        /// reply — which is what an agent almost always wants.
+        #[arg(long)]
+        message: Option<String>,
+    },
     /// Manage a forum's channels (list/create/rename/close/pin/delete).
     Channels {
         #[command(subcommand)]
@@ -293,6 +305,9 @@ async fn main() -> Result<()> {
         Cmd::Send { chat, channel, text } => {
             send(&Client::new(cli.base, token), &chat, channel.as_deref(), &text.join(" ")).await?
         }
+        Cmd::Attach { files, message } => {
+            attach(&Client::new(cli.base, token), &files, message.as_deref()).await?
+        }
         Cmd::Channels { cmd } => channels::run(cmd, &Client::new(cli.base, token)).await?,
         Cmd::Wallet { cmd } => wallet::run(cmd, &Client::new(cli.base, token)).await?,
         Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Install { .. } | Cmd::Cards { .. }
@@ -464,6 +479,29 @@ async fn chats(client: &Client) -> Result<()> {
             oneline
         };
         println!("• {title}{badge}\n  {oneline}");
+    }
+    Ok(())
+}
+
+/// Hang local images on a message we authored — the general door for "the agent
+/// made a picture, put it in the reply". Codex's own generated images are swept
+/// up without this (see `harness::codex::ImageSweep`); every other harness, and
+/// anything an agent draws with a script, comes through here.
+async fn attach(client: &Client, files: &[String], message: Option<&str>) -> Result<()> {
+    let msg = match message {
+        Some(m) => m.to_string(),
+        None => std::env::var("MAFOLD_DRAFT").ok().filter(|s| !s.is_empty()).context(
+            "no message to attach to — run this inside an agent turn (the daemon sets \
+             MAFOLD_DRAFT), or pass --message <id>",
+        )?,
+    };
+    for f in files {
+        let path = std::path::Path::new(f);
+        client
+            .attach_photo(&msg, path)
+            .await
+            .with_context(|| format!("attaching {}", path.display()))?;
+        println!("✓ attached {}", path.display());
     }
     Ok(())
 }

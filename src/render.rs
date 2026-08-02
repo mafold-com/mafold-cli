@@ -36,6 +36,10 @@ pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<St
         }
         AgentEvent::Done { duration_ms, cost_usd, tokens } => result_tag(*duration_ms, *cost_usd, *tokens),
         AgentEvent::Session(_) => None,
+        // Not text: the render loop uploads it and attaches it to the message,
+        // so it renders as message MEDIA — the same bubble path a person's
+        // photo takes — instead of as a card in the transcript.
+        AgentEvent::Image { .. } => None,
         // Heartbeat only — consumed by the render loop's generating card, never
         // rendered as content.
         AgentEvent::Pulse { .. } => None,

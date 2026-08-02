@@ -1135,10 +1135,27 @@ pub(crate) async fn claude_version() -> String {
     out.split_whitespace().next().unwrap_or("").trim_start_matches('v').to_string()
 }
 
+/// Strip Windows' extended-length prefix (`\\?\C:\x`, `\\?\UNC\srv\share`).
+///
+/// `fs::canonicalize` returns these on Windows, and a daemon can be registered
+/// with one in `daemons.json`. Claude Code normalizes them away before naming
+/// its project dir, so leaving the prefix on turns every one of its four bytes
+/// into a `-` and points us at a directory that cannot exist — which is why
+/// `/resume` used to come up empty on exactly the machines that had one.
+pub(crate) fn strip_extended_prefix(p: &str) -> &str {
+    p.strip_prefix(r"\\?\UNC\")
+        .map(|rest| rest.trim_start_matches('\\'))
+        .or_else(|| p.strip_prefix(r"\\?\"))
+        .unwrap_or(p)
+}
+
 /// Claude Code's per-project transcript dir for a workdir — the CLI's own
 /// munge: every non-alphanumeric byte becomes `-`.
 pub(crate) fn project_dir(workdir: &str) -> PathBuf {
-    let munged: String = workdir.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    let munged: String = strip_extended_prefix(workdir)
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
     home().join(".claude/projects").join(munged)
 }
 
@@ -1276,28 +1293,53 @@ pub(crate) fn fmt_age(secs: i64) -> String {
     else { format!("{}d ago", secs / 86400) }
 }
 
-/// An interactive `claude` (TUI) session alive right now.
+/// An interactive `claude` session someone else is holding right now — a
+/// terminal, or an editor window (the VS Code extension).
 pub(crate) struct LiveTui {
     pub session_id: String,
     pub cwd: String,
     /// "busy" | "idle" | "" (older CLIs don't report one).
     pub status: String,
+    /// The registry's own `entrypoint` — decides what we CALL the holder.
+    pub entrypoint: String,
 }
 
-/// Live TUI sessions from Claude Code's own registry
-/// (`~/.claude/sessions/<pid>.json`). Every claude process writes one — real
-/// terminals as `entrypoint:"cli"`, the daemon's own stream-json turns as
-/// `"sdk-cli"` — so only `cli` entries count (else a bot's in-flight turn tags
-/// itself "open in a TUI"). Exited TUIs leave their file behind, so an entry
-/// only counts while its pid is still alive. Windows: no signal-0 probe, so
-/// the live tags simply don't show there — `/resume` itself still works.
+impl LiveTui {
+    /// What to call this holder in user-facing copy. The IDE extensions are the
+    /// case that matters for migration: "your terminal" is wrong and confusing
+    /// when the session is a VS Code tab.
+    pub fn holder(&self) -> &'static str {
+        match &self.entrypoint {
+            e if e.contains("vscode") => "VS Code",
+            e if e.contains("ide") || e.contains("jetbrains") => "an editor",
+            _ => "a terminal",
+        }
+    }
+}
+
+/// Sessions held by a live claude process right now, from Claude Code's own
+/// registry (`~/.claude/sessions/<pid>.json`).
+///
+/// Every claude process writes one: terminals as `entrypoint:"cli"`, the VS
+/// Code extension as `"claude-vscode"`, and OUR OWN headless turns as `"sdk"`
+/// / `"sdk-cli"`. Only the last kind is excluded — it's us, and a daemon that
+/// counted its own in-flight turn would call every session "open elsewhere".
+/// Everything else is a real second writer, which is the whole point: a
+/// migrated VS Code tab is exactly the session someone is still typing in.
+/// (Before this, `cli` was the only accepted entrypoint, so the IDE windows the
+/// migration flow is built for were invisible.)
+///
+/// Exited processes leave their file behind, so an entry only counts while its
+/// pid is alive — via `platform::pid_alive`, which is implemented on Windows
+/// too. (A local `#[cfg(not(unix))] -> false` copy used to shadow it here, so
+/// this whole function silently returned nothing on Windows.)
 pub(crate) fn live_tui_sessions() -> Vec<LiveTui> {
     let mut out: Vec<LiveTui> = vec![];
     let Ok(entries) = std::fs::read_dir(home().join(".claude/sessions")) else { return out };
     for e in entries.flatten() {
         let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
         let Some((pid, l)) = parse_live_entry(&text) else { continue };
-        if !pid_alive(pid) { continue; }
+        if !crate::platform::pid_alive(pid) { continue; }
         // Two registry entries can claim one session (a TUI relaunched via
         // `--resume`); busy beats idle.
         if let Some(prev) = out.iter_mut().find(|x| x.session_id == l.session_id) {
@@ -1309,26 +1351,28 @@ pub(crate) fn live_tui_sessions() -> Vec<LiveTui> {
     out
 }
 
-/// Parse one live-registry entry; None for anything that isn't a real
-/// terminal session (non-interactive kinds, sdk-cli entrypoints, drift).
+/// Parse one live-registry entry; None for anything that isn't a session held
+/// by somebody else (non-interactive kinds, our own `sdk*` turns, drift).
 pub(crate) fn parse_live_entry(text: &str) -> Option<(u32, LiveTui)> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
-    if v["kind"].as_str() != Some("interactive") || v["entrypoint"].as_str() != Some("cli") { return None; }
+    if v["kind"].as_str() != Some("interactive") { return None; }
+    let entrypoint = v["entrypoint"].as_str()?.to_string();
+    if entrypoint.starts_with("sdk") { return None; } // that's us
     let pid = v["pid"].as_u64()? as u32;
     let session_id = v["sessionId"].as_str()?.to_string();
     let cwd = v["cwd"].as_str().unwrap_or("").to_string();
     let status = v["status"].as_str().unwrap_or("").to_string();
-    Some((pid, LiveTui { session_id, cwd, status }))
+    Some((pid, LiveTui { session_id, cwd, status, entrypoint }))
 }
 
-#[cfg(unix)]
-fn pid_alive(pid: u32) -> bool {
-    // Same-user probe: signal 0 delivers nothing, just checks existence.
-    unsafe { libc::kill(pid as i32, 0) == 0 }
-}
-#[cfg(not(unix))]
-fn pid_alive(_pid: u32) -> bool {
-    false
+/// Is this exact transcript open in someone else's claude process right now?
+///
+/// Print-mode `--resume` does NOT fork (measured, not assumed: the run returns
+/// the same `session_id` it was given), so resuming a session an editor window
+/// is holding puts two writers on one transcript. The turn asks this and forks
+/// instead — see `harness::claude_code`.
+pub(crate) fn session_held_elsewhere(session_id: &str) -> bool {
+    live_tui_sessions().iter().any(|l| l.session_id == session_id)
 }
 
 /// `/resume <arg>` resolution over the (newest-first) session list.
@@ -1738,6 +1782,23 @@ Last 7d · 7983 requests · 30 sessions
         assert!(parse_live_entry("not json").is_none());
         let (_, l) = parse_live_entry(r#"{"pid":2,"sessionId":"y","cwd":"/w","kind":"interactive","entrypoint":"cli"}"#).unwrap();
         assert_eq!(l.status, "");
+        assert_eq!(l.holder(), "a terminal");
+    }
+
+    /// The VS Code extension registers itself like a terminal does, only with a
+    /// different `entrypoint` — and it is THE case migration cares about: the
+    /// tabs a user is moving over are open windows, not idle files. While only
+    /// `entrypoint:"cli"` counted, every one of them read as "nobody's holding
+    /// this", so the turn resumed straight into a transcript VS Code was still
+    /// writing.
+    #[test]
+    fn ide_windows_count_as_holders() {
+        let vscode = r#"{"pid":10976,"sessionId":"0f9eda48","cwd":"c:\\Users\\me\\proj","kind":"interactive","entrypoint":"claude-vscode","name":"proj-80"}"#;
+        let (pid, l) = parse_live_entry(vscode).expect("an IDE window is a holder");
+        assert_eq!((pid, l.session_id.as_str()), (10976, "0f9eda48"));
+        assert_eq!(l.holder(), "VS Code");
+        // …but our own headless turns still aren't, whatever they're called.
+        assert!(parse_live_entry(r#"{"pid":4,"sessionId":"s","kind":"interactive","entrypoint":"sdk"}"#).is_none());
     }
 
     // ── machine-dependent smokes: read THIS machine's ~/.claude, run manually
@@ -1777,10 +1838,16 @@ Last 7d · 7983 requests · 30 sessions
         println!("{s}");
     }
 
+    /// `MAFOLD_SMOKE_DIR=<a project dir> cargo test -- --ignored resume_listing`
+    /// — the picker exactly as a turn pinned to that tree would see it. The dir
+    /// has to be a parameter: it was hardcoded to one machine's mac path, so
+    /// everywhere else this printed "0 sessions" and passed.
     #[test]
     #[ignore = "reads this machine's ~/.claude transcripts + live registry"]
     fn resume_listing_smoke() {
-        let metas = list_project_sessions("/Users/ops/Desktop/mafold");
+        let dir = std::env::var("MAFOLD_SMOKE_DIR").unwrap_or_else(|_| "/Users/ops/Desktop/mafold".into());
+        println!("dir: {dir}  →  project dir: {}", project_dir(&dir).display());
+        let metas = list_project_sessions(&dir);
         println!("{} sessions; newest 6:", metas.len());
         for m in metas.iter().take(6) {
             println!("  {} · {} · {:?}", &m.id[..8], fmt_age(m.age_secs), m.preview);

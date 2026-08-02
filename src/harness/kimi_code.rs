@@ -64,6 +64,7 @@ impl Harness for KimiCode {
             ask_file: _,
             conv,
             surface: _,
+            draft,
         } = turn;
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");
@@ -82,6 +83,7 @@ impl Harness for KimiCode {
             model: model.as_deref(),
             thinking,
             conv: &conv,
+            draft: &draft,
             cancel: &cancel,
             sink: &sink,
         };
@@ -136,6 +138,7 @@ struct RunParams<'a> {
     model: Option<&'a str>,
     thinking: Option<u32>,
     conv: &'a str,
+    draft: &'a str,
     cancel: &'a std::sync::Arc<tokio::sync::Notify>,
     sink: &'a UnboundedSender<AgentEvent>,
 }
@@ -143,7 +146,7 @@ struct RunParams<'a> {
 /// One `kimi --print` invocation (optionally resuming `session`), streaming
 /// normalized events into the sink.
 async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcome> {
-    let RunParams { full_prompt, workdir, model, thinking, conv, cancel, sink } = *p;
+    let RunParams { full_prompt, workdir, model, thinking, conv, draft, cancel, sink } = *p;
 
     let mut cmd = tokio::process::Command::new("kimi");
     // `--print` runs one turn non-interactively (and implies `--yolo`, so tools
@@ -174,6 +177,9 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
     // Export the current conversation for parity with the other harnesses (Kimi
     // has no room skill today — harmless).
     cmd.env("MAFOLD_CONV", conv);
+    // The reply being streamed right now — `mafold attach <file>` hangs media on
+    // it, so an image the agent makes lands in the same bubble as its text.
+    cmd.env("MAFOLD_DRAFT", draft);
     // Force Kimi's Python stdout to UTF-8. On Windows a piped (non-tty) Python
     // stdout defaults to the locale codepage (GBK on zh-CN), which emits invalid
     // UTF-8 for any non-ASCII content and corrupts the stream-json — the turn then

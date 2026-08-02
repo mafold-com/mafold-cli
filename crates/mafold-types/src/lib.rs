@@ -462,6 +462,23 @@ pub enum Attachment {
     },
 }
 
+impl Attachment {
+    /// The attachment's stable id. Every variant carries one, so callers that
+    /// need identity (de-dup on append, diffing a message's media) never have
+    /// to match per-kind — the whole point of keeping the field uniform.
+    pub fn id(&self) -> &str {
+        match self {
+            Attachment::News { id, .. }
+            | Attachment::Ticker { id, .. }
+            | Attachment::Positions { id, .. }
+            | Attachment::Photo { id, .. }
+            | Attachment::Video { id, .. }
+            | Attachment::File { id, .. }
+            | Attachment::ChatRecord { id, .. } => id,
+        }
+    }
+}
+
 /// One frozen message inside a `ChatRecord` snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordEntry {

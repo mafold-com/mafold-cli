@@ -699,7 +699,7 @@ pub async fn supervise(base: String, auto_update: bool) {
             match crate::update::check(&http).await {
                 Ok(Some(r)) if crate::update::recently_failed(&r.version) => {}
                 Ok(Some(r)) => {
-                    println!("↻ update v{} available — applying + restarting daemons…", r.version);
+                    println!("{} — applying + restarting daemons…", r.action_line());
                     match crate::update::apply(&http, &r.url, &r.version, r.sha256.as_deref()).await {
                         Ok(()) => {
                             // Graceful drain: download is done; now let in-flight turns

@@ -64,6 +64,59 @@ fn parse_semver(v: &str) -> (u64, u64, u64) {
 fn is_newer(latest: &str, current: &str) -> bool {
     parse_semver(latest) > parse_semver(current)
 }
+fn is_same_version(latest: &str, current: &str) -> bool {
+    parse_semver(latest) == parse_semver(current)
+}
+
+/// Should we install `r`?
+///
+/// A HIGHER version, obviously. But also the SAME version when our binary is
+/// demonstrably not the build that release published — compared by checksum,
+/// the only thing that actually identifies a build.
+///
+/// THE HOLE THIS CLOSES. `Cargo.toml` is bumped on main BEFORE the tag is cut,
+/// so every build of main in that window reports the release's version without
+/// containing it. Install one (a hand-built binary, a colleague's copy) and the
+/// version compare says "already on 0.9.81" forever: the real 0.9.81 can never
+/// arrive, because it is not *newer*. Observed 2026-08-02 — a binary built 2h
+/// before the fix it was supposed to carry sat on a machine for a day, and
+/// `/usage` rendered "Unsupported card: stats" the whole time with the daemon
+/// cheerfully reporting itself up to date.
+///
+/// Conservative on purpose: with no published checksum to compare against we
+/// never trigger a same-version install, so an unverifiable release can't put
+/// the updater into a download loop.
+fn wants_update(r: &Release, our_sha: Option<&str>) -> bool {
+    if is_newer(&r.version, current_version()) {
+        return true;
+    }
+    if !is_same_version(&r.version, current_version()) {
+        return false; // the "latest" release is older than us — leave us alone
+    }
+    match (r.sha256.as_deref(), our_sha) {
+        (Some(want), Some(got)) => !got.eq_ignore_ascii_case(want),
+        _ => false,
+    }
+}
+
+impl Release {
+    /// How to announce applying this release. A same-version install is a
+    /// REPAIR, not an upgrade — and it needs to say so out loud, because it is
+    /// the one case where the updater replaces a binary the user may have put
+    /// there deliberately. ("update v0.9.81 available" while already running
+    /// 0.9.81 reads like a bug, and hides why the swap happened.)
+    pub fn action_line(&self) -> String {
+        if is_same_version(&self.version, current_version()) {
+            format!(
+                "↻ v{} REINSTALL — this binary is not the build v{} published (checksum differs). \
+                 Run the supervisor with --no-auto-update to keep a local build",
+                self.version, self.version,
+            )
+        } else {
+            format!("↻ update v{} available", self.version)
+        }
+    }
+}
 
 async fn latest(http: &reqwest::Client) -> Result<Release> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
@@ -154,6 +207,16 @@ fn sha256_hex(bytes: &[u8]) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Checksum of a binary on disk — what a build IS, as opposed to what its
+/// `--version` claims to be. `None` when it can't be read (then every caller
+/// falls back to comparing versions, i.e. the old behaviour).
+///
+/// Cost is a ~10 MB read + hash, paid on the update poll (every 10 minutes) and
+/// on a nudge — not on any hot path.
+fn sha256_of_file(p: &Path) -> Option<String> {
+    std::fs::read(p).ok().map(|b| sha256_hex(&b))
+}
+
 /// Quick "does it run?" check on the downloaded binary before swapping it in.
 fn smoke_test(path: &Path) -> bool {
     let mut cmd = std::process::Command::new(path);
@@ -211,7 +274,12 @@ pub async fn check(http: &reqwest::Client) -> Result<Option<Release>> {
         return Ok(None);
     }
     let r = latest(http).await?;
-    Ok(is_newer(&r.version, current_version()).then_some(r))
+    // Hashed ONLY when the versions already match — the common "we're current"
+    // tick still costs nothing beyond the API call it was already making.
+    let our_sha = is_same_version(&r.version, current_version())
+        .then(|| binary_path().ok().as_deref().and_then(sha256_of_file))
+        .flatten();
+    Ok(wants_update(&r, our_sha.as_deref()).then_some(r))
 }
 
 /// Safely download + verify + swap in the binary. Coordinated across processes
@@ -223,7 +291,18 @@ pub async fn apply(http: &reqwest::Client, url: &str, version: &str, sha256: Opt
     // but only trust the stamp if OUR binary really is that version (the stamp is
     // machine-global; a stale one from another copy/install must not short-circuit
     // us into an eternal "apply Ok → reexec the same old exe" spin).
-    if read_stamp().as_deref() == Some(version) && binary_is(&bin, version) {
+    //
+    // The CHECKSUM clause is what makes a same-version repair possible at all:
+    // without it, a binary that merely CLAIMS the right version satisfies both
+    // tests above and this returns Ok having done nothing — the other half of
+    // the trap `wants_update` exists to escape.
+    let already_the_published_build = match (sha256, sha256_of_file(&bin)) {
+        (Some(want), Some(got)) => got.eq_ignore_ascii_case(want),
+        // No checksum to compare: fall back to the version-only rule, exactly
+        // as before.
+        _ => true,
+    };
+    if read_stamp().as_deref() == Some(version) && binary_is(&bin, version) && already_the_published_build {
         return Ok(());
     }
     // Fail CLOSED: the binary we're about to swap in runs
@@ -343,4 +422,80 @@ pub fn reexec_or_warn(new_version: &str) {
          while the binary on disk is v{new_version}. Restart me: `mafold down && mafold up`.",
         current_version()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{current_version, is_newer, wants_update, Release};
+
+    fn rel(version: &str, sha: Option<&str>) -> Release {
+        Release {
+            version: version.into(),
+            url: "https://example.invalid/mafold".into(),
+            sha256: sha.map(Into::into),
+        }
+    }
+
+    /// Bump the patch of whatever version this build actually is, so the tests
+    /// don't need editing every release.
+    fn newer_than_current() -> String {
+        let mut p = current_version().split('.').map(|s| s.to_string()).collect::<Vec<_>>();
+        let last = p.len() - 1;
+        p[last] = (p[last].parse::<u64>().unwrap_or(0) + 1).to_string();
+        p.join(".")
+    }
+
+    #[test]
+    fn a_newer_release_always_wins() {
+        // …and needs no checksum to do it — the version compare is enough.
+        assert!(wants_update(&rel(&newer_than_current(), None), Some("aaaa")));
+        assert!(wants_update(&rel(&newer_than_current(), Some("bbbb")), Some("aaaa")));
+        assert!(is_newer(&newer_than_current(), current_version()));
+    }
+
+    /// THE HOLE THIS CLOSES. A binary built from main after the version bump but
+    /// before the tag reports the release's version WITHOUT containing it. The
+    /// version compare calls that "up to date" forever, so the real release can
+    /// never land — the checksum is the only thing that tells them apart.
+    #[test]
+    fn a_same_version_binary_that_isnt_the_published_build_is_replaced() {
+        let r = rel(current_version(), Some("cafebabe"));
+        assert!(wants_update(&r, Some("deadbeef")));
+    }
+
+    /// …and once it IS the published build, the very next check must stop. This
+    /// is what keeps the repair from becoming a 10-minute re-download loop.
+    #[test]
+    fn the_repair_settles_after_one_install() {
+        let r = rel(current_version(), Some("cafebabe"));
+        assert!(!wants_update(&r, Some("cafebabe")));
+        assert!(!wants_update(&r, Some("CAFEBABE")), "hex case must not matter");
+    }
+
+    /// Fail SAFE, not eager: with nothing to compare we keep the old
+    /// version-only behaviour rather than re-downloading on every tick.
+    #[test]
+    fn no_checksum_to_compare_means_no_same_version_install() {
+        assert!(!wants_update(&rel(current_version(), None), Some("deadbeef")));
+        assert!(!wants_update(&rel(current_version(), Some("cafebabe")), None));
+        assert!(!wants_update(&rel(current_version(), None), None));
+    }
+
+    /// A "latest" release OLDER than us is never installed, checksum or not —
+    /// otherwise a mis-tagged release could walk every daemon backwards.
+    #[test]
+    fn an_older_release_is_never_installed() {
+        assert!(!wants_update(&rel("0.0.1", Some("cafebabe")), Some("deadbeef")));
+        assert!(!wants_update(&rel("0.0.1", None), None));
+    }
+
+    /// The repair says so in plain words: it is the one case where the updater
+    /// overwrites a binary someone may have put there on purpose.
+    #[test]
+    fn a_same_version_install_announces_itself_as_a_repair() {
+        let repair = rel(current_version(), Some("cafebabe")).action_line();
+        assert!(repair.contains("REINSTALL"), "{repair}");
+        assert!(repair.contains("--no-auto-update"), "must name the escape hatch: {repair}");
+        assert!(rel(&newer_than_current(), None).action_line().contains("update v"));
+    }
 }

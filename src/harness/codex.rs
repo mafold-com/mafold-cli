@@ -17,11 +17,15 @@
 //!   the owner-set effort (mapped to `model_reasoning_effort`).
 //! - **Auth lives on the host.** Codex uses its own login (`codex login`, or a
 //!   `CODEX_API_KEY` / `OPENAI_API_KEY` in the environment); we don't strip it.
+//! - **Generated images never appear on the stream.** See [`ImageSweep`] — the
+//!   only harness dialect we have to read off the filesystem instead.
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::collections::HashSet;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
@@ -58,6 +62,7 @@ impl Harness for Codex {
             ask_file: _,
             conv,
             surface: _,
+            draft,
         } = turn;
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");
@@ -76,6 +81,7 @@ impl Harness for Codex {
             model: model.as_deref(),
             effort: effort.as_deref(),
             conv: &conv,
+            draft: &draft,
             cancel: &cancel,
             sink: &sink,
         };
@@ -123,6 +129,7 @@ struct RunParams<'a> {
     model: Option<&'a str>,
     effort: Option<&'a str>,
     conv: &'a str,
+    draft: &'a str,
     cancel: &'a std::sync::Arc<tokio::sync::Notify>,
     sink: &'a UnboundedSender<AgentEvent>,
 }
@@ -137,7 +144,7 @@ fn is_stale_thread(e: &anyhow::Error) -> bool {
 /// One `codex exec` invocation (optionally resuming `session`), streaming
 /// normalized events into the sink.
 async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcome> {
-    let RunParams { full_prompt, workdir, model, effort, conv, cancel, sink } = *p;
+    let RunParams { full_prompt, workdir, model, effort, conv, draft, cancel, sink } = *p;
 
     let mut cmd = tokio::process::Command::new("codex");
         cmd.arg("exec");
@@ -168,6 +175,10 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
         // Export the current conversation so `mafold room …` targets THIS room
         // (harmless for Codex, which has no room skill today — kept for parity).
         cmd.env("MAFOLD_CONV", conv);
+        // The reply being streamed right now — `mafold attach <file>` hangs
+        // media on it. Codex's own generated images are swept up automatically
+        // (see ImageSweep); this is the door for everything else it draws.
+        cmd.env("MAFOLD_DRAFT", draft);
         // `--` stops flag parsing so a prompt starting with `-` is taken literally.
         cmd.arg("--").arg(full_prompt);
         cmd.kill_on_drop(true);
@@ -212,6 +223,22 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
         let mut stopped = false;
         let mut session_id: Option<String> = None;
         let mut error: Option<String> = None;
+        let mut images: Option<ImageSweep> = None;
+
+        // Emit whatever `image_gen` has written since the last check. Called
+        // after every completed item (so a picture reaches the bubble while the
+        // turn is still running, not in a lump at the end) and once more before
+        // `Done`, which the render loop treats as terminal.
+        macro_rules! sweep_images {
+            () => {
+                if let Some(sw) = images.as_mut() {
+                    for path in sw.take_new() {
+                        let _ = sink.send(AgentEvent::Image { path });
+                        produced = true;
+                    }
+                }
+            };
+        }
 
         loop {
             let line = tokio::select! {
@@ -234,11 +261,15 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
                         if session_id.is_none() {
                             session_id = Some(t.to_string());
                         }
+                        // Baseline BEFORE any item can run, so this turn's
+                        // sweeps see only this turn's images.
+                        images = Some(ImageSweep::baseline(t));
                         let _ = sink.send(AgentEvent::Session(t.to_string()));
                     }
                 }
                 // One `codex exec` run = one turn; its completion ends the stream.
                 "turn.completed" => {
+                    sweep_images!(); // must precede Done — the renderer stops there
                     let u = &v["usage"];
                     let toks: u64 = ["input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens"]
                         .iter()
@@ -270,6 +301,9 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
                 }
                 phase @ ("item.started" | "item.updated" | "item.completed") => {
                     handle_item(phase, &v["item"], sink, &mut produced);
+                    if phase == "item.completed" {
+                        sweep_images!();
+                    }
                 }
                 _ => {}
             }
@@ -315,6 +349,72 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
             session: session_id,
             error: None,
         })
+}
+
+/// Where Codex keeps its state (`CODEX_HOME`, else `~/.codex`) — the same
+/// resolution `codex` itself does.
+fn codex_home() -> PathBuf {
+    if let Ok(h) = std::env::var("CODEX_HOME") {
+        if !h.is_empty() {
+            return PathBuf::from(h);
+        }
+    }
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
+    PathBuf::from(home).join(".codex")
+}
+
+/// Watches for images Codex's `image_gen` tool produced this turn.
+///
+/// It has to be a directory watch, because the picture is **not on the event
+/// stream at all**: `codex exec --json` speaks a fixed item vocabulary
+/// (`agent_message` / `reasoning` / `command_execution` / `file_change` /
+/// `mcp_tool_call` / `web_search` / `todo_list`) with no image member. The
+/// generated bytes go straight into the model's own context and to
+/// `$CODEX_HOME/generated_images/<thread-id>/<call-id>.png` — so the model
+/// sees the image, says "已生成", and everything downstream of it sees nothing.
+/// That is the whole bug this exists to close.
+///
+/// BASELINED at `thread.started`, before the turn can write anything: a resumed
+/// thread's directory already holds every image from previous turns, and
+/// without a baseline the first resumed turn would re-send all of them.
+struct ImageSweep {
+    dir: PathBuf,
+    seen: HashSet<OsString>,
+}
+
+impl ImageSweep {
+    /// Start watching `thread_id`'s image directory, treating whatever is
+    /// already there as old news.
+    fn baseline(thread_id: &str) -> Self {
+        let dir = codex_home().join("generated_images").join(thread_id);
+        let mut s = Self { dir, seen: HashSet::new() };
+        s.take_new(); // prime `seen`; earlier turns' output is not ours to send
+        s
+    }
+
+    /// Images that appeared since the last call, oldest first (so a turn that
+    /// draws several sends them in the order they were made). Missing dir — the
+    /// overwhelmingly common case, since most turns draw nothing — is not an
+    /// error, just an empty sweep.
+    fn take_new(&mut self) -> Vec<PathBuf> {
+        let Ok(rd) = std::fs::read_dir(&self.dir) else { return Vec::new() };
+        let mut fresh: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+        for e in rd.flatten() {
+            let name = e.file_name();
+            if self.seen.contains(&name) {
+                continue;
+            }
+            let Ok(meta) = e.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            self.seen.insert(name);
+            let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            fresh.push((mtime, e.path()));
+        }
+        fresh.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        fresh.into_iter().map(|(_, p)| p).collect()
+    }
 }
 
 /// Map a mafold effort level (`low`…`max`) to Codex's `model_reasoning_effort`
@@ -571,6 +671,42 @@ mod tests {
         assert_eq!(map_effort("minimal"), Some("minimal"));
         assert_eq!(map_effort("default"), None);
         assert_eq!(map_effort("wat"), None);
+    }
+
+    /// A sweep must report only what THIS turn drew. A resumed thread's
+    /// directory already holds every image from every earlier turn, so without
+    /// the baseline the first resumed turn re-sends the whole history.
+    #[test]
+    fn a_sweep_reports_only_images_written_after_the_baseline() {
+        let dir = std::env::temp_dir().join(format!("mafold-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old.png"), b"x").unwrap();
+
+        // Baseline over the pre-existing file (bypasses codex_home for the test).
+        let mut sw = ImageSweep { dir: dir.clone(), seen: HashSet::new() };
+        sw.take_new();
+        assert!(sw.take_new().is_empty(), "a quiet turn sweeps up nothing");
+
+        std::fs::write(dir.join("new.png"), b"y").unwrap();
+        let got = sw.take_new();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].file_name().unwrap(), "new.png");
+        // Already reported — a later sweep in the same turn must not repeat it.
+        assert!(sw.take_new().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Most turns draw nothing, so the directory usually doesn't exist. That is
+    /// the normal path, not an error.
+    #[test]
+    fn sweeping_a_directory_that_was_never_created_is_empty() {
+        let mut sw = ImageSweep {
+            dir: std::env::temp_dir().join("mafold-sweep-does-not-exist"),
+            seen: HashSet::new(),
+        };
+        assert!(sw.take_new().is_empty());
     }
 
     #[test]

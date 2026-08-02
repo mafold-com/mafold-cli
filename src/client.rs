@@ -404,6 +404,44 @@ impl Client {
         self.post_idempotent("botEditDraft", json!({ "message_id": message_id, "content": content })).await?;
         Ok(())
     }
+    /// Attach media to one of OUR messages (draft or already delivered). The
+    /// server appends, de-duped by attachment id — which is what makes the
+    /// retry below safe, and what keeps this independent of the text snapshots
+    /// `edit_draft` is pushing in parallel.
+    ///
+    /// RETRIED: an image that silently fails to land is exactly the bug this
+    /// whole path exists to fix — the reply says "已生成" and nothing arrives.
+    pub async fn attach(&self, message_id: &str, attachments: Value) -> Result<()> {
+        self.post_idempotent("botAttach", json!({ "message_id": message_id, "attachments": attachments })).await?;
+        Ok(())
+    }
+
+    /// Upload a local file and attach it to `message_id` as a photo, returning
+    /// the attachment JSON that landed. The one place that turns "a path on
+    /// this machine" into "media in the bubble": `mafold attach` and the
+    /// agent render loop both come through here, so the daemon and the CLI can
+    /// never drift on id/mime/dimension handling.
+    pub async fn attach_photo(&self, message_id: &str, path: &std::path::Path) -> Result<Value> {
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("image.png")
+            .to_string();
+        let (w, h) = png_dimensions(&bytes).unzip();
+        let up = self.upload_media(bytes, &name, mime_for_image(&name)).await?;
+        let media_id = up["media_id"].as_str().context("uploadFile returned no media_id")?;
+        let url = up["url"].as_str().context("uploadFile returned no url")?;
+        // `id` is the attachment's identity for the server's de-dup, so key it
+        // on the media — re-attaching the same upload is a no-op, not a twin.
+        let att = json!({
+            "kind": "photo", "id": media_id, "media_id": media_id, "url": url,
+            "w": w, "h": h,
+        });
+        self.attach(message_id, json!([att.clone()])).await?;
+        Ok(att)
+    }
+
     /// Close the loop on a card tap: the API is holding the tapper's request open
     /// on this `action_id`. `result` is `{"kind":"patch","content":…}`,
     /// `{"kind":"error","message":…}` or `{"kind":"ok"}` — a patch is both
@@ -580,6 +618,75 @@ impl Client {
             .expect("ws url should be a valid URI");
         tokio_tungstenite::tungstenite::ClientRequestBuilder::new(uri)
             .with_header("Authorization", format!("Bearer {}", self.token))
+    }
+}
+
+/// Content type for an outgoing image, by extension. Only the formats the
+/// bubble renders inline; anything else is sent as generic bytes and the
+/// server's own extension allow-list decides how it is stored.
+fn mime_for_image(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "heic" => "image/heic",
+        _ => "image/png",
+    }
+}
+
+/// Intrinsic size from a PNG's IHDR, so the bubble can reserve the box before
+/// the bytes arrive (no layout jump on load). Header-only — we never decode the
+/// image. `None` for anything that isn't a PNG; the attachment is still valid
+/// without `w`/`h`, the client just measures after load.
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+    // 8 magic + 8 chunk header + 8 dimensions = the first 24 bytes.
+    if bytes.len() < 24 || !bytes.starts_with(MAGIC) || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let n = |o: usize| u32::from_be_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+    Some((n(16), n(20)))
+}
+
+#[cfg(test)]
+mod attach_tests {
+    use super::{mime_for_image, png_dimensions};
+
+    /// A real PNG header: magic + IHDR length/type + 1122×1402 (the size the
+    /// codex image that started all this actually came back at).
+    fn png_header(w: u32, h: u32) -> Vec<u8> {
+        let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+        v.extend_from_slice(&13u32.to_be_bytes());
+        v.extend_from_slice(b"IHDR");
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&h.to_be_bytes());
+        v
+    }
+
+    #[test]
+    fn png_size_comes_from_the_ihdr() {
+        assert_eq!(png_dimensions(&png_header(1122, 1402)), Some((1122, 1402)));
+    }
+
+    /// No dimensions is a fine attachment (the client measures after load), so
+    /// anything that isn't a PNG must decline rather than return garbage.
+    #[test]
+    fn non_png_bytes_have_no_dimensions() {
+        assert_eq!(png_dimensions(b"\xff\xd8\xff\xe0 jpeg"), None);
+        assert_eq!(png_dimensions(b""), None);
+        assert_eq!(png_dimensions(&png_header(1, 1)[..12]), None); // truncated
+        let mut wrong_chunk = png_header(4, 4);
+        wrong_chunk[12..16].copy_from_slice(b"iTXt"); // valid PNG, not IHDR first
+        assert_eq!(png_dimensions(&wrong_chunk), None);
+    }
+
+    #[test]
+    fn image_mime_by_extension() {
+        assert_eq!(mime_for_image("a.png"), "image/png");
+        assert_eq!(mime_for_image("a.JPG"), "image/jpeg");
+        assert_eq!(mime_for_image("a.jpeg"), "image/jpeg");
+        assert_eq!(mime_for_image("a.webp"), "image/webp");
+        assert_eq!(mime_for_image("noext"), "image/png");
     }
 }
 

@@ -657,6 +657,11 @@ impl ConvConfig {
 /// claude-code sessions are cwd-bound, so a chat whose workdir moved must
 /// fork its context rather than fail to resume.
 fn resolve_turn_workdir(surface: Option<&str>, conv: Option<&str>, owner: Option<&str>, default: &str) -> (String, bool) {
+    // Normalize away `\\?\` everywhere: it is what `canonicalize` hands back on
+    // Windows and what a daemon can be registered with, but Claude Code drops it
+    // before naming its project dir — so keeping it would make the session key
+    // and the transcript lookup disagree with the agent itself.
+    let default = crate::commands::strip_extended_prefix(default);
     let Some(want) = surface.or(conv).or(owner) else { return (default.to_string(), false) };
     let expanded = if let Some(rest) = want.strip_prefix("~/") {
         format!("{}/{rest}", std::env::var("HOME").unwrap_or_else(|_| "~".into()))
@@ -664,7 +669,7 @@ fn resolve_turn_workdir(surface: Option<&str>, conv: Option<&str>, owner: Option
         want.to_string()
     };
     let dir = std::fs::canonicalize(&expanded)
-        .map(|p| p.to_string_lossy().into_owned())
+        .map(|p| crate::commands::strip_extended_prefix(&p.to_string_lossy()).to_string())
         .unwrap_or(expanded);
     if dir == default {
         return (dir, false);
@@ -792,7 +797,7 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     if auto_update {
         if let Ok(Some(r)) = crate::update::check(&client.http).await {
             if !crate::update::recently_failed(&r.version) {
-                println!("↻ updating to v{}…", r.version);
+                println!("{}…", r.action_line());
                 match crate::update::apply(&client.http, &r.url, &r.version, r.sha256.as_deref()).await {
                     Ok(()) => crate::update::reexec_or_warn(&r.version), // replaces this process (loud if not)
                     Err(e) => {
@@ -2355,7 +2360,7 @@ async fn handle_control(
                 };
                 match std::fs::canonicalize(&want) {
                     Ok(p) if p.is_dir() => {
-                        let dir = p.to_string_lossy().into_owned();
+                        let dir = crate::commands::strip_extended_prefix(&p.to_string_lossy()).to_string();
                         {
                             let mut w = workdirs.lock().await;
                             w.insert(base_key.clone(), dir.clone());
@@ -2478,7 +2483,11 @@ async fn resume_session(client: Client, dir: String, chat_id: String, skey: Stri
         let _ = client.send_to(Dest::chat(&chat_id).channel(channel_id), &format!("No resumable sessions for `{dir}` yet — nothing under its Claude project dir.")).await;
         return;
     }
-    let live: HashMap<String, String> = live_tui_sessions().into_iter().filter(|l| l.cwd == dir).map(|l| (l.session_id, l.status)).collect();
+    // Case-insensitively: Windows spells one tree several ways — the VS Code
+    // extension registers `c:\Users\…`, `canonicalize` gives us `C:\Users\…` —
+    // and an exact compare drops exactly the sessions this flow exists for.
+    let live: HashMap<String, crate::commands::LiveTui> =
+        live_tui_sessions().into_iter().filter(|l| l.cwd.eq_ignore_ascii_case(&dir)).map(|l| (l.session_id.clone(), l)).collect();
     let current = sessions.lock().await.get(&skey).cloned();
     // Previews can carry the very chars the card's line format uses.
     let card_safe = |s: &str| s.replace(['|', '\n'], " ");
@@ -2492,9 +2501,9 @@ async fn resume_session(client: Client, dir: String, chat_id: String, skey: Stri
             if let Some(ctx) = session_context_tokens(&dir, &m.id) {
                 desc.push_str(&format!(" · ≈{} ctx", humanize(ctx)));
             }
-            match live.get(&m.id).map(String::as_str) {
-                Some("busy") => desc.push_str(" · 🖥️ TUI, busy now"),
-                Some(_) => desc.push_str(" · 🖥️ open in a TUI"),
+            match live.get(&m.id) {
+                Some(l) if l.status == "busy" => desc.push_str(&format!(" · 🖥️ {}, busy now", l.holder())),
+                Some(l) => desc.push_str(&format!(" · 🖥️ open in {}", l.holder())),
                 None => {}
             }
             if current.as_deref() == Some(m.id.as_str()) { desc.push_str(" · current"); }
@@ -2505,7 +2514,7 @@ async fn resume_session(client: Client, dir: String, chat_id: String, skey: Stri
         if metas.len() > 6 {
             out.push_str(&format!("_{} more in `{}` — `/resume <session-id>` (any unique prefix) also works._\n", metas.len() - 6, dir));
         }
-        out.push_str("_🖥️ = open in a terminal right now; resuming forks from its latest state — everything from the TUI carries over, and the terminal keeps its own thread._");
+        out.push_str("_🖥️ = someone's got it open right now; resuming forks from its latest state — everything from that window carries over, and the window keeps its own thread._");
         let _ = client.send_to(Dest::chat(&chat_id).channel(channel_id), &out).await;
         return;
     }
@@ -2522,9 +2531,12 @@ async fn resume_session(client: Client, dir: String, chat_id: String, skey: Stri
         }
     };
     let id8: String = m.id.chars().take(8).collect();
-    let tui = live.get(&m.id).map(String::as_str);
+    let tui = live.get(&m.id);
     if current.as_deref() == Some(m.id.as_str()) {
-        let extra = if tui.is_some() { " It's open in a TUI too — the next message picks up whatever happened there." } else { "" };
+        let extra = match tui {
+            Some(l) => format!(" It's open in {} too — the next message picks up whatever happened there.", l.holder()),
+            None => String::new(),
+        };
         let _ = client.send_to(Dest::chat(&chat_id).channel(channel_id), &format!("`{id8}…` is already this chat's session.{extra}")).await;
         return;
     }
@@ -2539,8 +2551,8 @@ async fn resume_session(client: Client, dir: String, chat_id: String, skey: Stri
     }
     msg.push_str(". Your next message continues from it.");
     match tui {
-        Some("busy") => msg.push_str("\n🖥️ It's open in a Claude Code terminal and running a turn right now — your next message forks from the transcript's latest state at that moment, so whatever the terminal has finished by then carries over. The terminal keeps its own thread."),
-        Some(_) => msg.push_str("\n🖥️ It's open in a Claude Code terminal right now — your next message forks from its latest state (everything typed there so far carries over), and the terminal's own thread is untouched."),
+        Some(l) if l.status == "busy" => msg.push_str(&format!("\n🖥️ It's open in {} and running a turn right now — your next message forks from the transcript's latest state at that moment, so whatever it has finished by then carries over. That window keeps its own thread.", l.holder())),
+        Some(l) => msg.push_str(&format!("\n🖥️ It's open in {} right now — your next message forks from its latest state (everything done there so far carries over), and that window's own thread is untouched.", l.holder())),
         None => {}
     }
     if busy {
@@ -2784,6 +2796,16 @@ that breaks the card). Scripts run; there is no network / same-origin. Reach for
 something visual communicates better than text.\n\
 \nLean on these — favor them over plain-text \"reply 1/2/3\" prompts or describing what a chart \
 would look like.",
+    );
+    // Images. Agents reliably ANNOUNCE a picture they made and then send
+    // nothing, because producing the file and delivering it are separate acts
+    // and only the first is obvious from inside the sandbox. Name the second one.
+    s.push_str(
+        "\n\nSENDING IMAGES AND FILES: when you produce an image — one you rendered, generated, or \
+found on disk — attach it to THIS reply with `mafold attach <path>` (one or more paths). It \
+arrives in the same bubble as your text, exactly like a person sending a photo. Writing the file \
+is NOT sending it: never say you've sent a picture you only saved, and never paste base64 or a \
+local path as a substitute.",
     );
     // Owner-only settings can't be self-edited (setBotConfig needs the owner's
     // session) — steer the agent to the one-tap {% mafold/customize %} card. The server
@@ -3167,6 +3189,7 @@ async fn handle(
         prompt: full_prompt.clone(),
         conv: chat_id.to_string(),
         surface: surface.clone(),
+        draft: msg_id.clone(),
         workdir: workdir.to_string(),
         session: prior.clone(),
         // Cloned (not moved): the empty-turn retry below rebuilds a Turn from
@@ -3263,6 +3286,7 @@ async fn handle(
                 ),
                 conv: chat_id.to_string(),
                 surface: surface.clone(),
+                draft: msg_id.clone(),
                 workdir: workdir.to_string(),
                 session,
                 model: model.clone(),
@@ -3326,6 +3350,7 @@ async fn handle(
             prompt: full_prompt.clone(),
             conv: chat_id.to_string(),
             surface: surface.clone(),
+            draft: msg_id.clone(),
             workdir: workdir.to_string(),
             session: None, // ← FRESH: no --resume, so the corrupt session can't poison it
             model: model.clone(),
@@ -4082,6 +4107,24 @@ async fn render_loop(
                     *final_md.lock().unwrap() = full;
                     return;
                 }
+                // An image the agent PRODUCED — upload it and hang it on THIS
+                // reply, so it arrives in the same bubble as the text the model
+                // wrote about it. Attachments and content are independent axes
+                // server-side, so this never disturbs the streaming snapshots.
+                //
+                // Awaited, not spawned: a silently-dropped upload reproduces
+                // exactly the bug this path exists to close — the reply says
+                // "已生成" and nothing ever shows up. If it fails, say so in the
+                // transcript rather than leaving the claim standing.
+                AgentEvent::Image { path } => {
+                    bump_beat!();
+                    if let Err(e) = client.attach_photo(&msg_id, path).await {
+                        commit_buf!();
+                        commit_group!();
+                        full.push_str(&format!("\n_(couldn't send the image: {e})_\n"));
+                    }
+                    push_running!(true);
+                }
                 AgentEvent::Session(_) => {}
                 // tool / diff / bash result / thinking → into the current group.
                 _ => {
@@ -4545,6 +4588,20 @@ mod gate_tests {
         // disallowed chars (incl. would-be separators) become `_`
         assert_eq!(sanitize_attachment_name("a b/c.png"), "c.png"); // file_name drops the dir
         assert_eq!(sanitize_attachment_name("we ird$.jpg"), "we_ird_.jpg");
+    }
+
+    /// Windows hands back `\\?\C:\x` from `canonicalize`, and a daemon can be
+    /// registered with one. Claude Code drops the prefix before naming its
+    /// project dir, so keeping it munges four leading bytes into `-` and points
+    /// at a directory that cannot exist — `/resume` then lists nothing at all.
+    #[test]
+    fn extended_length_prefix_is_stripped() {
+        use crate::commands::{project_dir, strip_extended_prefix};
+        assert_eq!(strip_extended_prefix(r"\\?\C:\tmp\x"), r"C:\tmp\x");
+        assert_eq!(strip_extended_prefix(r"\\?\UNC\srv\share"), r"srv\share");
+        assert_eq!(strip_extended_prefix(r"C:\tmp\x"), r"C:\tmp\x");
+        // both spellings of the same tree name the same transcript dir
+        assert_eq!(project_dir(r"\\?\C:\tmp\mafold-opus48"), project_dir(r"C:\tmp\mafold-opus48"));
     }
 
     /// The two keys that must agree. A control command (`/resume`, `/clear`)

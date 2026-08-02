@@ -27,7 +27,7 @@ impl Harness for ClaudeCode {
     }
 
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
-        let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, conv, surface } = turn;
+        let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, conv, surface, draft } = turn;
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");
         }
@@ -58,6 +58,10 @@ impl Harness for ClaudeCode {
         // registers detached background tasks under it, so their wrap-up turn
         // comes back to THIS channel instead of leaking into another one.
         cmd.env("MAFOLD_SURFACE", &surface);
+        // The reply being streamed right now — `mafold attach <file>` hangs
+        // media on it, so an image the agent makes lands in the same bubble as
+        // the text about it.
+        cmd.env("MAFOLD_DRAFT", &draft);
         // Extended thinking: a non-zero budget makes the model think before each
         // reply (streamed as `thinking` blocks). No env = Claude Code's default.
         if let Some(budget) = thinking {
@@ -96,6 +100,19 @@ impl Harness for ClaudeCode {
         cmd.kill_on_drop(true);
         if let Some(sid) = &session {
             cmd.arg("--resume").arg(sid);
+            // Somebody else is holding this exact transcript right now (a VS
+            // Code tab, a terminal). Print-mode `--resume` does NOT fork — it
+            // hands back the same session id and appends to the same file — so
+            // without this both writers braid into one session tree and the
+            // resume pointer ends up wherever the last write landed. Forking
+            // inherits everything they've typed up to this instant and leaves
+            // their thread alone, which is what `/resume` has been promising in
+            // words all along. The new id arrives on the stream (`session_id`)
+            // and is what the caller stores, so this costs one fork, not one
+            // per turn.
+            if crate::commands::session_held_elsewhere(sid) {
+                cmd.arg("--fork-session");
+            }
         }
         // Don't let the console child flash a window (the agent runs detached).
         crate::platform::no_window(&mut cmd);
