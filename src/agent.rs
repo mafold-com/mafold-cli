@@ -1454,15 +1454,25 @@ async fn connect_and_run(
     auto_update: bool,
 ) -> Result<WsExit> {
     use tokio_tungstenite::tungstenite;
-    let (ws, _) = match tokio_tungstenite::connect_async(client.ws_request()).await {
-        Ok(v) => v,
-        Err(tungstenite::Error::Http(resp))
+    // Bounded handshake: `connect_async` has no timeout of its own, so a
+    // black-holed server (frozen process, dead edge — the same failure the
+    // 90s read watchdog below catches mid-session) would hang the RECONNECT
+    // path forever, right after the watchdog worked. 30s covers a slow TLS
+    // handshake with lots of margin; past that, error out to the backoff loop.
+    let connect = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio_tungstenite::connect_async(client.ws_request()),
+    );
+    let (ws, _) = match connect.await {
+        Err(_) => return Err(anyhow::anyhow!("WebSocket connect timed out (30s)")),
+        Ok(Ok(v)) => v,
+        Ok(Err(tungstenite::Error::Http(resp)))
             if resp.status() == tungstenite::http::StatusCode::UNAUTHORIZED
                 || resp.status() == tungstenite::http::StatusCode::FORBIDDEN =>
         {
             return Ok(WsExit::AuthRejected);
         }
-        Err(e) => return Err(e).context("WebSocket connect failed"),
+        Ok(Err(e)) => return Err(e).context("WebSocket connect failed"),
     };
     let (mut write, mut read) = ws.split();
     println!("listening for messages to @{my_username} …");
@@ -1496,7 +1506,24 @@ async fn connect_and_run(
         let env: serde_json::Value = match replay.pop_front() {
             Some(v) => v,
             None => {
-                let Some(frame) = read.next().await else { break };
+                // Zombie-socket watchdog. A dead peer does NOT error this read:
+                // when the api restarts behind Cloudflare, the edge keeps our
+                // TCP leg ESTABLISHED — our 25s pings buffer "successfully"
+                // into the void and `read.next()` blocks forever, so the daemon
+                // sits deaf-but-connected indefinitely (bots showed "no signal"
+                // for an hour+ after an api deploy). The server heartbeats a
+                // protocol Ping every 25s, so a healthy-but-quiet socket always
+                // has inbound traffic; 90s of silence (3+ missed beats) means
+                // the connection is gone — drop it and let the reconnect loop
+                // (backoff + seq catch-up) rebuild a real one.
+                let frame = match tokio::time::timeout(Duration::from_secs(90), read.next()).await {
+                    Ok(Some(f)) => f,
+                    Ok(None) => break,
+                    Err(_) => {
+                        eprintln!("⚠ no server traffic for 90s — socket presumed dead, reconnecting");
+                        break;
+                    }
+                };
                 let frame = match frame { Ok(f) => f, Err(e) => { eprintln!("ws error: {e}"); break; } };
                 let text = match frame.into_text() { Ok(t) => t, Err(_) => continue };
                 match serde_json::from_str(&text) { Ok(v) => v, Err(_) => continue }
@@ -2876,6 +2903,23 @@ Only variables the schema marks `write` are editable; a `key:*` schema entry is 
 back. When the user asks to view or change an installed app's data, use this — a per-turn \
 block below lists exactly which apps + rooms are available right now.",
     );
+    // Connectors. The static half teaches the SHAPE (you never hold the token);
+    // a per-turn block says which ones exist here and who authorized you.
+    s.push_str(
+        "\n\nCONNECTORS (third-party services): a conversation may include a connector account \
+— @notion, @github — that holds a person's own access token for that service. You do not hold \
+those tokens and cannot be given them. Instead you name an operation and the connector performs \
+it on the credential of the person who authorized you:\n\
+  • `mafold connector list` — which connectors are here, and whose credential I may use\n\
+  • `mafold connector run <name> \"<command>\"` — e.g. `mafold connector run notion \"search 周报\"`\n\
+Write the command WITHOUT a leading slash: some shells rewrite a leading `/` into a path, and \
+the connector then answers with its menu instead. The reply is exactly what that connector would \
+have printed in chat. `run <name> help` lists its own commands — read that instead of guessing. \
+Authorization is a grant the credential's OWNER \
+mints by sending `/allow @<your handle>` to the connector (append `write` to include changes); \
+if a call is refused, the error text names what they should send — relay it rather than saying \
+you can't. A per-turn block lists exactly what is reachable right now.",
+    );
     s
 }
 
@@ -3070,6 +3114,13 @@ async fn handle(
     // no injection) when nothing is installed. Best-effort: a fetch error never
     // blocks the turn.
     if let Ok(Some(block)) = crate::room::context_block(client, chat_id).await {
+        full_prompt = format!("{block}\n\n{full_prompt}");
+    }
+    // Connectors reachable from THIS conversation, and on whose credential —
+    // dynamic for the same reason: "you can read their Notion" is a lie in every
+    // chat where nobody granted anything, and a model told that lie statically
+    // will try, fail, and improvise. Best-effort, never blocks the turn.
+    if let Ok(Some(block)) = crate::connector::context_block(client, chat_id).await {
         full_prompt = format!("{block}\n\n{full_prompt}");
     }
     // Photos → downloaded so the agent can Read them. Forwarded chat records
@@ -3933,7 +3984,13 @@ async fn render_loop(
     let mut names: HashMap<String, String> = HashMap::new();
     let mut full = String::new(); // content committed to the draft so far
     let mut buf = String::new(); // pending narration text
-    let mut group = String::new(); // pending consecutive tool cards → one {% mafold/run %}
+    // The pending consecutive tool cards → one {% mafold/run %}. Held as SLOTS,
+    // not as appended text: a tool call takes its slot immediately (it paints
+    // right away) and its result fills that same slot when it lands, so the
+    // group reads `call → its output` even though the harness streams every
+    // call first and every result after. `open` maps tool_use_id → slot.
+    let mut group: Vec<crate::render::GroupItem> = Vec::new();
+    let mut open: HashMap<String, usize> = HashMap::new();
     let mut counts: HashMap<&'static str, usize> = HashMap::new();
     let mut last_push = std::time::Instant::now();
 
@@ -3995,8 +4052,14 @@ async fn render_loop(
     macro_rules! commit_group {
         () => {
             if !group.is_empty() {
-                full.push_str(&crate::render::run_card(&crate::render::run_summary(&counts), &group));
+                full.push_str(&crate::render::run_card(
+                    &crate::render::run_summary(&counts),
+                    &crate::render::render_group(&group),
+                ));
                 group.clear();
+                // Slots are gone once committed — a result arriving after this
+                // takes the orphan path instead of writing into a stale index.
+                open.clear();
                 counts.clear();
             }
         };
@@ -4015,7 +4078,10 @@ async fn render_loop(
                 let live_group = if group.is_empty() {
                     String::new()
                 } else {
-                    crate::render::run_card(&crate::render::run_summary(&counts), &group)
+                    crate::render::run_card(
+                        &crate::render::run_summary(&counts),
+                        &crate::render::render_group(&group),
+                    )
                 };
                 let _ = client.edit_draft(&msg_id, &format!("{full}{live_group}{}", generating_tag!())).await;
                 last_push = std::time::Instant::now();
@@ -4143,8 +4209,36 @@ async fn render_loop(
                     if let Some(k) = crate::render::tool_kind(&ev) {
                         *counts.entry(k).or_insert(0) += 1;
                     }
-                    if let Some(s) = crate::render::render(&ev, &mut names) {
-                        group.push_str(&s);
+                    match &ev {
+                        // The call takes a slot NOW — it paints this push, with
+                        // its output still pending — and holds it for its result.
+                        AgentEvent::ToolCall { id, name, input } => {
+                            names.insert(id.clone(), name.to_lowercase());
+                            open.insert(id.clone(), group.len());
+                            group.push(crate::render::GroupItem::Step(
+                                crate::render::ToolStep::new(name, input),
+                            ));
+                        }
+                        // Into its call's slot. No slot (the group was already
+                        // committed) → fall back to the standalone output card,
+                        // which is where these lived before pairing existed.
+                        AgentEvent::ToolResult { id, text } => match open.get(id) {
+                            Some(&i) => {
+                                if let Some(crate::render::GroupItem::Step(s)) = group.get_mut(i) {
+                                    s.land(text);
+                                }
+                            }
+                            None => {
+                                if let Some(s) = crate::render::render(&ev, &mut names) {
+                                    group.push(crate::render::GroupItem::Card(s));
+                                }
+                            }
+                        },
+                        _ => {
+                            if let Some(s) = crate::render::render(&ev, &mut names) {
+                                group.push(crate::render::GroupItem::Card(s));
+                            }
+                        }
                     }
                     // Force: a tool call/result must paint NOW, not at the next
                     // 300ms tick — this is the "middle states" the transcript

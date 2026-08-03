@@ -10,12 +10,20 @@ use crate::harness::AgentEvent;
 /// Render one event to a markdoc string (text or a card), or `None` to skip.
 /// `names` tracks `tool_use_id → tool name` so a bash `tool_result` can be
 /// matched to its call.
+///
+/// Tool calls inside a run group don't come through here — they're held as
+/// [`ToolStep`]s so their result lands on the same card (see [`render_group`]).
+/// This path stays for the events that AREN'T paired: narration, thinking, the
+/// blocking ask, the end-of-turn stamp, and an ORPHAN result whose call is no
+/// longer in the open group — that last one keeps its old shape (a standalone
+/// output card) rather than being dropped, because a result with nowhere to go
+/// is still a result the user needs to see.
 pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<String> {
     match ev {
         AgentEvent::Text(t) => Some(t.clone()),
         AgentEvent::ToolCall { id, name, input } => {
             names.insert(id.clone(), name.to_lowercase());
-            Some(tool_use_tag(name, input))
+            Some(tool_use_tag(name, input, None))
         }
         AgentEvent::ToolResult { id, text } => {
             if names.get(id).map(String::as_str) != Some("bash") {
@@ -141,30 +149,161 @@ pub fn run_card(summary: &str, body: &str) -> String {
     format!("\n{{% mafold/run summary=\"{}\" %}}\n{}{{% /mafold/run %}}\n", attr_esc(summary), body)
 }
 
-/// A tool call → the right card.
-fn tool_use_tag(name: &str, input: &Value) -> String {
-    match name.to_lowercase().as_str() {
+/// One atomic step in a run group: a tool CALL and, once it lands, its RESULT.
+///
+/// The pair is one card. Harnesses stream every call in an assistant message and
+/// every result in the message after it, so rendering each event as it arrives
+/// produces `bash · bash · output · output` — two calls, then two outputs, with
+/// nothing tying either output to the command that produced it. A step instead
+/// keeps its slot open: the call paints immediately (the transcript still shows
+/// middle states), and the result fills in underneath it when it arrives.
+///
+/// Re-rendering an already-committed group is free — the daemon pushes the whole
+/// markdoc snapshot on every flush (the Telegram-draft model), so a landed
+/// result simply changes what the next snapshot says.
+#[derive(Debug, Clone)]
+pub struct ToolStep {
+    pub name: String,
+    pub input: Value,
+    /// The result text — `None` while the tool is still running.
+    pub out: Option<String>,
+}
+
+impl ToolStep {
+    pub fn new(name: &str, input: &Value) -> Self {
+        Self { name: name.to_string(), input: input.clone(), out: None }
+    }
+    /// The result landed. First one wins: a harness that re-sends a result must
+    /// not append a second copy to a card that already shows it.
+    pub fn land(&mut self, text: &str) {
+        if self.out.is_none() {
+            self.out = Some(text.to_string());
+        }
+    }
+    pub fn tag(&self) -> String {
+        tool_use_tag(&self.name, &self.input, self.out.as_deref())
+    }
+}
+
+/// One entry in a run group: a finished card (thinking, a legacy orphan result)
+/// or a tool step whose result may still be pending.
+#[derive(Debug, Clone)]
+pub enum GroupItem {
+    Card(String),
+    Step(ToolStep),
+}
+
+/// A run group's body — every item in arrival order, each step carrying its own
+/// result. Called on every snapshot push, so it must stay a pure function of the
+/// group: the same items always render the same markdoc.
+pub fn render_group(items: &[GroupItem]) -> String {
+    let mut out = String::new();
+    for it in items {
+        match it {
+            GroupItem::Card(s) => out.push_str(s),
+            GroupItem::Step(s) => out.push_str(&s.tag()),
+        }
+    }
+    out
+}
+
+/// A tool call (plus its result, when it has landed) → the right card.
+fn tool_use_tag(name: &str, input: &Value, out: Option<&str>) -> String {
+    let lname = name.to_lowercase();
+    let (summary, body) = result_parts(&lname, out);
+    match lname.as_str() {
         "todowrite" => todo_tag(input),
-        "edit" | "multiedit" => diff_tag_edit(&name.to_lowercase(), input),
-        "write" => diff_tag_write(input),
-        "task" => format!(
-            "\n{{% mafold/task subagent=\"{}\" desc=\"{}\" /%}}\n",
-            attr_esc(input["subagent_type"].as_str().unwrap_or("agent")),
-            attr_esc(input["description"].as_str().unwrap_or("")),
+        // The diff IS the result — an "updated the file" line under it says
+        // nothing the +N −M in its header doesn't already say.
+        "edit" | "multiedit" => diff_tag_edit(&lname, name, input),
+        "write" => diff_tag_write(name, input),
+        "task" => card(
+            "task",
+            &format!(
+                "subagent=\"{}\" desc=\"{}\"{}",
+                attr_esc(input["subagent_type"].as_str().unwrap_or("agent")),
+                attr_esc(input["description"].as_str().unwrap_or("")),
+                summary,
+            ),
+            &body,
         ),
-        "webfetch" => format!("\n{{% mafold/web url=\"{}\" /%}}\n", attr_esc(input["url"].as_str().unwrap_or(""))),
-        "websearch" => format!("\n{{% mafold/web query=\"{}\" /%}}\n", attr_esc(input["query"].as_str().unwrap_or(""))),
+        "webfetch" => card("web", &format!("url=\"{}\"{}", attr_esc(input["url"].as_str().unwrap_or("")), summary), ""),
+        "websearch" => card("web", &format!("query=\"{}\"{}", attr_esc(input["query"].as_str().unwrap_or("")), summary), ""),
         "skill" => {
             let sname = input["command"].as_str()
                 .or_else(|| input["skill"].as_str())
                 .or_else(|| input["name"].as_str())
                 .unwrap_or("skill");
             let args = input["args"].as_str().or_else(|| input["arguments"].as_str()).unwrap_or("");
-            format!("\n{{% mafold/skill name=\"{}\" args=\"{}\" /%}}\n", attr_esc(sname), attr_esc(args))
+            card("skill", &format!("name=\"{}\" args=\"{}\"{}", attr_esc(sname), attr_esc(args), summary), "")
         }
         "askuserquestion" => ask_tag(input),
-        _ => format!("\n{{% mafold/tool name=\"{}\" detail=\"{}\" /%}}\n", attr_esc(name), attr_esc(&tool_detail(name, input))),
+        _ => card(
+            "tool",
+            &format!("name=\"{}\" detail=\"{}\"{}", attr_esc(name), attr_esc(&tool_detail(name, input)), summary),
+            &body,
+        ),
     }
+}
+
+/// `{% mafold/<tag> <attrs> /%}` — self-closing, or a container when there's a
+/// body to carry. One shape for every card the renderer emits, so "does this one
+/// have a body" is a question about the DATA, never about the format string.
+fn card(tag: &str, attrs: &str, body: &str) -> String {
+    if body.is_empty() {
+        format!("\n{{% mafold/{tag} {attrs} /%}}\n")
+    } else {
+        format!("\n{{% mafold/{tag} {attrs} %}}\n{}{{% /mafold/{tag} %}}\n", block_esc(body))
+    }
+}
+
+/// A landed result → (`out="…"` attribute, card body).
+///
+/// Which of the two a tool gets is about what its result IS. A shell's stdout is
+/// content and belongs in the body, verbatim and capped. A Read's result is the
+/// file the model already has — echoing it back is noise, so it collapses to
+/// "126 lines". Nothing at all is also an answer: a command that printed nothing
+/// says so, rather than looking like it never finished.
+fn result_parts(lname: &str, out: Option<&str>) -> (String, String) {
+    let Some(text) = out else {
+        return (String::new(), String::new());
+    };
+    let t = text.trim();
+    let attr = |s: String| (format!(" out=\"{}\"", attr_esc(&s)), String::new());
+    match lname {
+        "bash" => {
+            if t.is_empty() {
+                attr("no output".into())
+            } else {
+                (String::new(), cap_lines(t, 20))
+            }
+        }
+        "read" | "notebookedit" => attr(count_phrase(t, "line", "lines")),
+        "glob" | "grep" => {
+            let first = t.lines().next().unwrap_or("").trim();
+            // Claude Code's own phrasing ("Found 12 files") when the harness
+            // already summarized; the count when it handed back raw matches.
+            if first.starts_with("Found ") && first.chars().count() <= 60 {
+                attr(first.to_string())
+            } else {
+                attr(count_phrase(t, "result", "results"))
+            }
+        }
+        // The diff card already carries the outcome.
+        "edit" | "write" | "multiedit" | "apply_patch" | "todowrite" => (String::new(), String::new()),
+        "task" => (String::new(), cap_lines(t, 6)),
+        _ if t.is_empty() => (String::new(), String::new()),
+        // An unknown tool: short results read as output, long ones as a count —
+        // one rule, no per-tool table to keep in sync with anybody's tool set.
+        _ if t.lines().count() > 6 => attr(count_phrase(t, "line", "lines")),
+        _ => (String::new(), cap_lines(t, 6)),
+    }
+}
+
+/// "1 line" / "126 lines" — an empty result counts as zero, not one.
+fn count_phrase(t: &str, sing: &str, plur: &str) -> String {
+    let n = if t.is_empty() { 0 } else { t.lines().count() };
+    if n == 1 { format!("1 {sing}") } else { format!("{n} {plur}") }
 }
 
 /// AskUserQuestion → an interactive `ask` card. The body is line-encoded (mirrors
@@ -223,7 +362,7 @@ fn todo_tag(input: &Value) -> String {
     format!("\n{{% mafold/todo %}}\n{}{{% /mafold/todo %}}\n", block_esc(&body))
 }
 
-fn diff_tag_edit(lname: &str, input: &Value) -> String {
+fn diff_tag_edit(lname: &str, name: &str, input: &Value) -> String {
     let file = input["file_path"].as_str().unwrap_or("");
     let (added, removed, body) = if lname == "multiedit" {
         let mut a = 0; let mut r = 0; let mut body = String::new();
@@ -237,22 +376,24 @@ fn diff_tag_edit(lname: &str, input: &Value) -> String {
     } else {
         synth_hunk(input["old_string"].as_str().unwrap_or(""), input["new_string"].as_str().unwrap_or(""))
     };
-    diff_tag(file, added, removed, &body)
+    diff_tag(file, name, added, removed, &body)
 }
 
-fn diff_tag_write(input: &Value) -> String {
+fn diff_tag_write(name: &str, input: &Value) -> String {
     let file = input["file_path"].as_str().unwrap_or("");
     let content = input["content"].as_str().unwrap_or("");
     let lines: Vec<&str> = if content.is_empty() { vec![] } else { content.lines().collect() };
     let mut body = String::new();
     for l in &lines { body.push('+'); body.push_str(l); body.push('\n'); }
-    diff_tag(file, lines.len(), 0, &body)
+    diff_tag(file, name, lines.len(), 0, &body)
 }
 
-fn diff_tag(file: &str, added: usize, removed: usize, body: &str) -> String {
+/// `tool` names WHICH edit this was (Write / Edit / MultiEdit) — the card leads
+/// with it, the way every other step in the transcript leads with its tool name.
+fn diff_tag(file: &str, tool: &str, added: usize, removed: usize, body: &str) -> String {
     format!(
-        "\n{{% mafold/diff file=\"{}\" added={} removed={} %}}\n{}{{% /mafold/diff %}}\n",
-        attr_esc(file), added, removed, block_esc(&cap_lines(body, 24)),
+        "\n{{% mafold/diff file=\"{}\" tool=\"{}\" added={} removed={} %}}\n{}{{% /mafold/diff %}}\n",
+        attr_esc(file), attr_esc(tool), added, removed, block_esc(&cap_lines(body, 24)),
     )
 }
 
@@ -336,6 +477,92 @@ fn attr_esc(s: &str) -> String {
         format!("{}…", cleaned.chars().take(80).collect::<String>())
     } else {
         cleaned.to_string()
+    }
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::{render_group, GroupItem, ToolStep};
+    use serde_json::json;
+
+    fn step(name: &str, input: serde_json::Value) -> ToolStep {
+        ToolStep::new(name, &input)
+    }
+
+    /// A call with no result yet still paints — the transcript shows the middle
+    /// states, it just doesn't claim an output that hasn't happened.
+    #[test]
+    fn a_pending_call_renders_alone() {
+        let s = step("Bash", json!({ "command": "pnpm test" }));
+        let tag = s.tag();
+        assert!(tag.contains("{% mafold/tool name=\"Bash\" detail=\"pnpm test\" /%}"), "{tag}");
+        assert!(!tag.contains("{% /mafold/tool %}"));
+    }
+
+    /// THE BUG: two shells in one message, then two outputs. Rendered per event
+    /// that reads `bash · bash · output · output`; as slots, each output is on
+    /// the card of the command that produced it.
+    #[test]
+    fn parallel_calls_keep_their_own_output() {
+        let mut a = step("Bash", json!({ "command": "ls src" }));
+        let mut b = step("Bash", json!({ "command": "ls docs" }));
+        // Results arrive AFTER both calls — and out of order, for good measure.
+        b.land("readme.md");
+        a.land("main.rs");
+        let md = render_group(&[GroupItem::Step(a), GroupItem::Step(b)]);
+        let first = md.find("ls src").expect("first call");
+        let second = md.find("ls docs").expect("second call");
+        let out_a = md.find("main.rs").expect("first output");
+        let out_b = md.find("readme.md").expect("second output");
+        // Call order is arrival order; each output sits inside its OWN call's card.
+        assert!(first < out_a && out_a < second && second < out_b, "{md}");
+        assert_eq!(md.matches("{% /mafold/tool %}").count(), 2, "{md}");
+    }
+
+    /// A shell's stdout is content — verbatim in the body. A Read's result is
+    /// the file the model already has — a count, not an echo.
+    #[test]
+    fn a_result_is_body_or_summary_by_what_it_is() {
+        let mut sh = step("Bash", json!({ "command": "echo hi" }));
+        sh.land("hi\nthere");
+        let tag = sh.tag();
+        assert!(tag.contains("%}\nhi\nthere\n{% /mafold/tool %}"), "{tag}");
+
+        let mut rd = step("Read", json!({ "file_path": "src/main.rs" }));
+        rd.land(&"x\n".repeat(126));
+        let tag = rd.tag();
+        assert!(tag.contains("out=\"126 lines\""), "{tag}");
+        assert!(!tag.contains("{% /mafold/tool %}"), "a count needs no body: {tag}");
+    }
+
+    /// A command that printed nothing SAYS so — silence is otherwise
+    /// indistinguishable from a command still running.
+    #[test]
+    fn an_empty_shell_result_still_reports() {
+        let mut s = step("Bash", json!({ "command": "true" }));
+        s.land("   \n");
+        assert!(s.tag().contains("out=\"no output\""), "{}", s.tag());
+    }
+
+    /// A re-sent result must not stack a second copy onto a card already showing it.
+    #[test]
+    fn the_first_result_wins() {
+        let mut s = step("Bash", json!({ "command": "date" }));
+        s.land("first");
+        s.land("second");
+        let tag = s.tag();
+        assert!(tag.contains("first") && !tag.contains("second"), "{tag}");
+    }
+
+    /// An edit renders as its diff, named by the tool that made it — and the
+    /// harness's "file updated" acknowledgement adds nothing on top.
+    #[test]
+    fn an_edit_is_its_diff_not_an_acknowledgement() {
+        let mut e = step("Write", json!({ "file_path": "a.txt", "content": "one\ntwo" }));
+        e.land("The file a.txt has been updated.");
+        let tag = e.tag();
+        assert!(tag.contains("{% mafold/diff file=\"a.txt\" tool=\"Write\" added=2 removed=0 %}"), "{tag}");
+        assert!(!tag.contains("has been updated"), "{tag}");
     }
 }
 

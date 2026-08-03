@@ -313,6 +313,16 @@ pub struct Channel {
     /// Channel icon: a single emoji. None = the default "#" tile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// Pinned message ids in THIS channel, newest first.
+    ///
+    /// A pin belongs to the timeline it was made in. `Conversation::
+    /// pinned_message_ids` is therefore the MAIN (`#all`) timeline's list, not
+    /// the forum's — before this split, pinning in `#garden` put a bar in every
+    /// channel, and since the message isn't in their buckets the bar rendered
+    /// with no text. The server routes each pin by the pinned message's own
+    /// `channel_id`, so no caller has to say which list it meant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_message_ids: Vec<Uuid>,
 }
 
 // MARK: - Message

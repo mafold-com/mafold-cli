@@ -14,6 +14,7 @@ mod cards;
 mod channels;
 mod client;
 mod commands;
+mod connector;
 mod daemon;
 mod discover;
 mod harness;
@@ -128,6 +129,14 @@ enum Cmd {
     Room {
         #[command(subcommand)]
         cmd: room::RoomCmd,
+    },
+    /// Ask a connector (@notion, @github) for something on a person's own
+    /// credential — the agent side of the no-model/no-credential split. Needs a
+    /// grant they minted with `/allow @<this bot>`. Conversation via `--conv` /
+    /// `MAFOLD_CONV`; auth via `--token` / `MAFOLD_BOT_TOKEN`.
+    Connector {
+        #[command(subcommand)]
+        cmd: connector::ConnectorCmd,
     },
     /// Publish the cloud language packs (langpacks/*.json) — first-party only.
     Langpack {
@@ -258,6 +267,12 @@ async fn main() -> Result<()> {
         let Cmd::Room { cmd } = cli.cmd else { unreachable!() };
         return room::run(cmd, cli.base, cli.token).await;
     }
+    // Connector: reach @notion / @github on a person's own credential, via the
+    // grant they minted with `/allow`. Bot token — the caller IS the agent.
+    if matches!(cli.cmd, Cmd::Connector { .. }) {
+        let Cmd::Connector { cmd } = cli.cmd else { unreachable!() };
+        return connector::run(cmd, cli.base, cli.token).await;
+    }
     // Langpack: publish/list check for the first-party token themselves.
     if matches!(cli.cmd, Cmd::Langpack { .. }) {
         let Cmd::Langpack { cmd } = cli.cmd else { unreachable!() };
@@ -311,7 +326,7 @@ async fn main() -> Result<()> {
         Cmd::Channels { cmd } => channels::run(cmd, &Client::new(cli.base, token)).await?,
         Cmd::Wallet { cmd } => wallet::run(cmd, &Client::new(cli.base, token)).await?,
         Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Install { .. } | Cmd::Cards { .. }
-        | Cmd::Apps { .. } | Cmd::Room { .. }
+        | Cmd::Apps { .. } | Cmd::Room { .. } | Cmd::Connector { .. }
         | Cmd::Langpack { .. } | Cmd::Login { .. } | Cmd::Report
         | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
         | Cmd::Rollback | Cmd::Supervise { .. } | Cmd::AskHook | Cmd::BashHook => unreachable!(),
