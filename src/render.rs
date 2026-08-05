@@ -51,6 +51,20 @@ pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<St
         // Heartbeat only — consumed by the render loop's generating card, never
         // rendered as content.
         AgentEvent::Pulse { .. } => None,
+        // Rendered as a line, NOT as the `{% mafold/compact %}` card. That card
+        // draws a before→after bar and needs BOTH counts; the harness's
+        // compaction event carries only the "before" (there is no post-compaction
+        // count in it). Passing `before` alone makes the card read `after` as 0
+        // and claim it freed 100% of the context — a number that is simply not
+        // true. The card stays for `/compact`, which does know both.
+        AgentEvent::Compacted { pre_tokens } => Some(match pre_tokens {
+            Some(n) => format!("\n_🗜️ Context auto-compacted ({} before)_\n", fmt_count(*n)),
+            None => "\n_🗜️ Context auto-compacted_\n".to_string(),
+        }),
+        AgentEvent::RateLimited { kind, resets_at } => Some(format!(
+            "\n_⏳ Usage limit reached ({kind}){}_\n",
+            reset_hint(*resets_at, now_unix())
+        )),
         // Not rendered as new content — the render loop stamps it into the
         // already-emitted ask card via `stamp_ask_answered`.
         AgentEvent::AskAnswered(_) => None,
@@ -436,6 +450,31 @@ fn fmt_count(n: u64) -> String {
     if n >= 1000 { format!("{:.1}k", n as f64 / 1000.0) } else { n.to_string() }
 }
 
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// " · resets in ~42m" for a usage limit, from its unix reset timestamp. Empty
+/// when there is nothing useful to say — no timestamp, or a time already past
+/// (a stale reset would otherwise render as "resets in ~0m", which reads as
+/// "you're already back" when we don't actually know that).
+fn reset_hint(resets_at: Option<i64>, now: i64) -> String {
+    let Some(at) = resets_at else { return String::new() };
+    let secs = at - now;
+    if secs <= 0 {
+        return String::new();
+    }
+    let mins = (secs + 59) / 60; // round UP: 30s left is "~1m", never "~0m"
+    match (mins / 60, mins % 60) {
+        (0, m) => format!(" · resets in ~{m}m"),
+        (h, 0) => format!(" · resets in ~{h}h"),
+        (h, m) => format!(" · resets in ~{h}h{m}m"),
+    }
+}
+
 fn cap_lines(s: &str, max: usize) -> String {
     let lines: Vec<&str> = s.lines().collect();
     if lines.len() <= max {
@@ -610,5 +649,68 @@ mod stamp_tests {
         // a stamped opener no longer matches the bare needle → never re-stamped
         assert!(stamp_unanswered_ask(&first, "Yes").is_none());
         assert!(stamp_unanswered_ask("no card here", "Yes").is_none());
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+
+    const NOW: i64 = 1_785_900_000;
+
+    #[test]
+    fn a_reset_within_the_hour_reads_in_minutes() {
+        assert_eq!(reset_hint(Some(NOW + 30 * 60), NOW), " · resets in ~30m");
+    }
+
+    #[test]
+    fn a_longer_reset_reads_in_hours() {
+        assert_eq!(reset_hint(Some(NOW + 2 * 3600), NOW), " · resets in ~2h");
+        assert_eq!(reset_hint(Some(NOW + 2 * 3600 + 15 * 60), NOW), " · resets in ~2h15m");
+    }
+
+    /// Rounding UP matters: 30 seconds left rendered as "~0m" reads as "you're
+    /// already back", which is the one thing we know isn't true yet.
+    #[test]
+    fn a_sub_minute_reset_rounds_up_never_to_zero() {
+        assert_eq!(reset_hint(Some(NOW + 30), NOW), " · resets in ~1m");
+    }
+
+    /// Nothing useful to say → say nothing, rather than print a stale or absent
+    /// timestamp as if it were information.
+    #[test]
+    fn a_past_or_missing_reset_says_nothing() {
+        assert_eq!(reset_hint(Some(NOW - 60), NOW), "");
+        assert_eq!(reset_hint(None, NOW), "");
+    }
+
+    #[test]
+    fn a_compaction_renders_with_the_size_it_compacted() {
+        let mut names = HashMap::new();
+        let out = render(&AgentEvent::Compacted { pre_tokens: Some(302_336) }, &mut names).unwrap();
+        assert!(out.contains("302.3k"), "{out}");
+        assert!(out.contains("compacted"), "{out}");
+    }
+
+    /// Without a size it still has to render — the point of the line is
+    /// explaining a multi-minute silence, and that holds with or without a number.
+    #[test]
+    fn a_compaction_without_a_size_still_renders() {
+        let mut names = HashMap::new();
+        let out = render(&AgentEvent::Compacted { pre_tokens: None }, &mut names).unwrap();
+        assert!(out.contains("compacted"), "{out}");
+        assert!(!out.contains('0'), "must not invent a number: {out}");
+    }
+
+    #[test]
+    fn a_usage_limit_renders_its_kind() {
+        let mut names = HashMap::new();
+        let out = render(
+            &AgentEvent::RateLimited { kind: "five_hour".into(), resets_at: None },
+            &mut names,
+        )
+        .unwrap();
+        assert!(out.contains("five_hour"), "{out}");
+        assert!(out.contains("Usage limit"), "{out}");
     }
 }

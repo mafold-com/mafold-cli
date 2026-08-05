@@ -84,6 +84,17 @@ pub enum AgentEvent {
     /// tokens) so the indicator reflects actual model progress — never the
     /// transcript.
     Pulse { chars: u64, tokens: Option<u64> },
+    /// The harness compacted its OWN context part-way through the turn (Claude
+    /// Code's auto-compact). It takes minutes and produces no stream output
+    /// while it runs, so relaying it is what keeps a long reply from reading as
+    /// a hang. `pre_tokens` is the context size that was compacted, when the
+    /// harness reports it.
+    Compacted { pre_tokens: Option<u64> },
+    /// The harness reported a usage limit that is NOT in the healthy state —
+    /// the quota is exhausted or restricted. Harnesses emit this ONLY for the
+    /// non-healthy states; a limit that's fine is not news and must not be
+    /// relayed into every reply.
+    RateLimited { kind: String, resets_at: Option<i64> },
     /// End-of-turn summary.
     Done { duration_ms: Option<f64>, cost_usd: Option<f64>, tokens: Option<u64> },
     /// (daemon-internal) The user answered the pending interactive ask — the

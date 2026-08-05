@@ -158,6 +158,14 @@ impl Harness for ClaudeCode {
         let mut session_id: Option<String> = None;
         // Set when an API / execution error ends the turn — surfaced to the user.
         let mut error: Option<String> = None;
+        // The last few NON-JSON stdout lines. `claude` prints its fatal reasons
+        // as plain text on stdout — a usage cap, an auth failure, a `--resume`
+        // id whose transcript is gone — NOT as stream-json, and the parser below
+        // drops every line it can't parse. When the run then exits nonzero with
+        // an empty stderr, this tail is the ONLY explanation that exists; without
+        // it the daemon reported a bare "claude exited unsuccessfully" and the
+        // reason was destroyed at the exact moment it was needed.
+        let mut plain_tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
         // Real output-token progress for the generating heartbeat: the API's
         // `message_delta` usage is cumulative PER assistant message, so completed
         // messages accumulate into `tokens_done` when the next one starts.
@@ -187,9 +195,38 @@ impl Harness for ClaudeCode {
             };
             let line = line.trim();
             if line.is_empty() { continue; }
-            let v: Value = match serde_json::from_str(line) { Ok(v) => v, Err(_) => continue };
+            let v: Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                // Not stream-json → keep it as a breadcrumb (see `plain_tail`)
+                // instead of dropping it on the floor.
+                Err(_) => { push_plain(&mut plain_tail, line); continue }
+            };
             if session_id.is_none() {
                 if let Some(sid) = v["session_id"].as_str() { session_id = Some(sid.to_string()); }
+            }
+            // Claude Code compacting its OWN context, mid-turn. It runs for
+            // minutes (135s / 162s / 308s in this machine's transcripts) and
+            // streams nothing at all while it works, so an unrelayed compaction
+            // reads as a hung reply — exactly the moment a user gives up and
+            // resends. Compaction is in place: the session id doesn't change,
+            // so `--resume` is unaffected and nothing needs re-persisting.
+            //
+            // Deliberately does NOT set `produced`: this is our narration, not
+            // model output. A turn that only compacted and then said nothing is
+            // still an empty turn, and must stay eligible for the caller's
+            // empty-turn retry.
+            if v["type"] == "system" && v["subtype"] == "compact_boundary" {
+                let _ = sink.send(AgentEvent::Compacted { pre_tokens: compaction_pre_tokens(&v) });
+                continue;
+            }
+            // Usage-limit state. Relayed ONLY when it is not "allowed": claude
+            // emits one of these on ordinary healthy turns too, and echoing
+            // "your quota is fine" into every reply is noise, not news.
+            if v["type"] == "rate_limit_event" {
+                if let Some((kind, resets_at)) = rate_limit_notice(&v["rate_limit_info"]) {
+                    let _ = sink.send(AgentEvent::RateLimited { kind, resets_at });
+                }
+                continue;
             }
             // A fatal error event (NOT a transient API blip the SDK retries away
             // silently) — stop now and report the reason, instead of relaying an
@@ -340,8 +377,27 @@ impl Harness for ClaudeCode {
                 Some(t) => t.await.unwrap_or_default(),
                 None => String::new(),
             };
-            let err = err.trim();
-            bail!("claude exited unsuccessfully{}", if err.is_empty() { String::new() } else { format!(": {err}") });
+            // Reaching here at all means the process died WITHOUT a terminal
+            // `result` line — EVERY `result`, success or `is_error`, breaks the
+            // loop above and returns before this point. So this is the silent
+            // death: claude quit without saying why on the stream, and (in the
+            // cases seen in the field) without saying why on stderr either.
+            //
+            // NOT `bail!`. A nonzero exit means "the turn ended on an error",
+            // which is exactly what `TurnOutcome::error` carries — and only that
+            // form reaches the caller's stale-resume recovery, which drops the
+            // resumed session and retries ONCE on a fresh one so the user's
+            // message still gets answered. An `Err` here bypassed BOTH retry
+            // paths in `agent::handle` (they only match `Ok`), so this silent
+            // death burned the whole turn on a reply card that lived a couple of
+            // seconds and the user had to notice and resend by hand. `produced`
+            // rides along, so a run that already streamed work is never redone.
+            return Ok(TurnOutcome {
+                produced,
+                stopped,
+                session: session_id,
+                error: Some(exit_reason(status.code(), &err, plain_tail.make_contiguous())),
+            });
         }
         if let Some(t) = stderr_task { t.abort(); }
         Ok(TurnOutcome { produced, stopped, session: session_id, error: None })
@@ -367,11 +423,179 @@ impl Harness for ClaudeCode {
     }
 }
 
+/// The context size a `compact_boundary` event says it compacted. Its own
+/// function so the JSON path is pinned by a test against a real captured event —
+/// a silently-wrong path here reads exactly like no compaction at all.
+fn compaction_pre_tokens(v: &Value) -> Option<u64> {
+    v["compactMetadata"]["preTokens"].as_u64()
+}
+
+/// The usage-limit state worth relaying from a `rate_limit_event`'s
+/// `rate_limit_info`, or None when the limit is healthy. Claude emits one of
+/// these on ordinary turns too, so the "allowed" gate is what keeps this from
+/// stamping a quota notice onto every single reply — it is load-bearing, not
+/// defensive.
+fn rate_limit_notice(info: &Value) -> Option<(String, Option<i64>)> {
+    if info["status"].as_str().unwrap_or("allowed") == "allowed" {
+        return None;
+    }
+    Some((
+        info["rateLimitType"].as_str().unwrap_or("usage").to_string(),
+        info["resetsAt"].as_i64(),
+    ))
+}
+
+/// Keep the last few plain-text stdout lines (see `plain_tail`). Bounded in both
+/// line count and line length — these are diagnostic breadcrumbs for a failed
+/// run, not a transcript, and a chatty non-JSON stream must not grow them.
+fn push_plain(tail: &mut std::collections::VecDeque<String>, line: &str) {
+    const MAX_LINES: usize = 5;
+    const MAX_CHARS: usize = 300;
+    let mut s: String = line.chars().take(MAX_CHARS).collect();
+    if line.chars().count() > MAX_CHARS {
+        s.push('…');
+    }
+    tail.push_back(s);
+    while tail.len() > MAX_LINES {
+        tail.pop_front();
+    }
+}
+
+/// Why a `claude` run that exited nonzero failed, in the most useful words we
+/// have: stderr when claude wrote there, else the plain-text stdout tail, else
+/// the exit code itself. Never a bare "exited unsuccessfully" — a failure with
+/// no reason attached is unactionable for the user AND undiagnosable from the
+/// daemon log, which is how this class of dead reply went unexplained for weeks.
+fn exit_reason(code: Option<i32>, stderr: &str, plain_tail: &[String]) -> String {
+    const HEAD: &str = "claude exited unsuccessfully";
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        return format!("{HEAD}: {stderr}");
+    }
+    let tail: Vec<&str> = plain_tail.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if !tail.is_empty() {
+        return format!("{HEAD}: {}", tail.join(" / "));
+    }
+    match code {
+        Some(c) => format!("{HEAD} (exit code {c}, and it printed nothing to stdout or stderr)"),
+        None => format!("{HEAD} (killed by a signal, and it printed nothing to stdout or stderr)"),
+    }
+}
+
 /// A tool_result's `content` can be a string or an array of `{type:text,text}`.
 fn tool_result_text(b: &Value) -> String {
     match &b["content"] {
         Value::String(s) => s.clone(),
         Value::Array(items) => items.iter().filter_map(|i| i["text"].as_str()).collect::<Vec<_>>().join("\n"),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three 0.0s cards in the field carried this on stderr — that path
+    /// already worked and must keep working.
+    #[test]
+    fn stderr_is_the_reason_when_claude_writes_there() {
+        let r = exit_reason(Some(1), "No conversation found with session ID: 29cbfee1\n", &[]);
+        assert!(r.contains("No conversation found"), "{r}");
+    }
+
+    /// The regression this fixes: claude printed the reason as PLAIN TEXT on
+    /// stdout, the stream-json parser dropped it as unparseable, stderr was
+    /// empty — and the user got a bare "claude exited unsuccessfully" with
+    /// nothing to act on and nothing in the log to diagnose.
+    #[test]
+    fn plain_stdout_tail_is_the_reason_when_stderr_is_empty() {
+        let tail = vec!["Claude usage limit reached|1785900000".to_string()];
+        let r = exit_reason(Some(1), "   \n ", &tail);
+        assert!(r.contains("usage limit reached"), "{r}");
+    }
+
+    /// Even with nothing on either stream, the exit code is real information —
+    /// it used to be discarded too.
+    #[test]
+    fn exit_code_is_reported_when_there_is_no_output_at_all() {
+        let r = exit_reason(Some(143), "", &[]);
+        assert!(r.contains("143"), "{r}");
+        assert!(exit_reason(None, "", &[]).contains("signal"));
+    }
+
+    #[test]
+    fn plain_tail_is_bounded_in_lines_and_line_length() {
+        let mut t = std::collections::VecDeque::new();
+        for i in 0..20 {
+            push_plain(&mut t, &format!("line {i}"));
+        }
+        assert_eq!(t.len(), 5, "keeps only the tail");
+        assert_eq!(t.back().unwrap(), "line 19", "keeps the LAST lines, not the first");
+        push_plain(&mut t, &"x".repeat(1000));
+        assert!(t.back().unwrap().chars().count() <= 301, "long line truncated");
+    }
+
+    /// Blank-only breadcrumbs must not masquerade as an explanation.
+    #[test]
+    fn whitespace_only_tail_falls_through_to_the_exit_code() {
+        let r = exit_reason(Some(2), "", &["".into(), "   ".into()]);
+        assert!(r.contains("exit code 2"), "{r}");
+    }
+
+    /// A real auto-compaction event, verbatim from a transcript on disk. Pins
+    /// the JSON path — read the wrong one and compaction goes back to being
+    /// invisible, with nothing failing to say so.
+    #[test]
+    fn pre_tokens_come_from_a_real_compact_boundary_event() {
+        let v: Value = serde_json::from_str(
+            r#"{"type":"system","subtype":"compact_boundary","content":"Conversation compacted",
+                "isMeta":false,"level":"info",
+                "compactMetadata":{"trigger":"auto","preTokens":302336,"durationMs":135931,
+                                   "preCompactDiscoveredTools":["WebFetch","WebSearch"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(compaction_pre_tokens(&v), Some(302336));
+    }
+
+    /// The event carries no post-compaction count, so an absent `preTokens`
+    /// must degrade to "compacted, size unknown" rather than to a zero that a
+    /// caller could mistake for a real measurement.
+    #[test]
+    fn a_compaction_event_without_pre_tokens_is_none_not_zero() {
+        let v: Value = serde_json::from_str(
+            r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"auto"}}"#,
+        )
+        .unwrap();
+        assert_eq!(compaction_pre_tokens(&v), None);
+    }
+
+    /// A real healthy rate-limit event, verbatim off the stream. Claude sends
+    /// one of these on ordinary turns — relaying it would stamp a quota notice
+    /// onto every reply.
+    #[test]
+    fn a_healthy_rate_limit_is_not_relayed() {
+        let v: Value = serde_json::from_str(
+            r#"{"status":"allowed","resetsAt":1785901800,"rateLimitType":"five_hour",
+                "overageStatus":"rejected","isUsingOverage":false}"#,
+        )
+        .unwrap();
+        assert_eq!(rate_limit_notice(&v), None);
+    }
+
+    #[test]
+    fn an_exhausted_rate_limit_is_relayed_with_its_kind_and_reset() {
+        let v: Value = serde_json::from_str(
+            r#"{"status":"rejected","resetsAt":1785901800,"rateLimitType":"five_hour"}"#,
+        )
+        .unwrap();
+        assert_eq!(rate_limit_notice(&v), Some(("five_hour".into(), Some(1785901800))));
+    }
+
+    /// An unfamiliar shape must not be silently swallowed: anything that isn't
+    /// explicitly "allowed" is worth telling the user about.
+    #[test]
+    fn an_unrecognized_rate_limit_status_is_still_relayed() {
+        let v: Value = serde_json::from_str(r#"{"status":"something_new"}"#).unwrap();
+        assert_eq!(rate_limit_notice(&v), Some(("usage".into(), None)));
     }
 }

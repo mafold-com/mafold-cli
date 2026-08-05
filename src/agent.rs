@@ -3379,9 +3379,20 @@ async fn handle(
     // otherwise re-persists the same session below) would leave the bot broken
     // on every future message until the session is cleared by hand. Drop the
     // stale session NOW and retry ONCE on a FRESH one so THIS message is still
-    // answered; the fresh session then replaces the bad one. Skip when we didn't
-    // resume (nothing to blame), when the user stopped it, or when nothing was
-    // produced (that's the empty-turn path above, retried on the same session).
+    // answered; the fresh session then replaces the bad one.
+    //
+    // This also covers the harness process exiting NONZERO without ever emitting
+    // a terminal `result` — it just dies, often with nothing on stderr either
+    // (a `result` that says `is_error` is the OTHER shape, already handled since
+    // 1902051e). That silent death used to arrive as `Err`, which matches
+    // neither retry here, so the whole turn was spent on a reply card that lived
+    // a couple of seconds and the user had to notice and resend by hand.
+    // `claude_code` now reports it as Ok+error so it lands here instead.
+    //
+    // Gates: skip when we didn't resume (nothing to blame), when the user
+    // stopped it, and when the run already PRODUCED output (a retry would redo
+    // work that partly landed). A clean turn with no error and no output is the
+    // separate empty-turn path above, retried on the SAME session.
     let resumed_errored = prior.is_some()
         && matches!(&result, Ok(o) if o.error.is_some() && !o.stopped && !o.produced);
     if resumed_errored {
@@ -3478,8 +3489,11 @@ async fn handle(
         }
         Err(e) => {
             eprintln!("harness run failed: {e}");
-            // A stale/expired resumed session → drop it so the next message
-            // starts fresh instead of failing again.
+            // Reaching here means the harness could not RUN at all (no `claude`
+            // on PATH, a workdir that doesn't exist) — a nonzero exit from a run
+            // that did start arrives as Ok+error and is retried above. Nothing
+            // to retry for these: the next message would fail the same way. Still
+            // drop a resumed session, since we can't tell it apart from a bad one.
             if prior.is_some() {
                 let mut s = sessions.lock().await;
                 if s.remove(&skey).is_some() { save_sessions(&s); }
