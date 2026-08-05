@@ -936,7 +936,7 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     // Make sure the Customization sheet has something to render: agent bots are
     // created template-less, so their schema is empty and the sheet shows an
     // empty state — the owner can't pick a model even though the daemon fully
-    // consumes model/system_prompt/thinking/cwd. Seed those fields once.
+    // consumes model/effort/system_prompt/thinking/cwd. Seed those fields once.
     ensure_customize_fields(&client, &my_username, owner_username.as_deref(), harness.id()).await;
 
     // A daemon killed mid-turn (update restart / crash) leaves its streaming
@@ -1321,8 +1321,11 @@ async fn ensure_customize_fields(client: &Client, my_username: &str, owner_usern
 /// it differs from the current stock for the daemon's harness.
 fn is_our_stock_seed(schema: &[serde_json::Value]) -> bool {
     let keys: Vec<&str> = schema.iter().filter_map(|f| f["key"].as_str()).collect();
-    // claude-code stock (with the stock Claude model menu)…
-    (keys == ["model", "system_prompt", "thinking", "cwd"]
+    // claude-code stock (with the stock Claude model menu): v1 had no effort
+    // select — the daemon consumed `effort` all along, so v1 stays listed here
+    // and existing v1 sheets re-seed into v2 on the next daemon start.
+    ((keys == ["model", "system_prompt", "thinking", "cwd"]
+        || keys == ["model", "effort", "system_prompt", "thinking", "cwd"])
         && schema[0]["options"]
             .as_array()
             .is_some_and(|o| o.iter().any(|x| x["value"] == "fable")))
@@ -1399,6 +1402,11 @@ fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
             ]),
             "model / system prompt / thinking / cwd",
         ),
+        // Claude Code (also the fallback): effort AND a thinking budget are two
+        // different dials here — `--effort` picks how hard the agent works a
+        // turn, MAX_THINKING_TOKENS how much it thinks before each reply — so
+        // unlike codex it gets both. The tiers are the ones `claude --effort`
+        // accepts (low/medium/high/xhigh/max — no `minimal`).
         _ => (
             serde_json::json!([
                 { "key": "model", "label": "Model", "label_key": "botField.model.label", "kind": "select", "default": "",
@@ -1409,6 +1417,15 @@ fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
                     { "label": "Sonnet", "value": "sonnet" },
                     { "label": "Haiku",  "value": "haiku" }
                   ] },
+                { "key": "effort", "label": "Reasoning effort", "label_key": "botField.effort.label", "kind": "select", "default": "",
+                  "options": [
+                    { "label": "Agent default", "label_key": "botField.optionAgentDefault", "value": "" },
+                    { "label": "Low",    "label_key": "botField.effort.low",    "value": "low" },
+                    { "label": "Medium", "label_key": "botField.effort.medium", "value": "medium" },
+                    { "label": "High",   "label_key": "botField.effort.high",   "value": "high" },
+                    { "label": "xHigh",  "label_key": "botField.effort.xhigh",  "value": "xhigh" },
+                    { "label": "Max",    "label_key": "botField.effort.max",    "value": "max" }
+                  ] },
                 { "key": "system_prompt", "label": "System prompt", "label_key": "botField.systemPrompt.label", "kind": "string",
                   "placeholder": "Extra instructions appended for every reply", "placeholder_key": "botField.systemPrompt.placeholder" },
                 { "key": "thinking", "label": "Thinking budget (tokens)", "label_key": "botField.thinking.label", "kind": "number",
@@ -1416,7 +1433,7 @@ fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
                 { "key": "cwd", "label": "Working directory", "label_key": "botField.cwd.label", "kind": "string",
                   "placeholder": "~/project — per-chat here = that chat only; All chats = the default", "placeholder_key": "botField.cwd.placeholder" }
             ]),
-            "model / system prompt / thinking / cwd",
+            "model / effort / system prompt / thinking / cwd",
         ),
     }
 }
@@ -1489,8 +1506,11 @@ async fn connect_and_run(
     });
 
     // Cards this bot can embed in replies — fetched once per connection, folded
-    // into the mafold preamble each turn.
+    // into the mafold preamble each turn AND used to canonicalise what the model
+    // writes back (`cardtags::qualify`): the same list that advertises the cards
+    // is the one that validates the output, so the two can't drift.
     let card_tags = available_card_tags(client).await;
+    crate::cardtags::set_registry(&card_tags);
 
     // Event-log cursor: the highest hub `seq` this daemon has processed,
     // persisted per bot. The hello's head seq says how far behind we are; the
@@ -4041,11 +4061,38 @@ async fn render_loop(
     // Show the generating card immediately (covers the model's initial latency).
     let _ = client.edit_draft(&msg_id, &generating_tag!()).await;
 
+    // Model prose → message content. This is the only place text the MODEL
+    // wrote enters `full`, so it is where a bare card tag gets its namespace
+    // spliced in (`{% html %}` → `{% mafold/html %}`, see `cardtags`): the
+    // preamble asks for the qualified form, but a conversation that predates
+    // the namespace migration copies its own `{% html %}` history over any
+    // instruction, and a bare tag renders as a grey "Unsupported card" box
+    // that also eats the card's body.
+    //
+    // Streaming cuts wherever the model breathes, so a chunk ending mid-tag is
+    // held back (`commit_boundary`) rather than committed as half a tag —
+    // `full` never holds a tag the qualifier couldn't see whole. `all` is the
+    // terminal flush: the stream is over, so whatever is left goes out as-is
+    // and the finished message is canonicalised one last time.
     macro_rules! commit_buf {
-        () => {
+        (all) => {
             if !buf.is_empty() {
                 full.push_str(&buf);
                 buf.clear();
+            }
+            full = crate::cardtags::qualify(&full);
+        };
+        () => {
+            if !buf.is_empty() {
+                let n = crate::cardtags::commit_boundary(&buf);
+                if n > 0 {
+                    let tagged = buf[..n].contains("{%");
+                    full.push_str(&buf[..n]);
+                    buf.drain(..n);
+                    if tagged {
+                        full = crate::cardtags::qualify(&full);
+                    }
+                }
             }
         };
     }
@@ -4141,7 +4188,7 @@ async fn render_loop(
                     }
                 }
                 AgentEvent::Done { .. } => {
-                    commit_buf!();
+                    commit_buf!(all);
                     commit_group!();
                     // Detached tasks outlive the turn — leave a visible,
                     // EXPANDABLE trace instead of letting them run invisibly
@@ -4255,7 +4302,7 @@ async fn render_loop(
     }
     // Safety net: stream closed without a Done (error/kill) → commit pending and
     // push a final snapshot WITHOUT the generating card.
-    commit_buf!();
+    commit_buf!(all);
     commit_group!();
     let _ = client.edit_draft(&msg_id, &full).await;
     *final_md.lock().unwrap() = full;
@@ -4505,6 +4552,89 @@ mod body_record_tests {
         let cut = &FORWARDED[..FORWARDED.len() - 40];
         let out = flatten_body_records(cut, &mut vec![]);
         assert!(!out.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod customize_seed_tests {
+    use super::{customize_fields, is_our_stock_seed};
+    use serde_json::{json, Value};
+
+    /// The values a select field actually offers, minus the empty "agent default".
+    fn opts(schema: &[Value], key: &str) -> Vec<String> {
+        schema
+            .iter()
+            .find(|f| f["key"] == key)
+            .unwrap_or_else(|| panic!("no {key} field in {schema:#?}"))["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o["value"].as_str())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn stock(harness: &str) -> Vec<Value> {
+        customize_fields(harness).0.as_array().unwrap().clone()
+    }
+
+    /// The sheet must offer the tiers `claude --effort` accepts — the daemon has
+    /// always passed this through (`Turn::effort` → `--effort`), so a sheet
+    /// without the field is a dial nobody can reach. `minimal` is codex-only.
+    #[test]
+    fn claude_sheet_offers_the_effort_tiers_claude_accepts() {
+        let s = stock("claude-code");
+        assert_eq!(opts(&s, "effort"), ["low", "medium", "high", "xhigh", "max"]);
+        // …and still both dials: effort ≠ the per-reply thinking budget.
+        assert!(s.iter().any(|f| f["key"] == "thinking"), "{s:#?}");
+    }
+
+    /// Codex keeps its own ladder (no xhigh/max) and no thinking budget.
+    #[test]
+    fn codex_sheet_keeps_its_own_ladder() {
+        let s = stock("codex");
+        assert_eq!(opts(&s, "effort"), ["minimal", "low", "medium", "high"]);
+        assert!(!s.iter().any(|f| f["key"] == "thinking"), "{s:#?}");
+    }
+
+    /// A sheet seeded before effort existed is still OURS, so the next daemon
+    /// start replaces it — that's how existing bots get the field.
+    #[test]
+    fn effort_less_claude_sheet_reseeds() {
+        let v1 = vec![
+            json!({ "key": "model", "kind": "select",
+                    "options": [{ "value": "" }, { "value": "fable" }, { "value": "opus" }] }),
+            json!({ "key": "system_prompt", "kind": "string" }),
+            json!({ "key": "thinking", "kind": "number" }),
+            json!({ "key": "cwd", "kind": "string" }),
+        ];
+        assert!(is_our_stock_seed(&v1));
+        assert_ne!(v1, stock("claude-code")); // …and it's stale ⇒ republished
+    }
+
+    /// The sheet we just published must read back as stock, or every daemon
+    /// start would republish it forever.
+    #[test]
+    fn the_current_claude_sheet_is_recognized_as_ours() {
+        for h in ["claude-code", "codex", "kimi-code"] {
+            assert!(is_our_stock_seed(&stock(h)), "{h}");
+        }
+    }
+
+    /// An owner who hand-wrote their sheet keeps it — matching the v2 key list
+    /// isn't enough, the stock Claude model menu has to be there too.
+    #[test]
+    fn owner_authored_sheet_is_never_stock() {
+        let owner = vec![
+            json!({ "key": "model", "kind": "string",
+                    "options": [{ "value": "" }, { "value": "claude-opus-4-8" }] }),
+            json!({ "key": "effort", "kind": "select", "options": [{ "value": "max" }] }),
+            json!({ "key": "system_prompt", "kind": "string" }),
+            json!({ "key": "thinking", "kind": "number" }),
+            json!({ "key": "cwd", "kind": "string" }),
+        ];
+        assert!(!is_our_stock_seed(&owner));
     }
 }
 

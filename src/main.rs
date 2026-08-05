@@ -11,6 +11,7 @@ mod apps;
 mod ask_hook;
 mod bash_hook;
 mod cards;
+mod cardtags;
 mod channels;
 mod client;
 mod commands;

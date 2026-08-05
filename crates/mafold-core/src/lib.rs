@@ -219,7 +219,14 @@ pub fn core_version() -> String {
 #[cfg(not(target_arch = "wasm32"))]
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn rpc(base: String, token: String, method: String, body: String) -> Result<String, CoreError> {
-    methods::call(&base, &token, &method, &body).await.map_err(|e| CoreError::Db(e.to_string()))
+    // Same rejection contract as the wasm `rpc`: an api `{ok:false}` carries the
+    // RAW envelope text (so the client extracts error_code/description); every
+    // other failure flattens to a human message. Flattening the Api case too
+    // (the old behavior) silently threw away error_code across the FFI.
+    methods::call(&base, &token, &method, &body).await.map_err(|e| match e {
+        net::RpcError::Api(envelope) => CoreError::Db(envelope),
+        other => CoreError::Db(other.to_string()),
+    })
 }
 
 // ───────────────────────── native: UniFFI (synchronous facade) ─────────────────────────
@@ -391,6 +398,82 @@ mod native {
                 .set_language(&base, &token, &code)
                 .await
                 .map_err(CoreError::Db)
+        }
+    }
+
+    // ── JSON twins of the record-typed surface (mirror of the wasm CoreHandle) ──
+    // One JSON contract across both compilation targets: a JS host over UniFFI
+    // (mafold-rn) speaks the SAME serde shapes the web wrapper does, so no host
+    // hand-writes record converters that could drift. Semantics match the wasm
+    // methods verbatim, including how parse failures are swallowed.
+    #[uniffi::export]
+    impl MafoldCore {
+        /// Upsert + reconcile, then RETURN the message's reconciled TIMELINE
+        /// window (JSON array, time-ordered; keyed by channel_id falling back
+        /// to conversation_id). "null" on a parse failure — callers fall back.
+        pub fn upsert_message_json(&self, json: String) -> String {
+            if let Ok(m) = serde_json::from_str::<CoreMessage>(&json) {
+                let timeline = m.channel_id.clone().unwrap_or_else(|| m.conversation_id.clone());
+                pollster::block_on(self.inner.upsert_message(&m));
+                let win = pollster::block_on(self.inner.messages(&timeline));
+                return serde_json::to_string(&win).unwrap_or_else(|_| "null".into());
+            }
+            "null".into()
+        }
+        pub fn upsert_conversation_json(&self, json: String) {
+            if let Ok(c) = serde_json::from_str::<CoreConversation>(&json) {
+                pollster::block_on(self.inner.upsert_conversation(&c));
+            }
+        }
+        pub fn upsert_account_json(&self, json: String) {
+            if let Ok(a) = serde_json::from_str::<CoreAccount>(&json) {
+                pollster::block_on(self.inner.upsert_account(&a));
+            }
+        }
+        pub fn replace_conversations_json(&self, json: String) {
+            if let Ok(cs) = serde_json::from_str::<Vec<CoreConversation>>(&json) {
+                pollster::block_on(self.inner.replace_conversations(&cs));
+            }
+        }
+        pub fn replace_messages_json(&self, conversation_id: String, json: String) {
+            if let Ok(ms) = serde_json::from_str::<Vec<CoreMessage>>(&json) {
+                pollster::block_on(self.inner.replace_messages(&conversation_id, &ms));
+            }
+        }
+        pub fn delete_messages_json(&self, conversation_id: String, ids_json: String) {
+            if let Ok(ids) = serde_json::from_str::<Vec<String>>(&ids_json) {
+                pollster::block_on(self.inner.delete_messages(&conversation_id, &ids));
+            }
+        }
+        pub fn messages_json(&self, conversation_id: String) -> String {
+            serde_json::to_string(&pollster::block_on(self.inner.messages(&conversation_id)))
+                .unwrap_or_default()
+        }
+        /// Thread view (root + replies, oldest→newest) as JSON — the root copy
+        /// is the live one (see `thread`).
+        pub fn thread_json(&self, conversation_id: String, root_id: String) -> String {
+            serde_json::to_string(&pollster::block_on(self.inner.thread(&conversation_id, &root_id)))
+                .unwrap_or_default()
+        }
+        pub fn conversations_json(&self) -> String {
+            serde_json::to_string(&pollster::block_on(self.inner.conversations()))
+                .unwrap_or_default()
+        }
+        pub fn save_channels_json(&self, conversation_id: String, channels_json: String) {
+            let list: Vec<CoreChannel> = serde_json::from_str(&channels_json).unwrap_or_default();
+            pollster::block_on(self.inner.replace_channels(&conversation_id, &list));
+        }
+        pub fn load_channels_json(&self, conversation_id: String) -> String {
+            serde_json::to_string(&pollster::block_on(self.inner.channels(&conversation_id)))
+                .unwrap_or_else(|_| "[]".into())
+        }
+        pub fn save_conv_apps_json(&self, conversation_id: String, apps_json: String) {
+            let list: Vec<CoreConvApp> = serde_json::from_str(&apps_json).unwrap_or_default();
+            pollster::block_on(self.inner.replace_conv_apps(&conversation_id, &list));
+        }
+        pub fn load_conv_apps_json(&self, conversation_id: String) -> String {
+            serde_json::to_string(&pollster::block_on(self.inner.conv_apps(&conversation_id)))
+                .unwrap_or_else(|_| "[]".into())
         }
     }
 }
@@ -776,6 +859,48 @@ mod tests {
         let convs = core.conversations().unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].id, "b");
+    }
+
+    #[test]
+    fn json_twins_mirror_wasm_semantics() {
+        // The UniFFI *_json surface (mafold-rn) must behave exactly like the
+        // wasm CoreHandle: same serde shapes, upsert returns the reconciled
+        // timeline window keyed by channel_id ?? conversation_id.
+        let core = MafoldCore::open(":memory:".into()).unwrap();
+        core.upsert_conversation_json(
+            r#"{"id":"c1","kind":"direct","title":null,"participants":[],
+                "updated_at_ms":100,"unread_count":0,"last_message":null,
+                "is_forum":false,"forum_member_channels":false}"#.into(),
+        );
+        let win = core.upsert_message_json(
+            r#"{"id":"m1","conversation_id":"c1",
+                "sender":{"username":"ops","display_name":"Ops","kind":"human",
+                          "avatar_url":null,"parent_username":null,"template":null,
+                          "language":null,"verified":false},
+                "content":"hi","created_at_ms":50,"finalized_at_ms":50,
+                "client_msg_id":null,"thread_root_id":null,"channel_id":null,
+                "payload":null}"#.into(),
+        );
+        let msgs: Vec<CoreMessage> = serde_json::from_str(&win).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "hi");
+        // channel message lands in the CHANNEL timeline, not the conv one
+        let win2 = core.upsert_message_json(
+            r#"{"id":"m2","conversation_id":"c1",
+                "sender":{"username":"ops","display_name":"Ops","kind":"human",
+                          "avatar_url":null,"parent_username":null,"template":null,
+                          "language":null,"verified":false},
+                "content":"in-channel","created_at_ms":60,"finalized_at_ms":60,
+                "client_msg_id":null,"thread_root_id":null,"channel_id":"ch9",
+                "payload":null}"#.into(),
+        );
+        let ch_msgs: Vec<CoreMessage> = serde_json::from_str(&win2).unwrap();
+        assert_eq!(ch_msgs.len(), 1);
+        assert_eq!(ch_msgs[0].id, "m2");
+        assert_eq!(serde_json::from_str::<Vec<CoreMessage>>(&core.messages_json("c1".into())).unwrap().len(), 1);
+        // parse failure is swallowed, mirrors wasm
+        assert_eq!(core.upsert_message_json("not json".into()), "null");
+        assert_eq!(serde_json::from_str::<Vec<CoreConversation>>(&core.conversations_json()).unwrap().len(), 1);
     }
 
     #[test]
