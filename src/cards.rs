@@ -80,6 +80,13 @@ struct CardManifest {
     entry: String,
     #[serde(rename = "displayName", default)]
     display_name: Option<String>,
+    /// `{label, icon, order}` — the card declaring it belongs in the composer
+    /// `+` drawer. Forwarded to the registry VERBATIM and never interpreted
+    /// here: the CLI's job is to carry what the author wrote, and a schema in
+    /// this file would be a second opinion about the drawer that drifts from
+    /// the server's.
+    #[serde(default)]
+    composer: Option<serde_json::Value>,
 }
 fn default_entry() -> String {
     "src/card.tsx".into()
@@ -214,13 +221,18 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
         anyhow::bail!("esbuild exited with {status}");
     }
     let bundle = std::fs::read(&out).with_context(|| format!("reading {}", out.display()))?;
-    println!("  bundle: {} ({:.1} KB)", out.display(), bundle.len() as f64 / 1024.0);
+    println!(
+        "  bundle: {} ({:.1} KB)",
+        out.display(),
+        bundle.len() as f64 / 1024.0
+    );
 
     let client = Client::new(base, token);
     let meta = json!({
         "id": manifest.id,
         "version": manifest.version,
         "display_name": manifest.display_name,
+        "composer": manifest.composer,
     });
     let r = client.publish_card(&meta, bundle).await?;
     let scope = r["scope"].as_str().unwrap_or("?");

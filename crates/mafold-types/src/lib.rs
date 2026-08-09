@@ -703,6 +703,30 @@ pub(crate) fn fnv1a_hex(bytes: &[u8]) -> String {
     format!("{h:016x}")
 }
 
+// MARK: - App update (in-app APK distribution for the RN Android client)
+
+/// server → client answer to `appUpdateCheck`. The metadata fields are filled
+/// whenever ANY release is live (so the UI can say "you're on the latest,
+/// which is X"); `available` alone decides whether an update is offered. `abi`
+/// echoes which of the client's ABIs the server matched — pass it back to
+/// `appUpdateDownload`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppUpdateInfo {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_code: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abi: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
 #[cfg(test)]
 mod inline_result_tests {
     use super::{InlinePick, InlineResult};

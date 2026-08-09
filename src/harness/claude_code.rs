@@ -171,6 +171,12 @@ impl Harness for ClaudeCode {
         // messages accumulate into `tokens_done` when the next one starts.
         let mut tokens_done: u64 = 0;
         let mut tokens_cur: u64 = 0;
+        // Receipts for OTHER queued messages stepped over so far (see the
+        // `result` arm). Bounded so a pathological queue can't hold a turn open
+        // forever — past the bound we take the next receipt as ours and end the
+        // turn, which is the old behaviour, not a new way to hang.
+        const MAX_SKIPPED_RECEIPTS: u32 = 8;
+        let mut skipped_receipts: u32 = 0;
 
         // Stall watchdog: a healthy turn always keeps stdout moving (text deltas,
         // tool events, thinking) — even a long tool call is bracketed by its
@@ -338,6 +344,27 @@ impl Harness for ClaudeCode {
                     );
                     break;
                 }
+                // Not OUR receipt. `claude -p --resume` drains the session's
+                // input QUEUE before it looks at the prompt we came here with,
+                // and a turn the user stopped leaves an item in that queue (a
+                // `<task-notification>` saying a background shell has no
+                // completion record). Claude closes that queued item as a turn
+                // of its own — no model call, so zero usage, empty `result`,
+                // ~100ms — emits a `result` for it, and only THEN dequeues our
+                // prompt and starts working on the real answer.
+                //
+                // Breaking on that receipt is the "0.1s empty reply" the field
+                // kept hitting: the renderer flushed a bare
+                // `{% mafold/result duration="0.1s" %}`, the real answer was
+                // streamed into a pipe with no reader left, and `child.wait()`
+                // below then blocked forever on a process that was still
+                // working — so the draft was never finalized and NEITHER retry
+                // in `agent::handle` ever got to run. Step over the receipt and
+                // keep reading; our own result is still coming.
+                if is_queued_receipt(&v, produced) && skipped_receipts < MAX_SKIPPED_RECEIPTS {
+                    skipped_receipts += 1;
+                    continue;
+                }
                 // Last-resort carrier: a turn that succeeded but reached us with
                 // NOTHING (no deltas, no assistant message, no tool events) still
                 // has its final answer here. Delivering it beats finalizing an
@@ -350,9 +377,7 @@ impl Harness for ClaudeCode {
                         produced = true;
                     }
                 }
-                let u = &v["usage"];
-                let toks: u64 = ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
-                    .iter().filter_map(|k| u[*k].as_u64()).sum();
+                let toks = usage_tokens(&v);
                 let _ = sink.send(AgentEvent::Done {
                     duration_ms: v["duration_ms"].as_f64(),
                     cost_usd: v["total_cost_usd"].as_f64(),
@@ -369,7 +394,29 @@ impl Harness for ClaudeCode {
             if let Some(t) = stderr_task { t.abort(); }
             return Ok(TurnOutcome { produced, stopped, session: session_id, error });
         }
-        let status = child.wait().await?;
+        // `claude` normally exits within a beat of its final `result`. When it
+        // does NOT — more queued input behind us, a background task it is still
+        // winding down — an unbounded wait PARKS THE WHOLE TURN here: the reply
+        // is never finalized (a draft that stays open forever), the caller's
+        // retries never run, and the child lives on writing into a pipe with no
+        // reader until it deadlocks on a full pipe buffer, still holding the
+        // session and whatever tools it spawned. Two such orphans were alive on
+        // the field machine when this was diagnosed — one of them still starting
+        // shells 13 minutes after its "reply" had been rendered.
+        //
+        // We already have this turn's result, so an overstaying child is not a
+        // failure of the reply: give it a grace period, then kill it and return
+        // what we have.
+        const EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+        let status = match tokio::time::timeout(EXIT_GRACE, child.wait()).await {
+            Ok(s) => s?,
+            Err(_) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                if let Some(t) = stderr_task { t.abort(); }
+                return Ok(TurnOutcome { produced, stopped, session: session_id, error });
+            }
+        };
         if !status.success() {
             // The concurrent reader already drained stderr (no post-wait read that
             // could have deadlocked) — just collect what it captured.
@@ -491,9 +538,76 @@ fn tool_result_text(b: &Value) -> String {
     }
 }
 
+/// Every `usage` field that counts toward a turn's token total.
+const USAGE_KEYS: [&str; 4] =
+    ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"];
+
+fn usage_tokens(v: &Value) -> u64 {
+    let u = &v["usage"];
+    USAGE_KEYS.iter().filter_map(|k| u[*k].as_u64()).sum()
+}
+
+/// Is this successful `result` the receipt for a message that ISN'T ours — a
+/// queued `<task-notification>` claude closed out before it even looked at our
+/// prompt? Three things are true of one and of nothing else: this run has
+/// produced nothing at all, the result text is empty, and it burned zero tokens
+/// (no model call happened, so there is no usage). A real turn always spends
+/// input tokens, so a real turn can never look like this.
+///
+/// `is_error` / non-success subtypes are handled before this is consulted.
+fn is_queued_receipt(v: &Value, produced: bool) -> bool {
+    !produced
+        && usage_tokens(v) == 0
+        && v["result"].as_str().map(str::trim).is_none_or(str::is_empty)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exact shape claude emitted at 13:45:08 on the field machine, right
+    /// after a stopped turn left a `<task-notification>` in the session queue.
+    /// Breaking the read loop here is what rendered the "0.1s empty reply" and
+    /// then parked the turn forever in `child.wait()`.
+    #[test]
+    fn queued_notification_receipt_is_not_our_turn() {
+        let v: Value = serde_json::json!({
+            "type": "result", "subtype": "success", "is_error": false,
+            "duration_ms": 103, "result": "", "session_id": "e6b17a8d",
+            "usage": {"input_tokens": 0, "output_tokens": 0}
+        });
+        assert!(is_queued_receipt(&v, false), "must be stepped over");
+    }
+
+    /// A real answer's receipt must END the turn — never be mistaken for a
+    /// queued one, or the reply would hang until the stall watchdog fires.
+    #[test]
+    fn a_real_turns_receipt_is_ours() {
+        let real: Value = serde_json::json!({
+            "type": "result", "subtype": "success", "duration_ms": 21000,
+            "result": "done", "usage": {"input_tokens": 12000, "output_tokens": 300}
+        });
+        assert!(!is_queued_receipt(&real, true), "streamed output already proves it is ours");
+        assert!(!is_queued_receipt(&real, false), "text + usage prove it is ours");
+
+        // Streaming carried the whole reply, so the final result text is empty —
+        // usage still says a model call happened.
+        let streamed: Value = serde_json::json!({
+            "type": "result", "subtype": "success", "result": "",
+            "usage": {"input_tokens": 9000, "cache_read_input_tokens": 400}
+        });
+        assert!(!is_queued_receipt(&streamed, false), "zero-text but real usage is ours");
+    }
+
+    #[test]
+    fn usage_tokens_sums_every_counter() {
+        let v: Value = serde_json::json!({"usage": {
+            "input_tokens": 1, "output_tokens": 2,
+            "cache_read_input_tokens": 4, "cache_creation_input_tokens": 8
+        }});
+        assert_eq!(usage_tokens(&v), 15);
+        assert_eq!(usage_tokens(&serde_json::json!({})), 0);
+    }
 
     /// The three 0.0s cards in the field carried this on stderr — that path
     /// already worked and must keep working.
