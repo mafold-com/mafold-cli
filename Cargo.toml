@@ -1,6 +1,6 @@
 [package]
 name = "mafold-cli"
-version = "0.9.86"
+version = "0.9.87"
 edition = "2021"
 description = "Mafold from your terminal — a CLI client (chats / send) + a Claude Code agent daemon."
 license = "MIT"
@@ -16,7 +16,7 @@ path = "src/main.rs"
 # client uses. Same-language consumer: no FFI, plain crate dep.
 mafold-core = { path = "crates/mafold-core" }
 uuid = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "io-util", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "io-util", "net", "signal"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
 futures-util = "0.3"

@@ -112,6 +112,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "listBuilderGrants",
     "listCards",
     "listChannels",
+    "listComposerCards",
     "listFlags",
     "listHarnessHosts",
     "listInstalls",
@@ -227,9 +228,15 @@ pub static KNOWN_METHODS: &[&str] = &[
     "walletGrants",
     "walletHistory",
     "walletMint",
+    "walletPacketClaim",
+    "walletPacketCreate",
+    "walletPacketGet",
     "walletRates",
     "walletRatesSet",
     "walletTransfer",
+    "walletTransferAccept",
+    "walletTransferDecline",
+    "walletTransferOffer",
     "ws",
 ];
 

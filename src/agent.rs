@@ -1471,15 +1471,14 @@ async fn connect_and_run(
     auto_update: bool,
 ) -> Result<WsExit> {
     use tokio_tungstenite::tungstenite;
-    // Bounded handshake: `connect_async` has no timeout of its own, so a
+    // Bounded handshake: the connect path has no timeout of its own, so a
     // black-holed server (frozen process, dead edge — the same failure the
     // 90s read watchdog below catches mid-session) would hang the RECONNECT
     // path forever, right after the watchdog worked. 30s covers a slow TLS
     // handshake with lots of margin; past that, error out to the backoff loop.
-    let connect = tokio::time::timeout(
-        Duration::from_secs(30),
-        tokio_tungstenite::connect_async(client.ws_request()),
-    );
+    // `ws_connect` (not `connect_async`) so the socket honours the proxy env
+    // the HTTP half already obeys — see Client::ws_connect.
+    let connect = tokio::time::timeout(Duration::from_secs(30), client.ws_connect());
     let (ws, _) = match connect.await {
         Err(_) => return Err(anyhow::anyhow!("WebSocket connect timed out (30s)")),
         Ok(Ok(v)) => v,

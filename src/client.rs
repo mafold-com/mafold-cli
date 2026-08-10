@@ -305,13 +305,12 @@ impl Client {
 
     /// Download a media attachment. The path comes from the server, so it's NOT
     /// trusted as an arbitrary URL: only a relative `/media/…`-style path (joined
-    /// onto our own `base`) or an absolute URL on the SAME origin as `base` is
+    /// onto our own `base`) or an absolute URL on an ALLOWED media origin is
     /// fetched. Anything else (a foreign `http(s)://` host) is rejected so a
     /// crafted attachment URL can't make the daemon do an SSRF request.
     pub async fn download(&self, path: &str) -> Result<Vec<u8>> {
         let url = if path.starts_with("http://") || path.starts_with("https://") {
-            // Absolute URL → only allow it if it's on our own API origin.
-            if !same_origin(&self.base, path) {
+            if !self.media_origin_allowed(path) {
                 anyhow::bail!("refusing to fetch attachment from a non-Mafold origin: {path}");
             }
             path.to_string()
@@ -610,7 +609,7 @@ impl Client {
 
     /// The WS handshake request — sends the bot token via an `Authorization:
     /// Bearer` header instead of the URL query string (so the secret doesn't sit
-    /// in logs / proxies). Pass this straight to `connect_async`.
+    /// in logs / proxies). Feed it to `ws_connect`.
     pub fn ws_request(&self) -> tokio_tungstenite::tungstenite::ClientRequestBuilder {
         let uri: tokio_tungstenite::tungstenite::http::Uri = self
             .ws_url()
@@ -619,6 +618,196 @@ impl Client {
         tokio_tungstenite::tungstenite::ClientRequestBuilder::new(uri)
             .with_header("Authorization", format!("Bearer {}", self.token))
     }
+
+    /// Open the daemon's WebSocket — through the HTTP proxy the environment
+    /// names, exactly like the HTTP half of this client already does.
+    ///
+    /// This exists because the two halves disagreed by default: `reqwest` reads
+    /// `HTTPS_PROXY`/`NO_PROXY` on its own, while `tokio_tungstenite::connect_async`
+    /// reads nothing and always dials the origin direct. Behind a proxy that is
+    /// the ONLY route out (observed: `getMe` 200 through the proxy while every
+    /// WS attempt died in SYN_SENT to the origin IP), that split makes a daemon
+    /// that authenticates, publishes its command menu, and then can never
+    /// receive a single message — online-looking and deaf. A tunnelled socket
+    /// keeps the TLS peer and SNI at the origin host, so the token still only
+    /// travels inside TLS and the proxy sees nothing but `CONNECT host:443`.
+    ///
+    /// Returns the same pair `connect_async` did, so callers keep matching on
+    /// `tungstenite::Error::Http` for the 401/403 auth-rejection path.
+    pub async fn ws_connect(
+        &self,
+    ) -> Result<
+        (
+            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+            tokio_tungstenite::tungstenite::handshake::client::Response,
+        ),
+        tokio_tungstenite::tungstenite::Error,
+    > {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::{error::UrlError, Error};
+
+        let request = self.ws_request().into_client_request()?;
+        let uri = request.uri().clone();
+        let host = uri.host().ok_or(Error::Url(UrlError::NoHostName))?.to_string();
+        let tls = uri.scheme_str() == Some("wss");
+        let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
+
+        let proxy = ws_proxy_for(&host, tls);
+        // One line per process, not per reconnect: which route the socket takes
+        // is the first thing worth knowing when a daemon won't come online, and
+        // the reconnect loop would otherwise bury it.
+        static NOTE: std::sync::Once = std::sync::Once::new();
+        NOTE.call_once(|| match &proxy {
+            Some(p) => println!("ws transport: {host}:{port} via proxy {}", redact_proxy(p)),
+            None => println!("ws transport: {host}:{port} direct (no proxy in env)"),
+        });
+
+        let stream = match &proxy {
+            Some(p) => ws_tunnel(p, &host, port).await?,
+            None => tokio::net::TcpStream::connect((host.as_str(), port)).await.map_err(Error::Io)?,
+        };
+        // The handshake is one small write followed by a wait; Nagle would sit
+        // on it for a round trip.
+        let _ = stream.set_nodelay(true);
+
+        // `request` still carries the wss:// URI, so this does the TLS handshake
+        // against the ORIGIN (SNI + cert check on `host`) over whatever socket we
+        // just handed it — proxied or not.
+        tokio_tungstenite::client_async_tls_with_config(request, stream, None, None).await
+    }
+}
+
+/// First non-empty value among `names`. Both cases are probed because only
+/// Windows env lookup is case-insensitive; the lowercase spellings are the
+/// conventional ones on Unix.
+fn env_first(names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .filter_map(|n| std::env::var(n).ok())
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
+}
+
+/// Whether `NO_PROXY` exempts `host`. Supports the three forms that actually
+/// appear in the wild: `*` (everything), a `192.168.*` prefix wildcard, and a
+/// bare or dot-led suffix (`mafold.com` / `.mafold.com`) which also matches
+/// subdomains. Keeping this honest is what stops a local `127.0.0.1:4000` dev
+/// server from being dialled through the proxy.
+fn no_proxy_matches(host: &str) -> bool {
+    let Some(list) = env_first(&["NO_PROXY", "no_proxy"]) else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    list.split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .any(|pat| {
+            if pat == "*" {
+                return true;
+            }
+            if let Some(prefix) = pat.strip_suffix('*') {
+                return !prefix.is_empty() && host.starts_with(prefix);
+            }
+            let base = pat.trim_start_matches('.');
+            !base.is_empty() && (host == base || host.ends_with(&format!(".{base}")))
+        })
+}
+
+/// The proxy to dial for a WS connection to `host`, or None for direct. Same
+/// precedence reqwest applies on the HTTP side: `NO_PROXY` wins outright, then
+/// the scheme-specific variable, then `ALL_PROXY`.
+fn ws_proxy_for(host: &str, tls: bool) -> Option<String> {
+    if no_proxy_matches(host) {
+        return None;
+    }
+    let scheme_specific: &[&str] =
+        if tls { &["HTTPS_PROXY", "https_proxy"] } else { &["HTTP_PROXY", "http_proxy"] };
+    env_first(scheme_specific).or_else(|| env_first(&["ALL_PROXY", "all_proxy"]))
+}
+
+/// Credentials stripped — this string is printed, and proxy URLs carry
+/// `user:pass@` often enough to matter.
+fn redact_proxy(proxy: &str) -> String {
+    let (scheme, rest) = proxy.split_once("://").unwrap_or(("http", proxy));
+    match rest.rsplit_once('@') {
+        Some((_, addr)) => format!("{scheme}://***@{addr}"),
+        None => format!("{scheme}://{rest}"),
+    }
+}
+
+/// A TCP socket to `host:port` tunnelled through an HTTP proxy via `CONNECT`.
+///
+/// SOCKS is deliberately not handled: `reqwest` here is built without its
+/// `socks` feature, so the HTTP half ignores a `socks5://` value too — failing
+/// loudly beats the two halves silently disagreeing again.
+async fn ws_tunnel(
+    proxy: &str,
+    host: &str,
+    port: u16,
+) -> Result<tokio::net::TcpStream, tokio_tungstenite::tungstenite::Error> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let io_err = |msg: String| {
+        tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, msg))
+    };
+
+    let (scheme, rest) = proxy.split_once("://").unwrap_or(("http", proxy));
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(io_err(format!(
+            "unsupported proxy scheme `{scheme}` for the WebSocket — only http:// CONNECT is handled"
+        )));
+    }
+    let rest = rest.trim_end_matches('/');
+    let (credentials, addr) = match rest.rsplit_once('@') {
+        Some((c, a)) => (Some(c.to_string()), a),
+        None => (None, rest),
+    };
+    // Bare `host` with no port is legal in these variables; 80 is the http
+    // default and what reqwest assumes too.
+    let proxy_addr = if addr.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) {
+        addr.to_string()
+    } else {
+        format!("{addr}:80")
+    };
+
+    let mut stream = tokio::net::TcpStream::connect(&proxy_addr)
+        .await
+        .map_err(|e| io_err(format!("proxy {proxy_addr} unreachable: {e}")))?;
+
+    let target = format!("{host}:{port}");
+    let mut req = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
+    if let Some(credentials) = credentials {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(credentials.as_bytes());
+        req.push_str(&format!("Proxy-Authorization: Basic {encoded}\r\n"));
+    }
+    req.push_str("Proxy-Connection: Keep-Alive\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.map_err(tokio_tungstenite::tungstenite::Error::Io)?;
+
+    // Byte at a time, stopping dead on the blank line: read any further and we
+    // would swallow the head of the TLS handshake that follows on this socket.
+    let mut head = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte).await.map_err(tokio_tungstenite::tungstenite::Error::Io)? {
+            0 => return Err(io_err("proxy closed the connection during CONNECT".into())),
+            _ => head.push(byte[0]),
+        }
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if head.len() > 8192 {
+            return Err(io_err("proxy sent an oversized CONNECT response".into()));
+        }
+    }
+
+    let status_line = String::from_utf8_lossy(&head);
+    let status_line = status_line.lines().next().unwrap_or_default().trim();
+    let accepted = status_line.split_whitespace().nth(1).is_some_and(|code| code.starts_with('2'));
+    if !accepted {
+        return Err(io_err(format!("proxy refused CONNECT {target}: {status_line}")));
+    }
+    Ok(stream)
 }
 
 /// Content type for an outgoing image, by extension. Only the formats the
@@ -690,6 +879,45 @@ mod attach_tests {
     }
 }
 
+/// Media origins the attachment downloader may fetch from, on top of `base`.
+///
+/// WHY THIS EXISTS: the allowlist used to be exactly "same origin as the api".
+/// api@0.0.58 (2026-08-06) moved uploads to `cdn.mafold.com`, so `uploadFile`
+/// started handing out absolute URLs on a DIFFERENT origin — and every image
+/// sent to an agent from then on was refused right here. The caller only
+/// `eprintln!`s the error, so the failure reached nobody: the picture simply
+/// never arrived. (Older messages kept working: they store a relative
+/// `/media/…`, which resolves onto the api and follows its redirect.)
+///
+/// Deliberately a LIST, not a `*.mafold.com` wildcard — a wildcard would make
+/// every present and future subdomain, including anything an attacker might
+/// get to host there, a legal SSRF target. Overridable so a self-hosted
+/// deployment can name its own CDN.
+fn extra_media_origins() -> Vec<String> {
+    parse_media_origins(std::env::var("MAFOLD_MEDIA_ORIGINS").ok().as_deref())
+}
+
+/// Split out from the env read so it can be tested without mutating process
+/// state (env is global; a test that sets it races every other test).
+fn parse_media_origins(raw: Option<&str>) -> Vec<String> {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => s
+            .split(',')
+            .map(|o| o.trim().trim_end_matches('/').to_string())
+            .filter(|o| !o.is_empty())
+            .collect(),
+        None => vec!["https://cdn.mafold.com".to_string()],
+    }
+}
+
+impl Client {
+    /// Is this absolute URL one we're willing to fetch an attachment from?
+    fn media_origin_allowed(&self, url: &str) -> bool {
+        same_origin(&self.base, url)
+            || extra_media_origins().iter().any(|o| same_origin(o, url))
+    }
+}
+
 /// Do two URLs share the same origin (scheme + host + port)? Used to keep the
 /// attachment downloader from following an absolute URL to a foreign host.
 fn same_origin(base: &str, other: &str) -> bool {
@@ -705,5 +933,52 @@ fn same_origin(base: &str, other: &str) -> bool {
     match (origin(base), origin(other)) {
         (Some(a), Some(b)) => a == b,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod media_origin_tests {
+    use super::*;
+
+    fn client(base: &str) -> Client {
+        Client::new(base.to_string(), "t".into())
+    }
+
+    /// The regression this whole allowlist entry exists for: media moved to the
+    /// CDN origin in api@0.0.58 and every agent image was refused for four days.
+    #[test]
+    fn cdn_origin_is_allowed_alongside_the_api() {
+        let c = client("https://api.mafold.com");
+        assert!(c.media_origin_allowed("https://cdn.mafold.com/abc.png"));
+        assert!(c.media_origin_allowed("https://api.mafold.com/media/abc.png"));
+    }
+
+    /// A wildcard would have been the lazy fix; these are what it would let in.
+    #[test]
+    fn look_alike_and_foreign_hosts_are_refused() {
+        let c = client("https://api.mafold.com");
+        for bad in [
+            "https://evil.com/x.png",
+            "https://cdn.mafold.com.evil.com/x.png", // suffix trick
+            "https://evil.com/cdn.mafold.com/x.png", // path trick
+            "http://cdn.mafold.com/x.png",           // scheme downgrade
+            "https://sub.cdn.mafold.com/x.png",      // not the named origin
+        ] {
+            assert!(!c.media_origin_allowed(bad), "should have refused {bad}");
+        }
+    }
+
+    #[test]
+    fn origins_are_configurable_for_self_hosted_deployments() {
+        assert_eq!(parse_media_origins(None), vec!["https://cdn.mafold.com"]);
+        assert_eq!(
+            parse_media_origins(Some(" https://a.example/ , https://b.example ,, ")),
+            vec!["https://a.example", "https://b.example"]
+        );
+        // Blank means UNSET, not "allow nothing" — same rule the api applies to
+        // its keys (state.rs), because a stray `VAR=` in an env file is an
+        // accident far more often than an intent, and here that accident would
+        // silently stop every attachment from loading.
+        assert_eq!(parse_media_origins(Some("   ")), vec!["https://cdn.mafold.com"]);
     }
 }

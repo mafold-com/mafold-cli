@@ -370,7 +370,7 @@ pub struct Message {
     /// message to their optimistic local copy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_msg_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "lenient_attachments")]
     pub attachments: Vec<Attachment>,
     /// Set of usernames who have deleted this message **for themselves**
     /// (Telegram "Delete for me"). Filtered out at history-read time so
@@ -411,25 +411,40 @@ pub struct ServiceNotice {
 
 // MARK: - Attachment
 
+/// Decode an `attachments` array, DROPPING any element this build no longer
+/// understands instead of failing the whole message.
+///
+/// A message is stored as one blob, and the loader skips anything it cannot
+/// parse — so without this, retiring a single attachment variant silently
+/// deletes every message that ever carried one. Retiring a shape must cost that
+/// attachment, never the message it rode in on.
+///
+/// It also makes the wire honestly one-directional: an older client can be sent
+/// a kind it has never heard of and will show the rest of the message rather
+/// than nothing at all.
+fn lenient_attachments<'de, D>(d: D) -> Result<Vec<Attachment>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<serde_json::Value>::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|v| serde_json::from_value(v).ok())
+        .collect())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Attachment {
+    /// A link-preview card. Kept — unlike the two demo shapes retired beside it,
+    /// this one has a real consumer: the Garden brain files it as a URL
+    /// candidate (`brains/garden.rs`), including inside merge-forward records.
     News {
         id: String,
         title: String,
         source_id: String,
         url: String,
         snippet: String,
-    },
-    Ticker {
-        id: String,
-        symbol: String,
-        exchange: String,
-    },
-    Positions {
-        id: String,
-        account_id: String,
-        captured_at: DateTime<Utc>,
     },
     Photo {
         id: String,
@@ -479,8 +494,6 @@ impl Attachment {
     pub fn id(&self) -> &str {
         match self {
             Attachment::News { id, .. }
-            | Attachment::Ticker { id, .. }
-            | Attachment::Positions { id, .. }
             | Attachment::Photo { id, .. }
             | Attachment::Video { id, .. }
             | Attachment::File { id, .. }
@@ -496,7 +509,7 @@ pub struct RecordEntry {
     pub sender_username: String,
     pub ts: DateTime<Utc>,
     pub content: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "lenient_attachments")]
     pub attachments: Vec<Attachment>,
 }
 
