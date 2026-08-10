@@ -2065,7 +2065,8 @@ async fn connect_and_run(
             );
             // Rebuild multi-party group context the access gate dropped (None for
             // DMs / when there's nothing the resumed session is missing).
-            let group_context = recent_group_context(&client, &chat_id, &me_user, &turn_sender, &trigger_id, thread_root.as_deref(), channel_id.as_deref()).await;
+            let mut lookback_photos: Vec<String> = vec![];
+            let group_context = recent_group_context(&client, &chat_id, &me_user, &turn_sender, &trigger_id, thread_root.as_deref(), channel_id.as_deref(), &mut lookback_photos).await;
             // a2a: frame an AI-authored trigger so the model knows the peer is an
             // authorized AI account and how the exchange terminates — an @ hands
             // the mic back, no @ lets it end (`.docs/a2a-v0.md` §3). Prompt-only:
@@ -2077,7 +2078,7 @@ async fn connect_and_run(
             } else {
                 content
             };
-            if let Err(e) = handle(&client, &turn_workdir, workdir_ns, &chat_id, thread_root.as_deref(), channel_id.as_deref(), &prompt, &attachments, &sessions, &coord, &chat_states, &harness, model, effort, thinking, system, &turn_sender, group_context).await {
+            if let Err(e) = handle(&client, &turn_workdir, workdir_ns, &chat_id, thread_root.as_deref(), channel_id.as_deref(), &prompt, &attachments, &sessions, &coord, &chat_states, &harness, model, effort, thinking, system, &turn_sender, group_context, &lookback_photos).await {
                 eprintln!("handle error: {e}");
             }
         });
@@ -2996,15 +2997,50 @@ async fn stamp_finalized_ask(
         .await;
 }
 
+/// The `max` most recent photos out of `(created_at, url)` candidates, handed
+/// back in the order they were SENT.
+///
+/// Newest-first is how you pick them (the picture someone just sent is the one
+/// they mean); oldest-first is how the agent should read them (two screenshots
+/// in a row are "before" then "after"). Getting that backwards silently shows
+/// the model the wrong one first, which is why this is its own function with
+/// its own tests rather than four lines inline.
+fn newest_photos(mut candidates: Vec<(String, String)>, max: usize) -> Vec<String> {
+    candidates.sort_by(|a, b| b.0.cmp(&a.0)); // RFC3339 sorts lexically
+    candidates.truncate(max);
+    candidates.reverse(); // back to chronological
+    let mut out: Vec<String> = Vec::with_capacity(candidates.len());
+    for (_, url) in candidates {
+        if !out.contains(&url) {
+            out.push(url);
+        }
+    }
+    out
+}
+
 async fn recent_group_context(
     client: &Client,
     chat_id: &str,
     my_username: &str,
-    _trigger_sender_lc: &str,
+    trigger_sender_lc: &str,
     trigger_id: &str,
     thread_root: Option<&str>,
     channel_id: Option<&str>,
+    // OUT: photos the trigger's sender posted in the messages just before this
+    // turn. "Send the picture, then @ the bot about it" is how people actually
+    // talk, and in a group the picture's own message @s nobody — so the trigger
+    // gate skipped it whole and the file was never fetched, leaving the agent
+    // staring at "如图所示" with no image. Harvested from the history this
+    // function already pulls, so it costs no extra request, and scoped to the
+    // ONE person who triggered the turn so it changes what the bot can SEE,
+    // never who may make it act.
+    lookback_photos: &mut Vec<String>,
 ) -> Option<String> {
+    // How many of that sender's recent photos to take. Small on purpose: this
+    // is "the picture I just sent", not an album sync.
+    const MAX_LOOKBACK_PHOTOS: usize = 4;
+    // (created_at, url) so the newest survive the cap regardless of API order.
+    let mut candidates: Vec<(String, String)> = Vec::new();
     const MAX_MSGS: usize = 30; // cap injected lines (recent-most kept)
     // Per-message cap. 600 used to cut card-heavy messages (usually other
     // agents' run/tool cards) mid-tag, which made AI-authored messages
@@ -3054,6 +3090,18 @@ async fn recent_group_context(
         let flattened = flatten_body_records(raw, &mut vec![]);
         let text = flattened.trim();
         let attach = msg.get("attachments").and_then(|a| a.as_array()).map(|a| a.len()).unwrap_or(0);
+        // …and if this earlier message is from the person who triggered us, keep
+        // its photos as turn context (capped below).
+        if who_lc == trigger_sender_lc {
+            let at = msg.get("created_at").and_then(|c| c.as_str()).unwrap_or("");
+            for a in msg.get("attachments").and_then(|a| a.as_array()).into_iter().flatten() {
+                if a.get("kind").and_then(|k| k.as_str()) == Some("photo") {
+                    if let Some(u) = a.get("url").and_then(|u| u.as_str()) {
+                        candidates.push((at.to_string(), u.to_string()));
+                    }
+                }
+            }
+        }
         let body = if text.is_empty() {
             if attach > 0 { format!("[{attach} attachment(s)]") } else { continue; }
         } else if text.chars().count() <= MAX_CHARS {
@@ -3070,6 +3118,9 @@ async fn recent_group_context(
         let at = msg.get("created_at").and_then(|c| c.as_str()).unwrap_or("").to_string();
         rows.push((at, who.to_string(), body));
     }
+    // Done BEFORE the early return below, so a chat whose only prior message is
+    // a bare photo still hands the image over.
+    *lookback_photos = newest_photos(candidates, MAX_LOOKBACK_PHOTOS);
     if rows.is_empty() {
         return None; // brand-new chat — nothing to show
     }
@@ -3120,6 +3171,9 @@ async fn handle(
     system: Option<String>,
     turn_sender: &str,
     group_context: Option<String>,
+    // Photos the same person posted in the few messages before the trigger —
+    // see `recent_group_context`. Empty for a turn where they sent none.
+    lookback_photos: &[String],
 ) -> Result<()> {
     // Multi-party group context (untrusted, prepended) so the bot follows the
     // conversation the access gate would otherwise hide. None for DMs.
@@ -3170,8 +3224,23 @@ async fn handle(
             _ => {}
         }
     }
+    // The trigger's own photos come first; the ones from just before it follow,
+    // so a turn that has both reads in the order they were sent.
+    for u in lookback_photos {
+        if !photo_urls.contains(u) {
+            photo_urls.push(u.clone());
+        }
+    }
     let mut saved: Vec<String> = vec![];
     for url in &photo_urls {
+        // Already on disk from an earlier turn → hand over the path without
+        // re-fetching. Without this, every follow-up question about the same
+        // picture would re-download it.
+        let cached = attachments_dir().join(sanitize_attachment_name(url.rsplit('/').next().unwrap_or("")));
+        if cached.is_file() {
+            saved.push(cached.to_string_lossy().into_owned());
+            continue;
+        }
         match client.download(url).await {
             Ok(bytes) => {
                 // The basename is SERVER-supplied → never trust it as a path. Take
@@ -3958,7 +4027,9 @@ fn arm_bg_wakeup(
                 thread_root.as_deref(), channel_id.as_deref(), &prompt, &[],
                 &sessions, &coord, &chat_states, &harness,
                 model.clone(), effort.clone(), thinking, system.clone(),
-                &turn_sender, None,
+                // A background-task wrap-up isn't someone asking about a picture
+                // — no trigger message, so nothing to look back from.
+                &turn_sender, None, &[],
             )
             .await
             {
@@ -4878,5 +4949,58 @@ mod gate_tests {
         // the surface beats the chat AND the owner default
         let (dir, _) = resolve_turn_workdir(Some(&b), Some(&a), Some(&a), "C:/default");
         assert!(dir.ends_with("mf-wd-b"), "{dir}");
+    }
+}
+
+#[cfg(test)]
+mod lookback_photo_tests {
+    use super::newest_photos;
+
+    fn c(at: &str, url: &str) -> (String, String) {
+        (at.into(), url.into())
+    }
+
+    /// The regression this exists for: in a group, "先发图,再 @ 一句" meant the
+    /// image-bearing message @'d nobody, got skipped by the trigger gate, and
+    /// its photo was never fetched. These are picked newest-first…
+    #[test]
+    fn keeps_the_most_recent_and_drops_older_ones() {
+        let got = newest_photos(
+            vec![
+                c("2026-08-10T09:00:00Z", "old.png"),
+                c("2026-08-10T09:05:00Z", "mid.png"),
+                c("2026-08-10T09:09:00Z", "new.png"),
+            ],
+            2,
+        );
+        assert_eq!(got, vec!["mid.png", "new.png"]);
+    }
+
+    /// …and handed over oldest-first, so a before/after pair reads in order.
+    #[test]
+    fn returns_them_in_the_order_they_were_sent() {
+        let got = newest_photos(
+            vec![
+                c("2026-08-10T09:09:00Z", "after.png"),
+                c("2026-08-10T09:00:00Z", "before.png"),
+            ],
+            4,
+        );
+        assert_eq!(got, vec!["before.png", "after.png"]);
+    }
+
+    /// Same picture quoted twice must not be downloaded twice.
+    #[test]
+    fn deduplicates_repeated_urls() {
+        let got = newest_photos(
+            vec![c("2026-08-10T09:00:00Z", "a.png"), c("2026-08-10T09:01:00Z", "a.png")],
+            4,
+        );
+        assert_eq!(got, vec!["a.png"]);
+    }
+
+    #[test]
+    fn no_candidates_means_no_photos() {
+        assert!(newest_photos(vec![], 4).is_empty());
     }
 }
