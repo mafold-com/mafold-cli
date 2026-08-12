@@ -131,8 +131,25 @@ pub async fn run(cmd: AppsCmd, base: String, token: Option<String>) -> Result<()
         AppsCmd::Init { id, dir, rn } => cmd_init(&id, &dir, rn),
         AppsCmd::Dev { dir, port } => cmd_dev(&dir, port).await,
         AppsCmd::Publish { dir } => cmd_publish(&dir, base, token).await,
-        AppsCmd::Register { id, url, name, icon, capabilities, room_schema } => {
-            cmd_register(&id, &url, name, icon, capabilities, room_schema, base, token).await
+        AppsCmd::Register {
+            id,
+            url,
+            name,
+            icon,
+            capabilities,
+            room_schema,
+        } => {
+            cmd_register(
+                &id,
+                &url,
+                name,
+                icon,
+                capabilities,
+                room_schema,
+                base,
+                token,
+            )
+            .await
         }
         AppsCmd::List => cmd_list(base, token).await,
         AppsCmd::Remove { id } => cmd_remove(&id, base, token).await,
@@ -145,8 +162,13 @@ pub async fn run(cmd: AppsCmd, base: String, token: Option<String>) -> Result<()
 async fn cmd_rotate_secret(id: &str, base: String, token: Option<String>) -> Result<()> {
     let token = token.context("needs your token — pass --token or set $MAFOLD_BOT_TOKEN")?;
     let client = Client::new(base, token);
-    let r = client.call("rotateAppSecret", serde_json::json!({ "id": id })).await?;
-    println!("✓ rotated. NEW signing secret (shown once):\n  {}", r["secret"].as_str().unwrap_or("?"));
+    let r = client
+        .call("rotateAppSecret", serde_json::json!({ "id": id }))
+        .await?;
+    println!(
+        "✓ rotated. NEW signing secret (shown once):\n  {}",
+        r["secret"].as_str().unwrap_or("?")
+    );
     println!("\nold secret no longer verifies — update your backend now.");
     Ok(())
 }
@@ -174,7 +196,9 @@ async fn cmd_sites(base: String, token: Option<String>) -> Result<()> {
 async fn cmd_remove_site(site: &str, base: String, token: Option<String>) -> Result<()> {
     let token = token.context("needs your token — pass --token or set $MAFOLD_BOT_TOKEN")?;
     let client = Client::new(base, token);
-    client.call("removeSite", serde_json::json!({ "site": site })).await?;
+    client
+        .call("removeSite", serde_json::json!({ "site": site }))
+        .await?;
     println!("✓ removed {site}");
     Ok(())
 }
@@ -182,8 +206,9 @@ async fn cmd_remove_site(site: &str, base: String, token: Option<String>) -> Res
 // ───────────────────────────── init ─────────────────────────────
 
 fn cmd_init(id: &str, dir: &str, rn: bool) -> Result<()> {
-    let (owner, slug) = parse_app_id(id)
-        .context("id must be `owner/slug` (e.g. `mafold/wallet`); reverse-DNS is no longer valid")?;
+    let (owner, slug) = parse_app_id(id).context(
+        "id must be `owner/slug` (e.g. `mafold/wallet`); reverse-DNS is no longer valid",
+    )?;
     let root = Path::new(dir).join(&slug);
     if root.exists() {
         anyhow::bail!("{} already exists", root.display());
@@ -198,11 +223,16 @@ fn cmd_init(id: &str, dir: &str, rn: bool) -> Result<()> {
         write(&root.join("package.json"), &package_json(&slug))?;
         write(&root.join("README.md"), &readme(id, &slug))?;
         write(&root.join(".gitignore"), "dist/\nnode_modules/\n")?;
-        println!("✓ created REMOTE-UI (beta) app `{owner}/{slug}` in {}", root.display());
+        println!(
+            "✓ created REMOTE-UI (beta) app `{owner}/{slug}` in {}",
+            root.display()
+        );
         println!("\nnext:");
         println!("  cd {}", root.display());
         println!("  mafold apps dev               # live preview at http://127.0.0.1:8788");
-        println!("  mafold apps publish           # ship it (needs your token; you must own `{owner}`)");
+        println!(
+            "  mafold apps publish           # ship it (needs your token; you must own `{owner}`)"
+        );
         return Ok(());
     }
 
@@ -212,12 +242,20 @@ fn cmd_init(id: &str, dir: &str, rn: bool) -> Result<()> {
     let title = title_case(&slug);
     write(&root.join("index.html"), &webview_sample(&title))?;
     write(&root.join("README.md"), &webview_readme(id, &slug))?;
-    println!("✓ created webview app `{owner}/{slug}` in {}", root.display());
+    println!(
+        "✓ created webview app `{owner}/{slug}` in {}",
+        root.display()
+    );
     println!("\nnext:");
-    println!("  1. open {}/index.html in a browser (SDK mocks off-Mafold gracefully)", root.display());
+    println!(
+        "  1. open {}/index.html in a browser (SDK mocks off-Mafold gracefully)",
+        root.display()
+    );
     println!("  2. host it anywhere with https — or let Mafold host it:");
     println!("       POST /api/deploySite  (see https://mafold.com/docs/apps/publishing)");
-    println!("  3. mafold apps register {owner}/{slug} --url https://… --capabilities room,chat.send");
+    println!(
+        "  3. mafold apps register {owner}/{slug} --url https://… --capabilities room,chat.send"
+    );
     println!("  4. install it into a conversation — the launcher icon appears");
     println!("\n(the old React-Native remote-ui scaffold is still available as BETA: --rn)");
     Ok(())
@@ -288,8 +326,8 @@ again only to change name/icon/capabilities (the secret is kept).
 
 async fn cmd_dev(dir: &str, port: u16) -> Result<()> {
     let manifest = read_manifest(dir)?;
-    let (_owner, slug) = parse_app_id(&manifest.id)
-        .context("mafold.app.json id must be `owner/slug`")?;
+    let (_owner, slug) =
+        parse_app_id(&manifest.id).context("mafold.app.json id must be `owner/slug`")?;
     let entry = Path::new(dir).join(&manifest.entry);
     if !entry.exists() {
         anyhow::bail!("entry not found: {}", entry.display());
@@ -297,7 +335,10 @@ async fn cmd_dev(dir: &str, port: u16) -> Result<()> {
     let esbuild = ensure_esbuild().await?;
     let out = format!("dist/{slug}.js");
 
-    println!("→ serving {} on http://127.0.0.1:{port}/{slug}.js", manifest.id);
+    println!(
+        "→ serving {} on http://127.0.0.1:{port}/{slug}.js",
+        manifest.id
+    );
     println!("  watching {} (Ctrl-C to stop)\n", manifest.entry);
 
     let mut c = tokio::process::Command::new(&esbuild);
@@ -317,9 +358,8 @@ async fn cmd_dev(dir: &str, port: u16) -> Result<()> {
 // ───────────────────────────── publish ─────────────────────────────
 
 async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<()> {
-    let token = token.context(
-        "publish needs your bot token — pass --token or set $MAFOLD_BOT_TOKEN",
-    )?;
+    let token =
+        token.context("publish needs your bot token — pass --token or set $MAFOLD_BOT_TOKEN")?;
     let mut manifest = read_manifest(dir)?;
     let (_owner, slug) = parse_app_id(&manifest.id)
         .context("mafold.app.json id must be `owner/slug` (reverse-DNS is no longer valid)")?;
@@ -339,12 +379,19 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
     // left untouched. See apps/AppIcon.tsx (web renders either kind).
     if let Some(icon) = manifest.icon.clone() {
         if let Some(path) = local_logo_path(dir, &icon) {
-            let bytes = std::fs::read(&path)
-                .with_context(|| format!("reading icon {}", path.display()))?;
+            let bytes =
+                std::fs::read(&path).with_context(|| format!("reading icon {}", path.display()))?;
             let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("logo");
-            println!("→ uploading logo {} ({:.1} KB) …", icon, bytes.len() as f64 / 1024.0);
+            println!(
+                "→ uploading logo {} ({:.1} KB) …",
+                icon,
+                bytes.len() as f64 / 1024.0
+            );
             let r = client.upload_media(bytes, fname, mime_for(fname)).await?;
-            let url = r["url"].as_str().context("uploadFile returned no url")?.to_string();
+            let url = r["url"]
+                .as_str()
+                .context("uploadFile returned no url")?
+                .to_string();
             println!("  logo:  {url}");
             manifest.icon = Some(url);
         }
@@ -368,7 +415,11 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
         anyhow::bail!("esbuild exited with {status}");
     }
     let bundle = std::fs::read(&out).with_context(|| format!("reading {}", out.display()))?;
-    println!("  bundle: {} ({:.1} KB)", out.display(), bundle.len() as f64 / 1024.0);
+    println!(
+        "  bundle: {} ({:.1} KB)",
+        out.display(),
+        bundle.len() as f64 / 1024.0
+    );
 
     // The server stores the manifest verbatim, so send the FULL manifest JSON
     // (not a hand-picked subset) — reconstruct it from the parsed fields + the
@@ -404,7 +455,9 @@ async fn cmd_register(
                 .with_context(|| format!("--room-schema must be a JSON object (got `{s}`)"))?;
             match v {
                 Value::Object(m) => Some(m),
-                _ => anyhow::bail!("--room-schema must be a JSON object, e.g. '{{\"issue:*\":\"write\"}}'"),
+                _ => anyhow::bail!(
+                    "--room-schema must be a JSON object, e.g. '{{\"issue:*\":\"write\"}}'"
+                ),
             }
         }
         None => None,
@@ -419,7 +472,11 @@ async fn cmd_register(
             }),
         )
         .await?;
-    println!("✓ registered {} → {}", r["id"].as_str().unwrap_or(id), r["url"].as_str().unwrap_or(url));
+    println!(
+        "✓ registered {} → {}",
+        r["id"].as_str().unwrap_or(id),
+        r["url"].as_str().unwrap_or(url)
+    );
     match r["secret"].as_str() {
         Some(s) => {
             println!("\nsigning secret (shown ONCE — store it in your app's backend):\n  {s}");
@@ -501,8 +558,14 @@ fn local_logo_path(dir: &str, icon: &str) -> Option<std::path::PathBuf> {
     if icon.starts_with("http://") || icon.starts_with("https://") || icon.starts_with("data:") {
         return None;
     }
-    let ext = Path::new(icon).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
-    let is_image = matches!(ext.as_deref(), Some("png" | "jpg" | "jpeg" | "svg" | "webp" | "gif" | "avif"));
+    let ext = Path::new(icon)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    let is_image = matches!(
+        ext.as_deref(),
+        Some("png" | "jpg" | "jpeg" | "svg" | "webp" | "gif" | "avif")
+    );
     if !is_image {
         return None;
     }
@@ -513,7 +576,12 @@ fn local_logo_path(dir: &str, icon: &str) -> Option<std::path::PathBuf> {
 /// Best-effort content-type from a filename extension (the server also re-derives
 /// + gates the stored extension).
 fn mime_for(name: &str) -> &'static str {
-    match Path::new(name).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+    match Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("png") => "image/png",
         Some("jpg") | Some("jpeg") => "image/jpeg",
         Some("svg") => "image/svg+xml",
@@ -556,7 +624,8 @@ fn valid_owner(owner: &str) -> bool {
     segs.iter().all(|s| {
         !s.is_empty()
             && s.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-            && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
     })
 }
 
@@ -565,7 +634,9 @@ fn valid_slug(slug: &str) -> bool {
     !slug.is_empty()
         && slug.len() <= 64
         && slug.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-        && slug.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 fn manifest_json(id: &str, title: &str) -> String {

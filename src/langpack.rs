@@ -106,9 +106,14 @@ async fn cmd_publish(
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-            if stem.starts_with('_') {
-                continue; // skip _meta.json and friends
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            // `_meta.json` and friends, plus DOTFILES: `.seed-lock.json` has a
+            // `.json` extension and a `.seed-lock` stem, so without this it
+            // would be published as a language named ".seed-lock".
+            if stem.starts_with('_') || stem.starts_with('.') {
+                continue;
             }
             let s = std::fs::read_to_string(&path)?;
             packs.push((stem.to_string(), parse_pack(&s, stem)?));
@@ -140,13 +145,20 @@ async fn cmd_publish(
             r["url"].as_str().unwrap_or("?")
         );
     }
-    println!("\nclients pick it up via getLangPackDiff on next launch — no app release needed.");
+    // "next launch" was true until the web client grew card-style background
+    // revalidation; saying it still would understate the pipeline and send
+    // people reloading to check their own publish.
+    println!(
+        "\nopen clients re-sync within ~60s (or on tab focus); others on next launch — \
+         no app release needed."
+    );
     Ok(())
 }
 
 /// Parse + validate a pack file: it must be a JSON object of `key -> value`.
 fn parse_pack(s: &str, lang: &str) -> Result<Value> {
-    let v: Value = serde_json::from_str(s).with_context(|| format!("{lang}.json is not valid JSON"))?;
+    let v: Value =
+        serde_json::from_str(s).with_context(|| format!("{lang}.json is not valid JSON"))?;
     if !v.is_object() {
         anyhow::bail!("{lang}.json must be a JSON object of key -> value");
     }
@@ -168,7 +180,11 @@ async fn cmd_list(base: String, token: Option<String>) -> Result<()> {
             l["code"].as_str().unwrap_or("?"),
             l["version"].as_u64().unwrap_or(0),
             l["name"].as_str().unwrap_or(""),
-            if l["rtl"].as_bool() == Some(true) { "  (rtl)" } else { "" },
+            if l["rtl"].as_bool() == Some(true) {
+                "  (rtl)"
+            } else {
+                ""
+            },
         );
     }
     Ok(())

@@ -16,7 +16,10 @@ mod ws;
 mod wire;
 mod i18n;
 pub mod flags;
+pub mod connections;
+pub mod mcp;
 pub mod methods;
+pub mod vault;
 #[cfg(not(target_arch = "wasm32"))]
 mod room;
 /// Shared test helper (zero-dependency mock HTTP server) — compiled only under
@@ -59,6 +62,48 @@ impl From<rusqlite::Error> for CoreError {
 // Mirrors the wire shapes; serde for KV (de)serialization, uniffi::Record on
 // native for the FFI boundary.
 
+/// An asset, mirroring `mafold_types::FileRef`. Bytes come from
+/// `<file_base>/<id>` — there is no url on the wire and none in the core; see
+/// `.docs/file-id-v1.md`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct CoreFileRef {
+    pub id: String,
+    #[serde(default)]
+    pub unique_id: String,
+    #[serde(default)]
+    pub mime: String,
+    #[serde(default)]
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub w: Option<u32>,
+    #[serde(default)]
+    pub h: Option<u32>,
+    #[serde(default)]
+    pub duration_ms: Option<u32>,
+    #[serde(default)]
+    pub filename: Option<String>,
+    /// Bytes are on the api host, not the CDN — append `id` to the api origin.
+    #[serde(default)]
+    pub local: bool,
+}
+
+impl From<&mafold_types::FileRef> for CoreFileRef {
+    fn from(f: &mafold_types::FileRef) -> Self {
+        Self {
+            id: f.id.clone(),
+            unique_id: f.unique_id.clone(),
+            mime: f.mime.clone(),
+            size_bytes: f.size_bytes,
+            w: f.w,
+            h: f.h,
+            duration_ms: f.duration_ms,
+            filename: f.filename.clone(),
+            local: f.local,
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct CoreAccount {
@@ -66,7 +111,8 @@ pub struct CoreAccount {
     pub display_name: String,
     /// "human" | "bot".
     pub kind: String,
-    pub avatar_url: Option<String>,
+    #[serde(default, alias = "avatar_url")]
+    pub avatar: Option<CoreFileRef>,
     /// Owner's username for a bot fork (`ops:claude` → `ops`).
     pub parent_username: Option<String>,
     /// Provider/template id for a bot (`claude` / `deepseek` / `claude-code`).
@@ -140,6 +186,20 @@ pub struct CoreConversation {
     #[serde(default)]
     #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = false))]
     pub forum_member_channels: bool,
+    /// The other three member permissions (`Conversation.member_perms` on the
+    /// wire; `forum_member_channels` above is the fourth, under its legacy
+    /// name). Flat here because every other flag in this cache shape is —
+    /// carried through for the same reason the forum flags are: a permission
+    /// the cache drops is a button that flickers wrong after every reload.
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = false))]
+    pub member_add_members: bool,
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = false))]
+    pub member_edit_info: bool,
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = false))]
+    pub member_add_bots: bool,
 }
 
 /// A forum channel, cached so a conversation opens with its channel list
@@ -493,6 +553,20 @@ mod web {
     #[wasm_bindgen(js_name = coreVersion)]
     pub fn core_version() -> String { crate::core_version() }
 
+    /// The connection-provider registry, display-ready JSON.
+    ///
+    /// Serving it from the core is what keeps there being ONE registry: the cli
+    /// reads `mafold_types::PROVIDERS` natively and the web reads the same const
+    /// through here, so adding a provider is one row in `connections.rs` and no
+    /// client edit at all. A hand-kept `{id → name, icon}` map in the web would
+    /// be a second registry that silently drifts — and the client that drifts is
+    /// the one the user is looking at.
+    #[wasm_bindgen(js_name = connectionProviders)]
+    pub fn connection_providers() -> String {
+        serde_json::to_string(&mafold_types::connections::provider_infos())
+            .unwrap_or_else(|_| "[]".into())
+    }
+
     /// Sync engine, stage 1: the core makes the API call itself (POST
     /// {base}/{method}, Bearer token, {ok,result} envelope) → returns the result
     /// JSON. Validates the method name against the api route table (`methods`)
@@ -519,6 +593,113 @@ mod web {
         let closed = std::rc::Rc::new(std::cell::Cell::new(false));
         crate::ws::connect(&url, on_event, closed.clone());
         WsHandle { closed }
+    }
+
+    // ── connections vault ──
+    // The browser is a REAL vault device here, not a viewer: it owns an X25519
+    // keypair and can seal new credentials. What it must never do is let the
+    // master key become a JS value — the agreed model is "device key on disk,
+    // UMK in memory only", and a base64 UMK handed to JS would sit in strings
+    // no one can zeroize, reachable from any script on the page. So the key
+    // stays in wasm linear memory behind this handle and JS only ever passes
+    // payloads through it.
+
+    /// Mint a device keypair. The secret is returned ONCE, for the caller to
+    /// persist (browser: IndexedDB); it is never sent anywhere.
+    #[wasm_bindgen(js_name = vaultGenerateDevice)]
+    pub fn vault_generate_device() -> String {
+        let d = crate::vault::generate_device();
+        serde_json::json!({
+            "secret": d.secret,
+            "public": d.public,
+            "fingerprint": crate::vault::fingerprint(&d.public),
+        })
+        .to_string()
+    }
+
+    /// The public half + fingerprint for an already-stored secret.
+    #[wasm_bindgen(js_name = vaultDeviceIdentity)]
+    pub fn vault_device_identity(secret: String) -> Result<String, JsValue> {
+        let public = crate::vault::public_from_secret(&secret)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(serde_json::json!({
+            "public": public,
+            "fingerprint": crate::vault::fingerprint(&public),
+        })
+        .to_string())
+    }
+
+    #[wasm_bindgen(js_name = vaultFingerprint)]
+    pub fn vault_fingerprint(public_key: String) -> String {
+        crate::vault::fingerprint(&public_key)
+    }
+
+    /// An unlocked vault. Dropping it (`free()`) drops the master key.
+    #[wasm_bindgen]
+    pub struct Vault {
+        umk: crate::vault::Key,
+        key_id: String,
+    }
+
+    /// Open the wrap an approving device left for this one. Fails when the wrap
+    /// was addressed to a different key — which is exactly what a substituted
+    /// public key would produce, so this failing is the design working.
+    #[wasm_bindgen(js_name = vaultUnlock)]
+    pub fn vault_unlock(device_secret: String, wrapped_umk: String, key_id: String) -> Result<Vault, JsValue> {
+        let umk = crate::vault::unwrap_umk(&device_secret, &wrapped_umk)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(Vault { umk, key_id })
+    }
+
+    /// Mint a brand-new vault — only valid when the account has no enrolled
+    /// device yet (the server reports `first`). The caller must immediately
+    /// wrap it for itself, or the credentials it stores become unopenable.
+    #[wasm_bindgen(js_name = vaultCreate)]
+    pub fn vault_create() -> Vault {
+        Vault { umk: crate::vault::Key::random(), key_id: crate::vault::new_key_id() }
+    }
+
+    #[wasm_bindgen]
+    impl Vault {
+        #[wasm_bindgen(getter, js_name = keyId)]
+        pub fn key_id(&self) -> String {
+            self.key_id.clone()
+        }
+
+        /// Wrap this master key for a device's public key — the approval step.
+        #[wasm_bindgen(js_name = wrapFor)]
+        pub fn wrap_for(&self, recipient_public: String) -> Result<String, JsValue> {
+            crate::vault::wrap_umk_for(&recipient_public, &self.umk)
+                .map_err(|e| JsValue::from_str(&e.to_string()))
+        }
+
+        /// Seal a connection payload → `{blob, wrapped_dek}`.
+        #[wasm_bindgen(js_name = sealPayload)]
+        pub fn seal_payload(&self, payload_json: String) -> String {
+            let s = crate::vault::seal_payload(&self.umk, &payload_json);
+            serde_json::json!({ "blob": s.blob, "wrapped_dek": s.wrapped_dek }).to_string()
+        }
+
+        /// Open one → the payload JSON.
+        #[wasm_bindgen(js_name = openPayload)]
+        pub fn open_payload(&self, blob: String, wrapped_dek: String) -> Result<String, JsValue> {
+            crate::vault::open_payload(&self.umk, &blob, &wrapped_dek)
+                .map_err(|e| JsValue::from_str(&e.to_string()))
+        }
+
+        /// Hand one socket event to the core. Resolves `true` when the core
+        /// took it, so the host can fall through to its own dispatch otherwise.
+        ///
+        /// This is the browser's half of "a connection is answered by the core,
+        /// like a message is received". The host does not decide anything: it
+        /// forwards the frame, and the same Rust that answers on a laptop
+        /// answers here. Nothing about which events matter, how a call is
+        /// claimed, or how a result is shaped is expressible in the host.
+        #[wasm_bindgen(js_name = handleEvent)]
+        pub async fn handle_event(&self, base: String, token: String, envelope: String) -> bool {
+            let mut rt = crate::connections::Runtime::new(&base, &token, self.umk.clone());
+            crate::connections::handle_event(&mut rt, &envelope).await
+        }
     }
 
     /// Returned by `connectWs`; `close()` stops the reconnect loop.
@@ -808,7 +989,7 @@ mod tests {
     fn acct(u: &str) -> CoreAccount {
         CoreAccount {
             username: u.into(), display_name: u.to_uppercase(), kind: "human".into(),
-            avatar_url: None, parent_username: None, template: None, language: None,
+            avatar: None, parent_username: None, template: None, language: None,
             verified: false,
         }
     }
@@ -820,6 +1001,7 @@ mod tests {
             id: "c1".into(), kind: "direct".into(), title: None,
             participants: vec![acct("alice"), acct("bob")],
             updated_at_ms: 100, unread_count: 2, last_message: None, is_forum: false, forum_member_channels: false,
+            member_add_members: false, member_edit_info: false, member_add_bots: false,
         }).unwrap();
         core.upsert_message(CoreMessage {
             id: "m1".into(), conversation_id: "c1".into(), sender: acct("alice"),
@@ -851,6 +1033,7 @@ mod tests {
         let c = |id: &str, ts: i64| CoreConversation {
             id: id.into(), kind: "direct".into(), title: None,
             participants: vec![acct("me"), acct(id)], updated_at_ms: ts, unread_count: 0, last_message: None, is_forum: false, forum_member_channels: false,
+            member_add_members: false, member_edit_info: false, member_add_bots: false,
         };
         core.replace_conversations(vec![c("a", 1), c("b", 2)]).unwrap();
         assert_eq!(core.conversations().unwrap().len(), 2);
@@ -1107,6 +1290,7 @@ mod tests {
         core.upsert_conversation(CoreConversation {
             id: "c".into(), kind: "group".into(), title: None,
             participants: vec![acct("me"), acct("bot")], updated_at_ms: 0, unread_count: 0, last_message: None, is_forum: false, forum_member_channels: false,
+            member_add_members: false, member_edit_info: false, member_add_bots: false,
         }).unwrap();
 
         // A top-level root that is STILL generating, a plain channel message, and

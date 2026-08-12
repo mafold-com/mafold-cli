@@ -12,6 +12,99 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod connections;
+pub use connections::{
+    provider, ConnectionMeta, ProviderKind, ProviderSpec, SecretField, VaultDevice, VaultRecovery,
+    PROVIDERS,
+};
+
+// MARK: - Files
+
+/// **The** way an asset appears on this wire — avatars, banners, group photos,
+/// message media, thumbnails. There is no url field anywhere, by design
+/// (owner's call, 2026-08-12): a url is a location, and locations belong in
+/// configuration, not in data. Storing one is how `api.mafold.com` stayed
+/// frozen in account rows for months after the bytes moved to a CDN.
+///
+/// Two ids, splitting Telegram's responsibilities:
+///
+/// * `id` — the **handle**. Fetch bytes from `<file_base>/<id>`, where
+///   `file_base` arrives once per connection in `events.hello`. It is also the
+///   object key, which is what makes that template work with no per-file round
+///   trip and no re-keying of pre-existing objects.
+/// * `unique_id` — the **content identity** (sha256). Answers "same file?"
+///   without fetching; never resolves to anything. Empty on rows inherited from
+///   before the registry, where the bytes were never in our hands: empty means
+///   *unknown*, and must never compare equal to another unknown.
+///
+/// `w`/`h` ride along so a bubble can reserve the box before the image lands.
+/// See `.docs/file-id-v1.md`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileRef {
+    pub id: String,
+    #[serde(default)]
+    pub unique_id: String,
+    #[serde(default)]
+    pub mime: String,
+    #[serde(default)]
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub w: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    /// The bytes never reached the bucket and only the api host has them —
+    /// append `id` to the api origin instead of `file_base`. A property of the
+    /// file, not a second addressing scheme.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local: bool,
+}
+
+impl FileRef {
+    /// A bare handle, everything else unknown — what an author has when all it
+    /// did was upload something and keep the id.
+    pub fn from_id(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            unique_id: String::new(),
+            mime: String::new(),
+            size_bytes: 0,
+            w: None,
+            h: None,
+            duration_ms: None,
+            filename: None,
+            local: false,
+        }
+    }
+}
+
+/// Accept either a full [`FileRef`] or a bare id string.
+///
+/// Author-facing fields (a bot's inline-result thumbnail) are hand-written
+/// JSON, and `"thumb": "<file id>"` is the honest shape for someone who only
+/// holds the handle. The API fills in the rest from the registry on the way
+/// out, so a reader always sees the complete object either way.
+pub fn opt_file_ref<'de, D>(d: D) -> Result<Option<FileRef>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Bare(String),
+        Full(FileRef),
+    }
+    Ok(match Option::<Either>::deserialize(d)? {
+        None => None,
+        Some(Either::Bare(s)) if s.trim().is_empty() => None,
+        Some(Either::Bare(s)) => Some(FileRef::from_id(s)),
+        Some(Either::Full(f)) => Some(f),
+    })
+}
+
 // MARK: - Account
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -26,13 +119,13 @@ pub struct Account {
     pub username: String,
     pub display_name: String,
     pub kind: AccountKind,
-    /// Plain image URL, stored and served verbatim — the account owner sets it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub avatar_url: Option<String>,
-    /// Publication banner (the /@handle cover), ~3:1. Same contract as the
-    /// avatar: display-ready URL, stored + served verbatim, owner-set.
+    /// The account's picture — a [`FileRef`], like every other asset on this
+    /// wire. Was `avatar_url`; see [`FileRef`] for why there is no url.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub banner_url: Option<String>,
+    pub avatar: Option<FileRef>,
+    /// Publication banner (the /@handle cover), ~3:1. Same contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner: Option<FileRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bio: Option<String>,
     /// For bot accounts (e.g. `ops:claude`), the username of the human
@@ -102,9 +195,9 @@ pub struct InlineResult {
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Display-ready image URL — the API decides it, clients render it verbatim.
+    /// Result thumbnail — a [`FileRef`], like every asset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub thumb: Option<String>,
+    pub thumb: Option<FileRef>,
     pub content: String,
     /// Seconds a client MAY reuse this answer for an unchanged query. `None` =
     /// don't cache. Set by whoever answers, because only it knows whether the
@@ -168,8 +261,8 @@ impl<'de> Deserialize<'de> for InlineResult {
             title: Option<String>,
             #[serde(default)]
             description: Option<String>,
-            #[serde(default)]
-            thumb: Option<String>,
+            #[serde(default, deserialize_with = "opt_file_ref")]
+            thumb: Option<FileRef>,
             #[serde(default)]
             content: Option<String>,
             #[serde(default)]
@@ -225,7 +318,7 @@ pub struct Conversation {
     pub unread_count: u32,
     /// Group avatar (None for direct chats — clients use the peer's avatar).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub avatar_url: Option<String>,
+    pub avatar: Option<FileRef>,
     /// Group description / "about" text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -273,11 +366,117 @@ pub struct Conversation {
     pub is_forum: bool,
     /// Forum: may ordinary members create channels? (Telegram's "Create
     /// Topics" member permission.) Default false = managers only.
+    ///
+    /// LEGACY WIRE NAME for `member_perms.create_channels` — shipped clients
+    /// (core's `CoreConversation`, iOS) read this spelling. It is a mirror, not
+    /// a second source of truth: `Store::set_member_perms` writes both and
+    /// nothing else writes either.
     #[serde(default, skip_serializing_if = "is_false")]
     pub forum_member_channels: bool,
+    /// What ORDINARY members may do here. Absent = every bit false = managers
+    /// only, which is exactly how groups behaved before this field existed.
+    #[serde(default, skip_serializing_if = "MemberPerms::is_default")]
+    pub member_perms: MemberPerms,
 }
 
-fn is_zero_u32(n: &u32) -> bool { *n == 0 }
+/// The member-side half of group permissions: powers an ordinary member does
+/// NOT have unless the group grants them. The owner and admins always have all
+/// of these — these bits only ever widen the circle, never narrow it, so a
+/// manager can't be locked out of their own group by a permission toggle.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberPerms {
+    /// Add other people (`addChatMembers`) and mint invite links.
+    #[serde(default)]
+    pub add_members: bool,
+    /// Edit the group's title / photo / description.
+    #[serde(default)]
+    pub edit_info: bool,
+    /// Add a bot they own to the group (`addGroupBot`).
+    #[serde(default)]
+    pub add_bots: bool,
+    /// Forum only: create channels (Telegram's "Create Topics").
+    #[serde(default)]
+    pub create_channels: bool,
+}
+
+impl MemberPerms {
+    /// All-false = the locked-down default; lets the field vanish from the wire
+    /// for the overwhelming majority of conversations that never change it.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A shareable invite to a group — the ONLY way to join one without a manager
+/// adding you by name.
+///
+/// A group may hold several at once (one per place you posted it), each
+/// independently expirable, capped and revocable, so retiring the link you put
+/// in one channel never breaks the others. The code is the whole credential:
+/// opaque, never reused, and worthless once `revoked` or spent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InviteLink {
+    /// URL-safe opaque code — the tail of `https://mafold.com/join/<code>`.
+    pub code: String,
+    pub conversation_id: Uuid,
+    /// Who minted it (lowercased username).
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    /// Manager-visible label, so two links are tellable apart ("Twitter", "Q3").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Hard expiry. None = never expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Max successful joins. None = unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_limit: Option<u32>,
+    /// Successful joins so far. Never decremented — someone leaving does not
+    /// refund a seat, or a capped link would be an unbounded one.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub used_count: u32,
+    /// Manually killed. Revoked links stay listed (they are the audit trail of
+    /// who let whom in) and never work again.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub revoked: bool,
+}
+
+impl InviteLink {
+    /// Usable right now? Mirrors the server's join gate exactly.
+    pub fn is_live(&self, now: DateTime<Utc>) -> bool {
+        !self.revoked
+            && self.expires_at.is_none_or(|t| t > now)
+            && self.usage_limit.is_none_or(|n| self.used_count < n)
+    }
+}
+
+/// What someone holding an invite code sees BEFORE they join — enough to decide,
+/// and nothing more. Deliberately not a `Conversation`: a stranger with a link
+/// has no business reading the member list or the history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvitePreview {
+    pub conversation_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<FileRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub member_count: u32,
+    /// A handful of members for the avatar stack — capped server-side.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sample_members: Vec<Account>,
+    /// The caller is already in: the client offers "Open", not "Join".
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub already_member: bool,
+    /// Who minted the link, when that account still exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inviter: Option<Account>,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
 
 /// An extra forum channel (beyond the implicit `#all` main timeline). A group
 /// becomes a forum via `is_forum`; each `Channel` is a named sub-timeline whose
@@ -370,7 +569,11 @@ pub struct Message {
     /// message to their optimistic local copy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_msg_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "lenient_attachments")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_attachments"
+    )]
     pub attachments: Vec<Attachment>,
     /// Set of usernames who have deleted this message **for themselves**
     /// (Telegram "Delete for me"). Filtered out at history-read time so
@@ -397,7 +600,9 @@ pub struct Message {
     pub service: Option<ServiceNotice>,
 }
 
-fn is_false(b: &bool) -> bool { !b }
+fn is_false(b: &bool) -> bool {
+    !b
+}
 
 /// A service-message payload — a ready-to-render centered pill (see
 /// `Message::service`). Generic so it's reusable beyond games (member joined,
@@ -446,34 +651,23 @@ pub enum Attachment {
         url: String,
         snippet: String,
     },
+    /// `id` identifies the ATTACHMENT (its slot in this message); `file`
+    /// identifies the BYTES. They were conflated before as `id` + `media_id` +
+    /// `url` + `w` + `h` — four fields describing one file, kept in sync by
+    /// hand. Everything about the file now lives in the one [`FileRef`].
     Photo {
         id: String,
-        media_id: String,
-        url: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        w: Option<u32>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        h: Option<u32>,
+        file: FileRef,
     },
-    /// An uploaded video clip (mp4/mov). Mirrors `Photo` — `w`/`h` reserve the
-    /// player box so the bubble doesn't jump on load. Served from `/media` with
-    /// Range/seek support.
+    /// An uploaded video clip (mp4/mov). Mirrors `Photo`; `file.w`/`file.h`
+    /// reserve the player box so the bubble doesn't jump on load.
     Video {
         id: String,
-        media_id: String,
-        url: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        w: Option<u32>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        h: Option<u32>,
+        file: FileRef,
     },
     File {
         id: String,
-        media_id: String,
-        url: String,
-        filename: String,
-        size_bytes: u64,
-        mime: String,
+        file: FileRef,
     },
     /// WeChat-style "merge forward" — a frozen transcript of several messages
     /// bundled into one card. The snapshot is complete (sender + time + content
@@ -509,7 +703,11 @@ pub struct RecordEntry {
     pub sender_username: String,
     pub ts: DateTime<Utc>,
     pub content: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "lenient_attachments")]
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_attachments"
+    )]
     pub attachments: Vec<Attachment>,
 }
 
@@ -599,7 +797,9 @@ pub struct Ok_ {
 }
 
 impl Ok_ {
-    pub fn yes() -> Self { Self { ok: true } }
+    pub fn yes() -> Self {
+        Self { ok: true }
+    }
 }
 
 // MARK: - Feature flags (.docs/feature-flags.md)
@@ -784,12 +984,14 @@ mod inline_result_tests {
     fn a_full_object_keeps_content_and_presentation_apart() {
         let r = parse(
             r#"{"id":"pg1","title":"周报模板","description":"Notion · 团队",
-                "thumb":"https://x/i.png","content":"[周报模板](https://notion.so/pg1)",
+                "thumb":"b9OgRzKFL3uZ0MsfuCBkUw","content":"[周报模板](https://notion.so/pg1)",
                 "cache_ttl":30,"on_pick":"insert"}"#,
         );
         assert_eq!(r.id, "pg1");
         assert_eq!(r.title, "周报模板");
         assert_eq!(r.description.as_deref(), Some("Notion · 团队"));
+        // A bare handle is a valid thumbnail — the author only has the id.
+        assert_eq!(r.thumb.as_ref().map(|f| f.id.as_str()), Some("b9OgRzKFL3uZ0MsfuCBkUw"));
         assert_eq!(r.content, "[周报模板](https://notion.so/pg1)");
         assert_eq!(r.cache_ttl, Some(30));
         assert_eq!(r.on_pick, InlinePick::Insert);

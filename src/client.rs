@@ -37,7 +37,10 @@ pub struct Dest<'a> {
 impl<'a> Dest<'a> {
     /// A conversation's main timeline — narrow it with the builders below.
     pub fn chat(chat_id: &'a str) -> Self {
-        Self { chat_id, ..Default::default() }
+        Self {
+            chat_id,
+            ..Default::default()
+        }
     }
     /// …in this forum channel (None = `#all`).
     pub fn channel(mut self, channel_id: Option<&'a str>) -> Self {
@@ -90,7 +93,9 @@ impl Client {
     /// `RpcError` rides along in the anyhow chain (see `is_connect_error`).
     async fn post(&self, method: &str, body: Value) -> Result<Value> {
         match self.api().call_raw(method, &body.to_string()).await {
-            Ok(result) => serde_json::from_str(&result).with_context(|| format!("{method} returned non-JSON")),
+            Ok(result) => {
+                serde_json::from_str(&result).with_context(|| format!("{method} returned non-JSON"))
+            }
             Err(e) => Err(anyhow::Error::new(e).context(format!("{method} failed"))),
         }
     }
@@ -115,7 +120,9 @@ impl Client {
                 // and hides the real error. Only transport failures get another go.
                 Err(e) if attempt == RETRY_ATTEMPTS || Self::is_api_error(&e) => return Err(e),
                 Err(e) => {
-                    eprintln!("{method} failed ({e}) — retry {attempt}/{RETRY_ATTEMPTS} in {delay:?}…");
+                    eprintln!(
+                        "{method} failed ({e}) — retry {attempt}/{RETRY_ATTEMPTS} in {delay:?}…"
+                    );
                     tokio::time::sleep(delay).await;
                     delay *= 2;
                 }
@@ -132,9 +139,13 @@ impl Client {
     }
 
     /// Generic authenticated RPC for callers outside this module (login, report…).
-    pub async fn call(&self, method: &str, body: Value) -> Result<Value> { self.post(method, body).await }
+    pub async fn call(&self, method: &str, body: Value) -> Result<Value> {
+        self.post(method, body).await
+    }
 
-    pub async fn me(&self) -> Result<Value> { self.post("getMe", json!({})).await }
+    pub async fn me(&self) -> Result<Value> {
+        self.post("getMe", json!({})).await
+    }
 
     /// `getMe`, but with an AUTH REJECTION (401/403 — token revoked / bot
     /// deleted) split out from ordinary failures, so a daemon whose bot was
@@ -160,7 +171,9 @@ impl Client {
         }
         Ok(MeProbe::Me(v["result"].clone()))
     }
-    pub async fn chats(&self) -> Result<Value> { self.post("getChats", json!({})).await }
+    pub async fn chats(&self) -> Result<Value> {
+        self.post("getChats", json!({})).await
+    }
 
     /// A single conversation (`{ id, kind, participants, … }`) — used to tell a
     /// group from a DM for the group reply gate.
@@ -181,7 +194,12 @@ impl Client {
     /// gate drops non-owner messages so they never reach claude's resumed
     /// session; for a group turn the daemon re-fetches history to rebuild the
     /// multi-party context (see `recent_group_context`).
-    pub async fn get_chat_history(&self, chat_id: &str, limit: usize, channel_id: Option<&str>) -> Result<Value> {
+    pub async fn get_chat_history(
+        &self,
+        chat_id: &str,
+        limit: usize,
+        channel_id: Option<&str>,
+    ) -> Result<Value> {
         let mut body = json!({ "chat_id": chat_id, "limit": limit });
         if let Some(ch) = channel_id {
             body["channel_id"] = json!(ch);
@@ -192,7 +210,12 @@ impl Client {
     /// A thread's messages (root + replies) — used to rebuild context when the
     /// bot is @-mentioned INSIDE a thread (thread replies aren't in the channel's
     /// main timeline, so getChatHistory alone misses them).
-    pub async fn get_thread_messages(&self, chat_id: &str, root_message_id: &str, limit: usize) -> Result<Value> {
+    pub async fn get_thread_messages(
+        &self,
+        chat_id: &str,
+        root_message_id: &str,
+        limit: usize,
+    ) -> Result<Value> {
         self.post(
             "getThreadMessages",
             json!({ "chat_id": chat_id, "root_message_id": root_message_id, "limit": limit }),
@@ -203,16 +226,23 @@ impl Client {
     /// Per-group bot dispatch settings (`{ items: [{ bot, always_on }] }`) —
     /// tells the daemon whether it's set to always-on in this group.
     pub async fn group_bots(&self, chat_id: &str) -> Result<Value> {
-        self.post("getGroupBots", json!({ "chat_id": chat_id })).await
+        self.post("getGroupBots", json!({ "chat_id": chat_id }))
+            .await
     }
 
     // ── forum channels (Telegram-Topics-style; see channels.rs) ──
     /// The forum's channels (`[Channel]`), decorated for the caller. `#all` is
     /// implicit (channel_id NULL) and never in this list.
     pub async fn list_channels(&self, chat_id: &str) -> Result<Value> {
-        self.post("listChannels", json!({ "chat_id": chat_id })).await
+        self.post("listChannels", json!({ "chat_id": chat_id }))
+            .await
     }
-    pub async fn create_channel(&self, chat_id: &str, name: &str, icon: Option<&str>) -> Result<Value> {
+    pub async fn create_channel(
+        &self,
+        chat_id: &str,
+        name: &str,
+        icon: Option<&str>,
+    ) -> Result<Value> {
         let mut body = json!({ "chat_id": chat_id, "name": name });
         if let Some(i) = icon {
             body["icon"] = json!(i);
@@ -220,7 +250,13 @@ impl Client {
         self.post("createChannel", body).await
     }
     /// Partial edit: absent = unchanged; `icon: Some("")` clears the icon.
-    pub async fn edit_channel(&self, chat_id: &str, channel_id: &str, name: Option<&str>, icon: Option<&str>) -> Result<Value> {
+    pub async fn edit_channel(
+        &self,
+        chat_id: &str,
+        channel_id: &str,
+        name: Option<&str>,
+        icon: Option<&str>,
+    ) -> Result<Value> {
         let mut body = json!({ "chat_id": chat_id, "channel_id": channel_id });
         if let Some(n) = name {
             body["name"] = json!(n);
@@ -232,33 +268,71 @@ impl Client {
     }
     /// Removes the channel AND its contents (messages, threads, read state).
     pub async fn delete_channel(&self, chat_id: &str, channel_id: &str) -> Result<Value> {
-        self.post("deleteChannel", json!({ "chat_id": chat_id, "channel_id": channel_id })).await
+        self.post(
+            "deleteChannel",
+            json!({ "chat_id": chat_id, "channel_id": channel_id }),
+        )
+        .await
     }
-    pub async fn set_channel_closed(&self, chat_id: &str, channel_id: &str, closed: bool) -> Result<Value> {
-        self.post("setChannelClosed", json!({ "chat_id": chat_id, "channel_id": channel_id, "closed": closed })).await
+    pub async fn set_channel_closed(
+        &self,
+        chat_id: &str,
+        channel_id: &str,
+        closed: bool,
+    ) -> Result<Value> {
+        self.post(
+            "setChannelClosed",
+            json!({ "chat_id": chat_id, "channel_id": channel_id, "closed": closed }),
+        )
+        .await
     }
-    pub async fn set_channel_pinned(&self, chat_id: &str, channel_id: &str, pinned: bool) -> Result<Value> {
-        self.post("setChannelPinned", json!({ "chat_id": chat_id, "channel_id": channel_id, "pinned": pinned })).await
+    pub async fn set_channel_pinned(
+        &self,
+        chat_id: &str,
+        channel_id: &str,
+        pinned: bool,
+    ) -> Result<Value> {
+        self.post(
+            "setChannelPinned",
+            json!({ "chat_id": chat_id, "channel_id": channel_id, "pinned": pinned }),
+        )
+        .await
     }
-    pub async fn set_channel_archived(&self, chat_id: &str, channel_id: &str, archived: bool) -> Result<Value> {
-        self.post("setChannelArchived", json!({ "chat_id": chat_id, "channel_id": channel_id, "archived": archived })).await
+    pub async fn set_channel_archived(
+        &self,
+        chat_id: &str,
+        channel_id: &str,
+        archived: bool,
+    ) -> Result<Value> {
+        self.post(
+            "setChannelArchived",
+            json!({ "chat_id": chat_id, "channel_id": channel_id, "archived": archived }),
+        )
+        .await
     }
 
     // ── shared-room CRDT relay (the AI's room peer; see room.rs) ──
     pub async fn room_changes(&self, conv: &str, app: &str) -> Result<Value> {
-        self.post("roomChanges", json!({ "conv": conv, "app": app })).await
+        self.post("roomChanges", json!({ "conv": conv, "app": app }))
+            .await
     }
     pub async fn room_change(&self, conv: &str, app: &str, changes: Vec<String>) -> Result<Value> {
-        self.post("roomChange", json!({ "conv": conv, "app": app, "changes": changes })).await
+        self.post(
+            "roomChange",
+            json!({ "conv": conv, "app": app, "changes": changes }),
+        )
+        .await
     }
     pub async fn list_installs(&self, conv: &str) -> Result<Value> {
-        self.post("listInstalls", json!({ "conversation_id": conv })).await
+        self.post("listInstalls", json!({ "conversation_id": conv }))
+            .await
     }
 
     /// This bot's own per-conversation config bag (`{ config: {key: value} }`)
     /// — the Customize sheet's chat scope. Callable with the bot's own token.
     pub async fn bot_conv_config(&self, chat_id: &str) -> Result<Value> {
-        self.post("getBotConvConfig", json!({ "chat_id": chat_id })).await
+        self.post("getBotConvConfig", json!({ "chat_id": chat_id }))
+            .await
     }
 
     /// The bot's OWNER-set config, callable by the bot itself. Returns `BotDetail`
@@ -299,7 +373,8 @@ impl Client {
 
     /// Publish this bot's slash commands (the chat command panel).
     pub async fn set_commands(&self, commands: Value) -> Result<()> {
-        self.post("setBotCommands", json!({ "commands": commands })).await?;
+        self.post("setBotCommands", json!({ "commands": commands }))
+            .await?;
         Ok(())
     }
 
@@ -318,9 +393,18 @@ impl Client {
             // A relative server path (e.g. `/media/…`) → resolve against base.
             format!("{}{}", self.base, path)
         } else {
-            anyhow::bail!("refusing to fetch attachment from a non-relative, non-Mafold URL: {path}");
+            anyhow::bail!(
+                "refusing to fetch attachment from a non-relative, non-Mafold URL: {path}"
+            );
         };
-        let bytes = self.http.get(&url).send().await?.error_for_status()?.bytes().await?;
+        let bytes = self
+            .http
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
         Ok(bytes.to_vec())
     }
 
@@ -332,7 +416,10 @@ impl Client {
             return Ok(a.to_string());
         }
         let conv = self.post("startChat", json!({ "user_ids": [a] })).await?;
-        Ok(conv["id"].as_str().context("startChat: no conversation id")?.to_string())
+        Ok(conv["id"]
+            .as_str()
+            .context("startChat: no conversation id")?
+            .to_string())
     }
 
     /// Did this request die in the CONNECT phase — i.e. it never left this
@@ -356,7 +443,12 @@ impl Client {
     /// replies"). Connect-phase failures are retried a couple of times (observed
     /// real-world cause: a local proxy killing fresh TLS connections right after
     /// the WS reconnects).
-    pub async fn create_draft(&self, chat_id: &str, thread_root_id: Option<&str>, channel_id: Option<&str>) -> Result<String> {
+    pub async fn create_draft(
+        &self,
+        chat_id: &str,
+        thread_root_id: Option<&str>,
+        channel_id: Option<&str>,
+    ) -> Result<String> {
         // TYPED through the core: ids parse to real Uuids up front (a malformed
         // id fails here, not as a server 400), and the result is a wire::Message.
         let chat = uuid::Uuid::parse_str(chat_id).context("botCreateDraft: bad chat_id")?;
@@ -387,7 +479,11 @@ impl Client {
         Ok(draft.id.to_string())
     }
     pub async fn append_delta(&self, message_id: &str, delta: &str) -> Result<()> {
-        self.post("botAppendDelta", json!({ "message_id": message_id, "delta": delta })).await?;
+        self.post(
+            "botAppendDelta",
+            json!({ "message_id": message_id, "delta": delta }),
+        )
+        .await?;
         Ok(())
     }
 
@@ -400,7 +496,11 @@ impl Client {
     /// it to a two-second uplink blip left the bubble animating forever with a
     /// Stop button that could never resolve — the failure this retry exists for.
     pub async fn edit_draft(&self, message_id: &str, content: &str) -> Result<()> {
-        self.post_idempotent("botEditDraft", json!({ "message_id": message_id, "content": content })).await?;
+        self.post_idempotent(
+            "botEditDraft",
+            json!({ "message_id": message_id, "content": content }),
+        )
+        .await?;
         Ok(())
     }
     /// Attach media to one of OUR messages (draft or already delivered). The
@@ -415,28 +515,40 @@ impl Client {
         Ok(())
     }
 
-    /// Upload a local file and attach it to `message_id` as a photo, returning
-    /// the attachment JSON that landed. The one place that turns "a path on
-    /// this machine" into "media in the bubble": `mafold attach` and the
-    /// agent render loop both come through here, so the daemon and the CLI can
-    /// never drift on id/mime/dimension handling.
-    pub async fn attach_photo(&self, message_id: &str, path: &std::path::Path) -> Result<Value> {
+    /// Upload a local file and attach it to `message_id`, returning the
+    /// attachment JSON that landed. The one place that turns "a path on this
+    /// machine" into "media in the bubble": `mafold attach` and the agent render
+    /// loop both come through here, so the daemon and the CLI can never drift on
+    /// kind/id/mime/dimension handling.
+    ///
+    /// The wire's THREE media kinds are all reachable from here — `classify`
+    /// picks by content, not by hope. Sending everything as `photo` (what this
+    /// did before) meant a `.html` the agent wrote arrived as a broken image
+    /// bubble, which is also why agents stopped believing they could send files.
+    pub async fn attach_media(&self, message_id: &str, path: &std::path::Path) -> Result<Value> {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or("image.png")
+            .unwrap_or("file")
             .to_string();
-        let (w, h) = png_dimensions(&bytes).unzip();
-        let up = self.upload_media(bytes, &name, mime_for_image(&name)).await?;
-        let media_id = up["media_id"].as_str().context("uploadFile returned no media_id")?;
-        let url = up["url"].as_str().context("uploadFile returned no url")?;
+        let (kind, mime) = classify(&name, &bytes);
+        // The upload's filename must AGREE with the bytes (the declared name is
+        // what the registry row keeps); a screenshot handed over as `shot.txt`
+        // should register as the image it is. A file keeps the caller's own
+        // name — that name is what the bubble displays.
+        let upload_name = match kind {
+            "file" => name.clone(),
+            _ => retype(&name, mime),
+        };
+        // uploadFile answers with the FILE itself (`{id, unique_id, mime, …}`,
+        // file-id world — no urls). The attachment carries nothing but that id;
+        // name/size/dimensions live on the registry row the server just wrote.
+        let up = self.upload_media(bytes, &upload_name, mime).await?;
+        let file_id = up["id"].as_str().context("uploadFile returned no id")?;
         // `id` is the attachment's identity for the server's de-dup, so key it
-        // on the media — re-attaching the same upload is a no-op, not a twin.
-        let att = json!({
-            "kind": "photo", "id": media_id, "media_id": media_id, "url": url,
-            "w": w, "h": h,
-        });
+        // on the file — re-attaching the same upload is a no-op, not a twin.
+        let att = json!({ "kind": kind, "id": file_id, "file": file_id });
         self.attach(message_id, json!([att.clone()])).await?;
         Ok(att)
     }
@@ -449,21 +561,36 @@ impl Client {
     ///
     /// Not retried: the caller is parked on a timeout, so a slow retry answers an
     /// audience that already left.
-    pub async fn answer_card_action(&self, action_id: &str, result: serde_json::Value) -> Result<()> {
-        self.post("answerCardAction", json!({ "action_id": action_id, "result": result })).await?;
+    pub async fn answer_card_action(
+        &self,
+        action_id: &str,
+        result: serde_json::Value,
+    ) -> Result<()> {
+        self.post(
+            "answerCardAction",
+            json!({ "action_id": action_id, "result": result }),
+        )
+        .await?;
         Ok(())
     }
     /// RETRIED: finalizing an already-finalized message is a no-op server-side,
     /// and an unfinalized draft is precisely the "forever generating" bubble.
     pub async fn finalize(&self, message_id: &str) -> Result<()> {
-        self.post_idempotent("botFinalize", json!({ "message_id": message_id })).await?;
+        self.post_idempotent("botFinalize", json!({ "message_id": message_id }))
+            .await?;
         Ok(())
     }
 
     /// Push a directed alert popup to a single user (Telegram answerCallbackQuery
     /// `show_alert` analog). Used to tell a non-allow-listed user their Stop
     /// request was denied. `level` ∈ {info, success, error}.
-    pub async fn push_alert(&self, to: &str, title: Option<&str>, text: &str, level: &str) -> Result<()> {
+    pub async fn push_alert(
+        &self,
+        to: &str,
+        title: Option<&str>,
+        text: &str,
+        level: &str,
+    ) -> Result<()> {
         let mut body = json!({ "to_username": to, "text": text, "level": level });
         if let Some(t) = title {
             body["title"] = json!(t);
@@ -476,7 +603,11 @@ impl Client {
     /// message bodies — each may carry `{% card %}` tags; the client shows them as
     /// pickable suggestions and sends the chosen one.
     pub async fn answer_inline_query(&self, query_id: &str, results: Vec<String>) -> Result<()> {
-        self.post("answerInlineQuery", json!({ "query_id": query_id, "results": results })).await?;
+        self.post(
+            "answerInlineQuery",
+            json!({ "query_id": query_id, "results": results }),
+        )
+        .await?;
         Ok(())
     }
 
@@ -503,7 +634,10 @@ impl Client {
             .await
             .context("publishCard returned non-JSON")?;
         if v.get("ok").and_then(Value::as_bool) == Some(false) {
-            anyhow::bail!("publishCard: {}", v["description"].as_str().unwrap_or("error"));
+            anyhow::bail!(
+                "publishCard: {}",
+                v["description"].as_str().unwrap_or("error")
+            );
         }
         Ok(v["result"].clone())
     }
@@ -516,7 +650,8 @@ impl Client {
     /// Retract a card from YOUR scope — one version, or the whole tag. Used to
     /// clear a family shadow so the tag resolves to the global card again.
     pub async fn unpublish_card(&self, tag: &str, version: Option<&str>) -> Result<Value> {
-        self.post("unpublishCard", json!({ "tag": tag, "version": version })).await
+        self.post("unpublishCard", json!({ "tag": tag, "version": version }))
+            .await
     }
 
     // ── developer mini-app registry ──
@@ -545,14 +680,17 @@ impl Client {
             .await
             .context("publishApp returned non-JSON")?;
         if v.get("ok").and_then(Value::as_bool) == Some(false) {
-            anyhow::bail!("publishApp: {}", v["description"].as_str().unwrap_or("error"));
+            anyhow::bail!(
+                "publishApp: {}",
+                v["description"].as_str().unwrap_or("error")
+            );
         }
         Ok(v["result"].clone())
     }
 
-    /// Upload a media asset (e.g. an app logo) via `/api/uploadFile`. Returns the
-    /// bare `MediaUploadResponse` (`{media_id, url, mime, size_bytes, filename?}`)
-    /// — NOT the `{ok,result}` envelope — with `url` = a served `/media/…` path.
+    /// Upload a file via `/api/uploadFile`. Returns the bare `FileRef`
+    /// (`{id, unique_id, mime, size_bytes, filename?, w?, h?}`) — NOT the
+    /// `{ok,result}` envelope. The `id` is the handle everything else uses.
     pub async fn upload_media(&self, bytes: Vec<u8>, filename: &str, mime: &str) -> Result<Value> {
         let form = reqwest::multipart::Form::new().part(
             "file",
@@ -595,7 +733,8 @@ impl Client {
     }
     /// Resolve newest (or pinned) packs — used to read the current server version.
     pub async fn resolve_langpacks(&self, requests: Value) -> Result<Value> {
-        self.post("resolveLangPacks", json!({ "requests": requests })).await
+        self.post("resolveLangPacks", json!({ "requests": requests }))
+            .await
     }
     /// The languages the server currently serves (newest version each).
     pub async fn list_languages(&self) -> Result<Value> {
@@ -603,7 +742,10 @@ impl Client {
     }
 
     fn ws_url(&self) -> String {
-        let ws = self.base.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
+        let ws = self
+            .base
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1);
         format!("{ws}/api/ws")
     }
 
@@ -611,10 +753,8 @@ impl Client {
     /// Bearer` header instead of the URL query string (so the secret doesn't sit
     /// in logs / proxies). Feed it to `ws_connect`.
     pub fn ws_request(&self) -> tokio_tungstenite::tungstenite::ClientRequestBuilder {
-        let uri: tokio_tungstenite::tungstenite::http::Uri = self
-            .ws_url()
-            .parse()
-            .expect("ws url should be a valid URI");
+        let uri: tokio_tungstenite::tungstenite::http::Uri =
+            self.ws_url().parse().expect("ws url should be a valid URI");
         tokio_tungstenite::tungstenite::ClientRequestBuilder::new(uri)
             .with_header("Authorization", format!("Bearer {}", self.token))
     }
@@ -810,16 +950,90 @@ async fn ws_tunnel(
     Ok(stream)
 }
 
-/// Content type for an outgoing image, by extension. Only the formats the
-/// bubble renders inline; anything else is sent as generic bytes and the
-/// server's own extension allow-list decides how it is stored.
-fn mime_for_image(name: &str) -> &'static str {
+/// What a local file becomes in the bubble: `(kind, mime)`, where `kind` is one
+/// of the wire's media kinds (`photo` / `video` / `file`).
+///
+/// The BYTES decide, not the name. A file only rides the photo/video path if its
+/// header proves it is one — everything else is a `file` card with an honest
+/// mime, which is what the web composer produces for the same upload. That
+/// asymmetry is the whole bug: a name-based guess turned every attachment into a
+/// photo, so `.html`, `.pdf` and a mis-saved screenshot alike arrived as broken
+/// image bubbles.
+fn classify(name: &str, bytes: &[u8]) -> (&'static str, &'static str) {
+    match sniff_media(bytes) {
+        Some(m) if m.starts_with("image/") => ("photo", m),
+        Some(m) => ("video", m),
+        None => ("file", mime_from_ext(name)),
+    }
+}
+
+/// Formats we can PROVE from the header and that the media pipeline serves as
+/// playable/renderable media. Deliberately narrow: anything a sniff can't
+/// confirm becomes a file card, which degrades to "a download that works"
+/// instead of "an image that doesn't".
+fn sniff_media(b: &[u8]) -> Option<&'static str> {
+    if b.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if b.len() >= 12 && b.starts_with(b"RIFF") && &b[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    // ISO-BMFF (`....ftyp<brand>`) covers HEIC, MP4 and MOV — same container,
+    // different major brand, so the brand is what tells them apart.
+    if b.len() >= 12 && &b[4..8] == b"ftyp" {
+        // Unknown brand ⇒ None on purpose: `M4A `/`M4B ` are audio, which has no
+        // media kind of its own, and a file card beats a silent video player.
+        return match &b[8..12] {
+            b"heic" | b"heix" | b"hevc" | b"heim" | b"mif1" | b"msf1" => Some("image/heic"),
+            b"qt  " => Some("video/quicktime"),
+            b"isom" | b"iso2" | b"iso4" | b"iso5" | b"mp41" | b"mp42" | b"avc1" | b"dash"
+            | b"M4V " | b"mmp4" => Some("video/mp4"),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// The same basename carrying the extension that matches `mime` — what we
+/// upload media under once the header has overruled the caller's name.
+fn retype(name: &str, mime: &str) -> String {
+    let ext = match mime {
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/heic" => "heic",
+        "video/mp4" => "mp4",
+        "video/quicktime" => "mov",
+        _ => "png",
+    };
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    let stem = if stem.is_empty() { "file" } else { stem };
+    format!("{stem}.{ext}")
+}
+
+/// Content type for everything else, by extension. Only a display/download hint
+/// — the server's own allow-list still decides how the bytes are STORED (an
+/// `.html` is kept extensionless there so it can never be served as an active
+/// same-origin document).
+fn mime_from_ext(name: &str) -> &'static str {
     match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "heic" => "image/heic",
-        _ => "image/png",
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "csv" => "text/csv; charset=utf-8",
+        "md" | "markdown" => "text/markdown; charset=utf-8",
+        "txt" | "log" => "text/plain; charset=utf-8",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
     }
 }
 
@@ -839,7 +1053,7 @@ fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod attach_tests {
-    use super::{mime_for_image, png_dimensions};
+    use super::{classify, png_dimensions, retype};
 
     /// A real PNG header: magic + IHDR length/type + 1122×1402 (the size the
     /// codex image that started all this actually came back at).
@@ -869,13 +1083,63 @@ mod attach_tests {
         assert_eq!(png_dimensions(&wrong_chunk), None);
     }
 
+    /// `.....ftyp<brand>` — the ISO-BMFF header MP4/MOV/HEIC all share.
+    fn ftyp(brand: &[u8; 4]) -> Vec<u8> {
+        let mut v = vec![0, 0, 0, 0x18];
+        v.extend_from_slice(b"ftyp");
+        v.extend_from_slice(brand);
+        v
+    }
+
+    /// Real images and clips keep riding the media path — proven by their
+    /// header, so a screenshot saved under the wrong name still lands as a photo.
     #[test]
-    fn image_mime_by_extension() {
-        assert_eq!(mime_for_image("a.png"), "image/png");
-        assert_eq!(mime_for_image("a.JPG"), "image/jpeg");
-        assert_eq!(mime_for_image("a.jpeg"), "image/jpeg");
-        assert_eq!(mime_for_image("a.webp"), "image/webp");
-        assert_eq!(mime_for_image("noext"), "image/png");
+    fn header_decides_the_media_kind() {
+        assert_eq!(classify("shot.png", &png_header(4, 4)), ("photo", "image/png"));
+        assert_eq!(classify("shot.txt", &png_header(4, 4)), ("photo", "image/png"));
+        assert_eq!(classify("a.jpg", b"\xff\xd8\xff\xe0JFIF"), ("photo", "image/jpeg"));
+        assert_eq!(classify("a.gif", b"GIF89a\x01\0"), ("photo", "image/gif"));
+        assert_eq!(classify("a.webp", b"RIFF\0\0\0\0WEBPVP8 "), ("photo", "image/webp"));
+        assert_eq!(classify("a.heic", &ftyp(b"heic")), ("photo", "image/heic"));
+        assert_eq!(classify("clip.mp4", &ftyp(b"isom")), ("video", "video/mp4"));
+        assert_eq!(classify("clip.mov", &ftyp(b"qt  ")), ("video", "video/quicktime"));
+    }
+
+    /// THE BUG: an `.html` the agent wrote used to go out as `image/png` under
+    /// `kind: photo`, so the bubble showed a broken image. It is a file card now,
+    /// with the same mime the web composer sends for the same upload.
+    #[test]
+    fn documents_are_files_not_photos() {
+        assert_eq!(
+            classify("demo.html", b"<!doctype html><html>"),
+            ("file", "text/html; charset=utf-8")
+        );
+        assert_eq!(classify("notes.md", b"# hi"), ("file", "text/markdown; charset=utf-8"));
+        assert_eq!(classify("data.json", b"{}"), ("file", "application/json"));
+        assert_eq!(classify("paper.pdf", b"%PDF-1.7"), ("file", "application/pdf"));
+        assert_eq!(classify("logo.svg", b"<svg xmlns="), ("file", "image/svg+xml"));
+        assert_eq!(classify("thing", b"\0\0binary"), ("file", "application/octet-stream"));
+    }
+
+    /// Media is stored under an extension that matches its bytes — the serve path
+    /// types the file from that name, so `shot.txt` holding a PNG must not be
+    /// handed to the server as text.
+    #[test]
+    fn media_uploads_under_the_extension_its_bytes_earn() {
+        assert_eq!(retype("shot.txt", "image/png"), "shot.png");
+        assert_eq!(retype("shot", "image/png"), "shot.png");
+        assert_eq!(retype("clip.bin", "video/quicktime"), "clip.mov");
+        assert_eq!(retype("a.b.jpeg", "image/jpeg"), "a.b.jpg");
+        assert_eq!(retype(".hidden", "image/png"), "file.png");
+    }
+
+    /// A named-but-lying extension must not promote bytes onto the photo path:
+    /// an HTML error page saved as `.png` is precisely the "broken image" report,
+    /// and audio (ISO-BMFF, but no video brand) has no player of its own.
+    #[test]
+    fn a_lying_extension_cannot_fake_media() {
+        assert_eq!(classify("broken.png", b"<html>404</html>"), ("file", "application/octet-stream"));
+        assert_eq!(classify("song.m4a", &ftyp(b"M4A ")), ("file", "application/octet-stream"));
     }
 }
 

@@ -34,6 +34,19 @@ mafold-types = { path = "../mafold-types" }
 # config as mafold-types: serde only, no v4/getrandom — wasm-clean.
 uuid = { version = "1", default-features = false, features = ["serde"] }
 
+# Connections vault (see vault.rs). This lives in the CORE, not in a client,
+# because cli and web must produce byte-identical blobs — two implementations of
+# the same key hierarchy would diverge silently and the symptom would be "the
+# credential I added on my laptop won't open in the browser".
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+argon2 = "0.5"
+rand = "0.8"
+zeroize = "1"
+sha2 = "0.10"
+base64 = "0.22"
+
 # Native (iOS/Android): SQLite KV backend + UniFFI binding + a tiny block_on so
 # the UniFFI surface stays SYNCHRONOUS (callers unchanged) over the async core.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -54,6 +67,12 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
+# The core was deliberately kept free of `getrandom` ("wasm-clean") while it had
+# nothing to randomize. The vault does: device keypairs, DEKs, nonces and salts
+# all need real entropy, and on wasm32-unknown-unknown that means routing
+# getrandom at the browser's crypto.getRandomValues. Spent knowingly — the
+# alternative is a client that cannot generate its own key, i.e. no web vault.
+getrandom = { version = "0.2", features = ["js"] }
 js-sys = "0.3"
 idb = "0.6"
 serde-wasm-bindgen = "0.6"

@@ -11,10 +11,10 @@
 #![allow(dead_code)] // wired into the agent turn loop in a follow-up.
 
 use anyhow::{Context, Result};
-use clap::Subcommand;
 use automerge::transaction::Transactable;
 use automerge::{AutoCommit, ObjId, ObjType, ReadDoc, ScalarValue, Value, ROOT};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use clap::Subcommand;
 use serde_json::{json, Map, Value as J};
 
 use crate::client::Client;
@@ -204,7 +204,12 @@ pub async fn run(cmd: RoomCmd, base: String, token: Option<String>) -> Result<()
             let doc = load_room(&client, &conv, &app).await?;
             println!("{}", serde_json::to_string_pretty(&room_to_json(&doc))?);
         }
-        RoomCmd::Set { app, key, value, conv } => {
+        RoomCmd::Set {
+            app,
+            key,
+            value,
+            conv,
+        } => {
             let schema = room_schema(&client, &conv, &app).await?;
             let mode = schema_mode(&schema, &key);
             if mode != "write" {
@@ -233,11 +238,19 @@ async fn app_rooms(client: &Client, conv: &str) -> Result<Vec<(String, Vec<(Stri
     let mut out = Vec::new();
     if let Some(items) = resp.get("items").and_then(|i| i.as_array()) {
         for it in items {
-            let id = it.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let id = it
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             if id.is_empty() {
                 continue;
             }
-            if let Some(room) = it.get("manifest").and_then(|m| m.get("room")).and_then(|r| r.as_object()) {
+            if let Some(room) = it
+                .get("manifest")
+                .and_then(|m| m.get("room"))
+                .and_then(|r| r.as_object())
+            {
                 let schema = room
                     .iter()
                     .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("read").to_string()))
@@ -249,7 +262,11 @@ async fn app_rooms(client: &Client, conv: &str) -> Result<Vec<(String, Vec<(Stri
     Ok(out)
 }
 
-async fn room_schema(client: &Client, conv: &str, app: &str) -> Result<std::collections::BTreeMap<String, String>> {
+async fn room_schema(
+    client: &Client,
+    conv: &str,
+    app: &str,
+) -> Result<std::collections::BTreeMap<String, String>> {
     app_rooms(client, conv)
         .await?
         .into_iter()
@@ -296,9 +313,15 @@ pub async fn context_block(client: &Client, conv: &str) -> Result<Option<String>
             continue;
         }
         let manifest = it.get("manifest");
-        let name = manifest.and_then(|m| m.get("name")).and_then(|v| v.as_str()).unwrap_or(id);
+        let name = manifest
+            .and_then(|m| m.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(id);
         apps.push(format!("• {name} ({id})"));
-        if let Some(room) = manifest.and_then(|m| m.get("room")).and_then(|r| r.as_object()) {
+        if let Some(room) = manifest
+            .and_then(|m| m.get("room"))
+            .and_then(|r| r.as_object())
+        {
             let cols: Vec<String> = room
                 .iter()
                 .map(|(k, v)| format!("{k}:{}", v.as_str().unwrap_or("read")))
@@ -436,7 +459,8 @@ mod tests {
         // and the same one the API + web exchange over the wire) → identical.
         let blob = STANDARD.encode(doc.save());
         let mut doc2 = AutoCommit::new();
-        doc2.load_incremental(&STANDARD.decode(blob).unwrap()).unwrap();
+        doc2.load_incremental(&STANDARD.decode(blob).unwrap())
+            .unwrap();
         assert_eq!(room_to_json(&doc2), out);
     }
 }

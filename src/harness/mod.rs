@@ -11,9 +11,14 @@
 
 pub mod claude_code;
 pub mod codex;
+// Codex uses this transport for native control data, the live thread/turn path,
+// and reply-scoped server-request approvals.
+#[allow(dead_code)]
+pub mod codex_app_server;
 pub mod kimi_code;
 
 use async_trait::async_trait;
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -62,7 +67,11 @@ pub enum AgentEvent {
     /// A chunk of streamed assistant text.
     Text(String),
     /// A tool / function call the agent made.
-    ToolCall { id: String, name: String, input: Value },
+    ToolCall {
+        id: String,
+        name: String,
+        input: Value,
+    },
     /// The result of a tool call (correlated by `id`).
     ToolResult { id: String, text: String },
     /// A thinking / chain-of-thought block (collapsed in the UI).
@@ -96,7 +105,11 @@ pub enum AgentEvent {
     /// relayed into every reply.
     RateLimited { kind: String, resets_at: Option<i64> },
     /// End-of-turn summary.
-    Done { duration_ms: Option<f64>, cost_usd: Option<f64>, tokens: Option<u64> },
+    Done {
+        duration_ms: Option<f64>,
+        cost_usd: Option<f64>,
+        tokens: Option<u64>,
+    },
     /// (daemon-internal) The user answered the pending interactive ask — the
     /// agent loop emits this when it routes a reply into `ask_file`, and the
     /// renderer stamps the answer into the open `{% ask %}` card so the message
@@ -111,12 +124,10 @@ pub struct Turn {
     /// The conversation id this turn runs in — exported to the agent's process
     /// env as `MAFOLD_CONV` so `mafold room …` (the room skill) targets it.
     pub conv: String,
-    /// The SURFACE this turn runs on: the conversation plus, in a forum, the
-    /// channel (`agent::surface_tag`). Exported as `MAFOLD_SURFACE` and used by
-    /// the bash-hook as the `~/.mafold/bgtasks` registry key, so a background
-    /// task detached in #a is never picked up by #b's completion monitor — it
-    /// is the same granularity the harness session is keyed at, which is why
-    /// the wrap-up turn can safely resume that session.
+    /// The fully scoped SURFACE this turn runs on: bot, harness, conversation,
+    /// forum channel and cwd. Exported as `MAFOLD_SURFACE` and used by the
+    /// bash-hook as the `~/.mafold/bgtasks` registry key, so a detached task is
+    /// only picked up by the daemon/session/tree that created it.
     pub surface: String,
     /// The in-flight reply's message id — the draft this turn is streaming
     /// into. Exported as `MAFOLD_DRAFT` so `mafold attach <file>` can hang
@@ -176,6 +187,152 @@ pub enum CommandOutcome {
     Forward,
 }
 
+/// One model advertised by a harness's live model catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelChoice {
+    /// Picker identity returned by the harness.
+    pub id: String,
+    /// Actual model slug passed to a turn.
+    pub model: String,
+    pub display_name: String,
+    pub description: String,
+    pub is_default: bool,
+    pub default_effort: Option<String>,
+    pub efforts: Vec<String>,
+}
+
+/// One rate-limit window on the subscription seat behind a harness, normalized
+/// across harnesses (Claude Code's `limits[]`, Codex's `primary`/`secondary`).
+#[derive(Debug, Clone, Serialize)]
+pub struct SeatLimit {
+    /// Harness-native window id — `"session"` / `"weekly_all"` /
+    /// `"weekly_scoped"` for Claude Code, `"<limitId>.primary"` for Codex.
+    /// Opaque to the server: it groups and dedupes, it does not interpret.
+    pub kind: String,
+    /// Display label ("Session", "Week (all models)").
+    pub label: String,
+    /// 0–100. The occupancy that actually matters when lending a seat.
+    pub percent: f64,
+    /// Epoch seconds the window rolls over, when the harness reports one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<i64>,
+}
+
+/// Liveness of the subscription seat behind a harness — "is this seat usable
+/// right now", as distinct from [`Harness::available`] ("is the CLI installed").
+///
+/// A seat can be installed and dead: credential expired, account no longer
+/// eligible, window exhausted. Lending, quota and supply decisions all need the
+/// second question answered, and only the machine holding the credential can
+/// answer it — so it rides the existing `reportHarnesses` heartbeat rather than
+/// a channel of its own.
+///
+/// Everything here is BEST EFFORT and self-reported by the host machine. It is
+/// operational telemetry for the seat's own owner, never an authorization input
+/// (§15: a flag is not a security boundary) and never billing evidence.
+#[derive(Debug, Clone, Serialize)]
+pub struct SeatHealth {
+    /// One of:
+    /// - `ok` — credential valid, upstream answered.
+    /// - `exhausted` — answered, but a window is full (100%).
+    /// - `unauthenticated` — no readable credential, or upstream said 401.
+    ///   The owner has to log in again.
+    /// - `rejected` — upstream said 403: the account is no longer allowed to
+    ///   use this seat (eligibility / suspension). Distinct from `unauthenticated`
+    ///   because re-logging-in does NOT fix it.
+    /// - `unreachable` — network failure, timeout, or an unexpected status.
+    /// - `unknown` — this harness has no way to probe its seat.
+    pub state: String,
+    /// Upstream HTTP status when the probe got one — the raw signal behind
+    /// `state`, kept so a new upstream behaviour is diagnosable without a CLI
+    /// release.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Plan/tier label the seat reports ("Max (20x)", "Pro").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    /// Rate-limit windows, most-occupied first.
+    pub limits: Vec<SeatLimit>,
+    /// Epoch seconds this probe ran.
+    pub checked_at: i64,
+}
+
+impl SeatHealth {
+    /// Epoch seconds now (probe stamp).
+    fn now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    /// A seat with nothing to report — the default for harnesses that cannot
+    /// probe. Deliberately NOT `ok`: "we didn't look" and "we looked and it's
+    /// fine" must never collapse into the same value, or every consumer
+    /// silently treats unprobeable seats as healthy.
+    pub fn unknown() -> Self {
+        Self {
+            state: "unknown".into(),
+            status: None,
+            tier: None,
+            limits: Vec::new(),
+            checked_at: Self::now(),
+        }
+    }
+
+    /// Terminal-ish states carry no windows; build one from a status code.
+    pub fn from_status(status: u16) -> Self {
+        let state = match status {
+            401 => "unauthenticated",
+            403 => "rejected",
+            _ => "unreachable",
+        };
+        Self {
+            state: state.into(),
+            status: Some(status),
+            tier: None,
+            limits: Vec::new(),
+            checked_at: Self::now(),
+        }
+    }
+
+    /// A live probe: `ok`, or `exhausted` when any window is full.
+    pub fn from_limits(tier: Option<String>, mut limits: Vec<SeatLimit>) -> Self {
+        limits.sort_by(|a, b| b.percent.total_cmp(&a.percent));
+        let exhausted = limits.iter().any(|l| l.percent >= 100.0);
+        Self {
+            state: if exhausted { "exhausted" } else { "ok" }.into(),
+            status: Some(200),
+            tier,
+            limits,
+            checked_at: Self::now(),
+        }
+    }
+
+    /// No credential on disk / unreadable — same remedy as a 401, but there was
+    /// no request to get a status from.
+    pub fn unauthenticated() -> Self {
+        Self {
+            state: "unauthenticated".into(),
+            status: None,
+            tier: None,
+            limits: Vec::new(),
+            checked_at: Self::now(),
+        }
+    }
+
+    /// The probe never got an answer (DNS, TLS, timeout).
+    pub fn unreachable() -> Self {
+        Self {
+            state: "unreachable".into(),
+            status: None,
+            tier: None,
+            limits: Vec::new(),
+            checked_at: Self::now(),
+        }
+    }
+}
+
 /// A pluggable coding-agent backend.
 #[async_trait]
 pub trait Harness: Send + Sync {
@@ -186,7 +343,11 @@ pub trait Harness: Send + Sync {
     fn available(&self) -> bool;
 
     /// Run one turn, pushing normalized events into `sink` as they arrive.
-    async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> anyhow::Result<TurnOutcome>;
+    async fn run(
+        &self,
+        turn: Turn,
+        sink: UnboundedSender<AgentEvent>,
+    ) -> anyhow::Result<TurnOutcome>;
 
     /// Discover the harness's slash-commands / skills for the bot's `/` menu
     /// (a JSON array of `{command, description, arg_hint?}`).
@@ -197,11 +358,25 @@ pub trait Harness: Send + Sync {
     /// `session` is this chat's live harness session id, when it has one — the
     /// only reliable way to report on it, since sibling chats can share a
     /// workdir and their transcripts race for newest-mtime.
-    async fn command(&self, client: &Client, chat_id: &str, name: &str, arg: &str, workdir: &str, session: Option<&str>) -> CommandOutcome;
+    async fn command(
+        &self,
+        client: &Client,
+        chat_id: &str,
+        name: &str,
+        arg: &str,
+        workdir: &str,
+        session: Option<&str>,
+    ) -> CommandOutcome;
 
     /// One-line status (e.g. auth account) appended to `/status`. Empty = none.
     async fn status_line(&self) -> String {
         String::new()
+    }
+
+    /// Live model catalog for `/model`. Empty means the harness has no dynamic
+    /// catalog and the daemon should keep its existing free-form model UX.
+    async fn model_choices(&self) -> anyhow::Result<Vec<ModelChoice>> {
+        Ok(Vec::new())
     }
 
     /// The harness CLI's own version string (e.g. Claude Code `2.1.198`, Codex
@@ -210,6 +385,26 @@ pub trait Harness: Send + Sync {
     /// report the `claude` version (and vice-versa).
     async fn cli_version(&self) -> String {
         String::new()
+    }
+
+    /// Probe the subscription seat behind this harness (see [`SeatHealth`]).
+    ///
+    /// Default is `unknown` — a harness that cannot ask its upstream "am I still
+    /// allowed, and how full is my window" must say so rather than imply health.
+    /// Implementations MUST be cheap and quota-free: this runs on every
+    /// `reportHarnesses` heartbeat, so a probe that starts a session or burns
+    /// tokens would measure the thing by consuming it.
+    ///
+    /// Implemented for Claude Code (a plain HTTP call to the same utilization
+    /// endpoint Claude Code itself polls). **Codex is deliberately still
+    /// `unknown`**: its equivalent data (`account/rateLimits/read`) is only
+    /// reachable through the App Server, and `select()` hands out a fresh
+    /// `Codex` per call, so its connection cache is always cold here — probing
+    /// it would spawn a codex process on every heartbeat. Wiring that up needs
+    /// process-lifetime harness instances, which is a separate change; until
+    /// then `unknown` is the honest answer.
+    async fn seat_health(&self) -> SeatHealth {
+        SeatHealth::unknown()
     }
 }
 
@@ -254,7 +449,10 @@ pub fn probe() -> Vec<(&'static str, bool)> {
 /// live ~10 min — the supervisor reports every 30s and must stay cheap.
 #[allow(clippy::type_complexity)]
 static VERSION_CACHE: std::sync::Mutex<
-    Option<(std::time::Instant, std::collections::HashMap<&'static str, Option<String>>)>,
+    Option<(
+        std::time::Instant,
+        std::collections::HashMap<&'static str, Option<String>>,
+    )>,
 > = std::sync::Mutex::new(None);
 
 /// Like [`probe`], plus each available harness CLI's version (`<bin> --version`,
@@ -263,7 +461,9 @@ static VERSION_CACHE: std::sync::Mutex<
 pub fn probe_with_versions() -> Vec<(&'static str, bool, Option<String>)> {
     let avail = probe();
     let mut guard = VERSION_CACHE.lock().unwrap();
-    let fresh = guard.as_ref().is_some_and(|(at, _)| at.elapsed() < std::time::Duration::from_secs(600));
+    let fresh = guard
+        .as_ref()
+        .is_some_and(|(at, _)| at.elapsed() < std::time::Duration::from_secs(600));
     if !fresh {
         let mut m = std::collections::HashMap::new();
         for ((id, bin), (_, ok)) in BINS.iter().zip(&avail) {
@@ -274,8 +474,55 @@ pub fn probe_with_versions() -> Vec<(&'static str, bool, Option<String>)> {
     let versions = &guard.as_ref().unwrap().1;
     avail
         .into_iter()
-        .map(|(id, ok)| (id, ok, if ok { versions.get(id).cloned().flatten() } else { None }))
+        .map(|(id, ok)| {
+            (
+                id,
+                ok,
+                if ok {
+                    versions.get(id).cloned().flatten()
+                } else {
+                    None
+                },
+            )
+        })
         .collect()
+}
+
+/// The `reportHarnesses` rows for this machine — availability, CLI version and
+/// seat health — built in ONE place so `mafold login` / `mafold report` and the
+/// supervisor heartbeat can never drift apart (§0). Both call sites hand this
+/// straight to the `harnesses` field.
+///
+/// Seat health is probed only for harnesses actually installed (asking a missing
+/// CLI about its subscription is noise), and sequentially: only Claude Code does
+/// I/O today, its probe is timeout-bounded at 5s, and a heartbeat has no latency
+/// budget worth a join set for.
+pub async fn report_rows() -> Vec<Value> {
+    let probed = tokio::task::spawn_blocking(probe_with_versions)
+        .await
+        .unwrap_or_default();
+    let mut rows = Vec::with_capacity(probed.len());
+    for (id, available, version) in probed {
+        // `null` (not `unknown`) when the harness isn't installed: there is no
+        // seat to have an opinion about.
+        //
+        // `select()` deliberately falls back to Claude Code for ids it doesn't
+        // implement, so asking it directly would attribute CLAUDE's seat to
+        // `opencode`/`openclaw` — verified live: both rows came back "Max
+        // (20x)" with Claude's windows. Ask the harness who it actually is
+        // instead of keeping a second list of "ids that are implemented" (§9).
+        let health = match select(id) {
+            h if available && h.id() == id => Some(h.seat_health().await),
+            _ => None,
+        };
+        rows.push(serde_json::json!({
+            "id": id,
+            "available": available,
+            "version": version,
+            "health": health,
+        }));
+    }
+    rows
 }
 
 /// Drop the version cache (next `probe_with_versions` re-probes) — call after
@@ -287,7 +534,10 @@ pub fn invalidate_versions() {
 /// `<bin> --version` → a short version string ("2.1.198"): first token that
 /// starts with a digit, else the trimmed first line. None on any failure.
 fn bin_version(bin: &str) -> Option<String> {
-    let out = std::process::Command::new(bin).arg("--version").output().ok()?;
+    let out = std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }

@@ -16,24 +16,43 @@ fn dir() -> Result<PathBuf> {
     fs::create_dir_all(&d)?;
     Ok(d)
 }
-fn pid_path() -> Result<PathBuf> { Ok(dir()?.join("agent.pid")) }
-fn log_path() -> Result<PathBuf> { Ok(dir()?.join("agent.log")) }
+fn pid_path() -> Result<PathBuf> {
+    Ok(dir()?.join("agent.pid"))
+}
+fn log_path() -> Result<PathBuf> {
+    Ok(dir()?.join("agent.log"))
+}
 
 fn read_pid() -> Option<u32> {
-    fs::read_to_string(pid_path().ok()?).ok()?.trim().parse().ok()
+    fs::read_to_string(pid_path().ok()?)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
-fn alive(pid: u32) -> bool { platform::pid_alive(pid) }
+fn alive(pid: u32) -> bool {
+    platform::pid_alive(pid)
+}
 
 /// Re-exec ourselves in a new session (detached from the controlling terminal),
 /// with stdio redirected to a log file. The parent records the pid and exits.
-pub fn start_detached(base: &str, token: &str, workdir: Option<&str>, harness: &str, no_auto_update: bool) -> Result<u32> {
+pub fn start_detached(
+    base: &str,
+    token: &str,
+    workdir: Option<&str>,
+    harness: &str,
+    no_auto_update: bool,
+) -> Result<u32> {
     if let Some(pid) = read_pid() {
         if alive(pid) {
             anyhow::bail!("agent already running (pid {pid}) — run `mafold stop` first");
         }
     }
     let exe = std::env::current_exe()?;
-    let out = fs::OpenOptions::new().create(true).append(true).open(log_path()?)?;
+    let out = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path()?)?;
     let err = out.try_clone()?;
 
     let mut cmd = Command::new(exe);

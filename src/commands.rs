@@ -25,22 +25,38 @@ pub enum Outcome {
 pub async fn handle(name: &str, _arg: &str, workdir: &str, session: Option<&str>) -> Outcome {
     match name {
         // ── usage stats (rich card): local transcript scan + live rate limits ──
-        "stats" | "usage" | "cost" => Outcome::Reply(stats(&fetch_limits().await, workdir, session)),
+        "stats" | "usage" | "cost" => {
+            Outcome::Reply(stats(&fetch_limits().await, workdir, session))
+        }
         // ── auth ──
         "logout" => Outcome::Reply(logout().await),
         // ── read local config / state ──
         "config" | "settings" => Outcome::Reply(dump_settings(workdir)),
         "memory" => Outcome::Reply(dump_memory(workdir)),
-        "mcp" => Outcome::Reply(fence_block("🔌 MCP servers", "", &run_claude(&["mcp", "list"], 25).await)),
+        "mcp" => Outcome::Reply(fence_block(
+            "🔌 MCP servers",
+            "",
+            &run_claude(&["mcp", "list"], 25).await,
+        )),
         "agents" => Outcome::Reply(dump_agents(workdir)),
         "skills" => Outcome::Reply(dump_skills(workdir)),
         "hooks" => Outcome::Reply(settings_key(workdir, "hooks", "🪝 Hooks")),
         "permissions" => Outcome::Reply(settings_key(workdir, "permissions", "🔐 Permissions")),
         "plugin" | "plugins" => Outcome::Reply(dump_plugins()),
-        "keybindings" => Outcome::Reply(dump_file("⌨️ Keybindings", "json", &home().join(".claude/keybindings.json"))),
+        "keybindings" => Outcome::Reply(dump_file(
+            "⌨️ Keybindings",
+            "json",
+            &home().join(".claude/keybindings.json"),
+        )),
         "statusline" => Outcome::Reply(settings_key(workdir, "statusLine", "Status line")),
-        "privacy-settings" | "privacy" => Outcome::Reply(settings_key(workdir, "privacy", "Privacy settings")),
-        "doctor" => Outcome::Reply(fence_block("🩺 claude doctor", "", &run_claude(&["doctor"], 30).await)),
+        "privacy-settings" | "privacy" => {
+            Outcome::Reply(settings_key(workdir, "privacy", "Privacy settings"))
+        }
+        "doctor" => Outcome::Reply(fence_block(
+            "🩺 claude doctor",
+            "",
+            &run_claude(&["doctor"], 30).await,
+        )),
         // ── terminal-only: a friendly mock note ──
         n if mock_desc(n).is_some() => Outcome::Reply(mock_reply(n)),
         _ => Outcome::Forward,
@@ -60,7 +76,11 @@ async fn logout() -> String {
 
 pub async fn auth_status_line() -> String {
     let o = run_claude(&["auth", "status", "--text"], 8).await;
-    o.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string()
+    o.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string()
 }
 
 // ───────────────────────── config dumps ─────────────────────────
@@ -74,14 +94,22 @@ fn dump_settings(workdir: &str) -> String {
 
     let files = [
         ("user", home().join(".claude/settings.json")),
-        ("project", PathBuf::from(workdir).join(".claude/settings.json")),
-        ("local", PathBuf::from(workdir).join(".claude/settings.local.json")),
+        (
+            "project",
+            PathBuf::from(workdir).join(".claude/settings.json"),
+        ),
+        (
+            "local",
+            PathBuf::from(workdir).join(".claude/settings.local.json"),
+        ),
     ];
     let mut merged = serde_json::Map::new();
     let mut src: std::collections::HashMap<String, &str> = Default::default();
     let mut raws: Vec<(&str, PathBuf, String)> = vec![];
     for (label, p) in &files {
-        let Ok(text) = std::fs::read_to_string(p) else { continue };
+        let Ok(text) = std::fs::read_to_string(p) else {
+            continue;
+        };
         if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&text) {
             for (k, v) in obj {
                 src.insert(k.clone(), label);
@@ -108,16 +136,26 @@ fn dump_settings(workdir: &str) -> String {
         let mut val = p["defaultMode"].as_str().unwrap_or("default").to_string();
         for k in ["allow", "ask", "deny"] {
             let n = p[k].as_array().map(|a| a.len()).unwrap_or(0);
-            if n > 0 { val.push_str(&format!(" · {n} {k}")); }
+            if n > 0 {
+                val.push_str(&format!(" · {n} {k}"));
+            }
         }
         rows.push(("Permissions".into(), val, "permissions".into()));
     }
     if let Some(Value::Object(h)) = merged.get("hooks") {
         if !h.is_empty() {
-            let val = h.iter().map(|(ev, v)| {
-                let n = v.as_array().map(|a| a.len()).unwrap_or(0);
-                if n > 1 { format!("{ev} ×{n}") } else { ev.clone() }
-            }).collect::<Vec<_>>().join(" · ");
+            let val = h
+                .iter()
+                .map(|(ev, v)| {
+                    let n = v.as_array().map(|a| a.len()).unwrap_or(0);
+                    if n > 1 {
+                        format!("{ev} ×{n}")
+                    } else {
+                        ev.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
             rows.push(("Hooks".into(), val, "hooks".into()));
         }
     }
@@ -126,16 +164,23 @@ fn dump_settings(workdir: &str) -> String {
             let names: Vec<&str> = e.keys().map(|s| s.as_str()).take(5).collect();
             let extra = e.len().saturating_sub(names.len());
             let mut val = names.join(" · ");
-            if extra > 0 { val.push_str(&format!(" +{extra}")); }
+            if extra > 0 {
+                val.push_str(&format!(" +{extra}"));
+            }
             rows.push(("Env".into(), val, "env".into()));
         }
     }
     if let Some(sl) = merged.get("statusLine") {
-        let val = sl["command"].as_str().or(sl["type"].as_str()).unwrap_or("set").to_string();
+        let val = sl["command"]
+            .as_str()
+            .or(sl["type"].as_str())
+            .unwrap_or("set")
+            .to_string();
         rows.push(("Status line".into(), val, "statusLine".into()));
     }
     if let Some(Value::Object(pl)) = merged.get("enabledPlugins") {
-        let names: Vec<&str> = pl.iter()
+        let names: Vec<&str> = pl
+            .iter()
             .filter(|(_, on)| on.as_bool() == Some(true))
             .map(|(k, _)| k.split('@').next().unwrap_or(k))
             .collect();
@@ -156,14 +201,33 @@ fn dump_settings(workdir: &str) -> String {
     }
     if let Some(c) = merged.get("commit") {
         if let Some(co) = c["coAuthor"].as_bool() {
-            rows.push(("Commit co-author".into(), if co { "on".into() } else { "off".into() }, "commit".into()));
+            rows.push((
+                "Commit co-author".into(),
+                if co { "on".into() } else { "off".into() },
+                "commit".into(),
+            ));
         }
     }
 
     // Everything else, generically (scalars as-is, objects compacted) — so a
     // key we didn't special-case is still visible.
-    const HANDLED: &[&str] = &["model", "effortLevel", "permissions", "hooks", "env", "statusLine", "enabledPlugins", "theme", "voice", "commit"];
-    for (k, v) in merged.iter().filter(|(k, _)| !HANDLED.contains(&k.as_str())).take(16) {
+    const HANDLED: &[&str] = &[
+        "model",
+        "effortLevel",
+        "permissions",
+        "hooks",
+        "env",
+        "statusLine",
+        "enabledPlugins",
+        "theme",
+        "voice",
+        "commit",
+    ];
+    for (k, v) in merged
+        .iter()
+        .filter(|(k, _)| !HANDLED.contains(&k.as_str()))
+        .take(16)
+    {
         let val = match v {
             Value::String(s) => s.clone(),
             other => serde_json::to_string(other).unwrap_or_default(),
@@ -181,7 +245,11 @@ fn dump_settings(workdir: &str) -> String {
     }
     out.push_str("{% /mafold/stats %}\n");
     for (label, p, body) in raws {
-        out.push_str(&format!("\n**{label}** · `{}`\n{}\n", p.display(), fence("json", &body)));
+        out.push_str(&format!(
+            "\n**{label}** · `{}`\n{}\n",
+            p.display(),
+            fence("json", &body)
+        ));
     }
     out
 }
@@ -190,56 +258,95 @@ fn dump_memory(workdir: &str) -> String {
     let files = [
         ("user", home().join(".claude/CLAUDE.md")),
         ("project", PathBuf::from(workdir).join("CLAUDE.md")),
-        ("project (.claude)", PathBuf::from(workdir).join(".claude/CLAUDE.md")),
+        (
+            "project (.claude)",
+            PathBuf::from(workdir).join(".claude/CLAUDE.md"),
+        ),
     ];
     let mut out = String::from("🧠 **Memory (CLAUDE.md)**\n");
     let mut any = false;
     for (label, p) in files {
         if let Some(body) = read_capped(&p, 3500) {
             any = true;
-            out.push_str(&format!("\n**{label}** · `{}`\n{}\n", p.display(), fence("markdown", &body)));
+            out.push_str(&format!(
+                "\n**{label}** · `{}`\n{}\n",
+                p.display(),
+                fence("markdown", &body)
+            ));
         }
     }
-    if !any { out.push_str("\n_No CLAUDE.md found (user or project)._"); }
+    if !any {
+        out.push_str("\n_No CLAUDE.md found (user or project)._");
+    }
     out
 }
 
 fn settings_key(workdir: &str, key: &str, title: &str) -> String {
     let files = [
         ("user", home().join(".claude/settings.json")),
-        ("project", PathBuf::from(workdir).join(".claude/settings.json")),
-        ("project (local)", PathBuf::from(workdir).join(".claude/settings.local.json")),
+        (
+            "project",
+            PathBuf::from(workdir).join(".claude/settings.json"),
+        ),
+        (
+            "project (local)",
+            PathBuf::from(workdir).join(".claude/settings.local.json"),
+        ),
     ];
     let mut out = format!("{title}\n");
     let mut any = false;
     for (label, p) in files {
-        let Ok(text) = std::fs::read_to_string(&p) else { continue };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
         if let Some(sub) = v.get(key) {
             any = true;
             let pretty = serde_json::to_string_pretty(sub).unwrap_or_default();
-            out.push_str(&format!("\n**{label}**\n{}\n", fence("json", &cap_chars(&pretty, 3000))));
+            out.push_str(&format!(
+                "\n**{label}**\n{}\n",
+                fence("json", &cap_chars(&pretty, 3000))
+            ));
         }
     }
-    if !any { out.push_str(&format!("\n_No `{key}` configured._")); }
+    if !any {
+        out.push_str(&format!("\n_No `{key}` configured._"));
+    }
     out
 }
 
 fn dump_agents(workdir: &str) -> String {
-    let dirs = [home().join(".claude/agents"), PathBuf::from(workdir).join(".claude/agents")];
+    let dirs = [
+        home().join(".claude/agents"),
+        PathBuf::from(workdir).join(".claude/agents"),
+    ];
     let mut lines: Vec<String> = vec![];
     for d in dirs {
         if let Ok(entries) = std::fs::read_dir(&d) {
             for e in entries.flatten() {
                 let p = e.path();
-                if p.extension().and_then(|x| x.to_str()) != Some("md") { continue; }
-                let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("agent").to_string();
+                if p.extension().and_then(|x| x.to_str()) != Some("md") {
+                    continue;
+                }
+                let name = p
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("agent")
+                    .to_string();
                 let desc = frontmatter_desc(&p).unwrap_or_default();
-                lines.push(if desc.is_empty() { format!("• `{name}`") } else { format!("• `{name}` — {}", clip(&desc, 90)) });
+                lines.push(if desc.is_empty() {
+                    format!("• `{name}`")
+                } else {
+                    format!("• `{name}` — {}", clip(&desc, 90))
+                });
             }
         }
     }
-    if lines.is_empty() { return "🤖 **Agents**\n\n_No custom agents found._".into(); }
+    if lines.is_empty() {
+        return "🤖 **Agents**\n\n_No custom agents found._".into();
+    }
     lines.sort();
     lines.dedup();
     format!("🤖 **Agents** ({})\n\n{}", lines.len(), lines.join("\n"))
@@ -257,15 +364,27 @@ fn dump_skills(workdir: &str) -> String {
         }
     };
     push_dir(home().join(".claude/skills"), "", &mut names);
-    push_dir(PathBuf::from(workdir).join(".claude/skills"), "", &mut names);
+    push_dir(
+        PathBuf::from(workdir).join(".claude/skills"),
+        "",
+        &mut names,
+    );
     // plugin skills
-    if let Ok(text) = std::fs::read_to_string(home().join(".claude/plugins/installed_plugins.json")) {
+    if let Ok(text) = std::fs::read_to_string(home().join(".claude/plugins/installed_plugins.json"))
+    {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
             if let Some(plugins) = v["plugins"].as_object() {
                 for (full, installs) in plugins {
                     let short = full.split('@').next().unwrap_or(full);
-                    if let Some(p) = installs.as_array().and_then(|a| a.iter().rev().find_map(|i| i["installPath"].as_str())) {
-                        push_dir(PathBuf::from(p).join("skills"), &format!("{short}:"), &mut names);
+                    if let Some(p) = installs
+                        .as_array()
+                        .and_then(|a| a.iter().rev().find_map(|i| i["installPath"].as_str()))
+                    {
+                        push_dir(
+                            PathBuf::from(p).join("skills"),
+                            &format!("{short}:"),
+                            &mut names,
+                        );
                     }
                 }
             }
@@ -273,23 +392,42 @@ fn dump_skills(workdir: &str) -> String {
     }
     names.sort();
     names.dedup();
-    if names.is_empty() { return "🧩 **Skills**\n\n_None installed._".into(); }
-    format!("🧩 **Skills** ({})\n\n{}", names.len(), names.iter().map(|n| format!("`/{n}`")).collect::<Vec<_>>().join("  "))
+    if names.is_empty() {
+        return "🧩 **Skills**\n\n_None installed._".into();
+    }
+    format!(
+        "🧩 **Skills** ({})\n\n{}",
+        names.len(),
+        names
+            .iter()
+            .map(|n| format!("`/{n}`"))
+            .collect::<Vec<_>>()
+            .join("  ")
+    )
 }
 
 fn dump_plugins() -> String {
-    let Ok(text) = std::fs::read_to_string(home().join(".claude/plugins/installed_plugins.json")) else {
+    let Ok(text) = std::fs::read_to_string(home().join(".claude/plugins/installed_plugins.json"))
+    else {
         return "🔌 **Plugins**\n\n_None installed._".into();
     };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return "🔌 **Plugins**\n\n_(couldn't read plugin manifest)_".into() };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return "🔌 **Plugins**\n\n_(couldn't read plugin manifest)_".into();
+    };
     let mut lines = vec![];
     if let Some(plugins) = v["plugins"].as_object() {
         for (full, installs) in plugins {
-            let ver = installs.as_array().and_then(|a| a.last()).and_then(|i| i["version"].as_str()).unwrap_or("?");
+            let ver = installs
+                .as_array()
+                .and_then(|a| a.last())
+                .and_then(|i| i["version"].as_str())
+                .unwrap_or("?");
             lines.push(format!("• `{full}` v{ver}"));
         }
     }
-    if lines.is_empty() { return "🔌 **Plugins**\n\n_None installed._".into(); }
+    if lines.is_empty() {
+        return "🔌 **Plugins**\n\n_None installed._".into();
+    }
     format!("🔌 **Plugins** ({})\n\n{}", lines.len(), lines.join("\n"))
 }
 
@@ -326,8 +464,12 @@ impl Buckets {
     }
     /// input + output — the metric Claude Code's own Stats screen calls "Total
     /// tokens". Cache traffic is ~100× larger and would drown it.
-    fn io(&self) -> u64 { self.input + self.output }
-    fn any(&self) -> bool { self.io() + self.cache_read + self.cache_write > 0 }
+    fn io(&self) -> u64 {
+        self.input + self.output
+    }
+    fn any(&self) -> bool {
+        self.io() + self.cache_read + self.cache_write > 0
+    }
 }
 
 /// USD per million tokens as (input, output), by short model name.
@@ -338,10 +480,15 @@ impl Buckets {
 /// $253.65 shown, i.e. display rounding. An unrecognised id prices at the Opus
 /// tier so a newly released model never silently reads as free.
 fn model_price(short: &str) -> (f64, f64) {
-    if short.starts_with("fable") || short.starts_with("mythos") { (10.0, 50.0) }
-    else if short.starts_with("sonnet") { (3.0, 15.0) }
-    else if short.starts_with("haiku") { (1.0, 5.0) }
-    else { (5.0, 25.0) }
+    if short.starts_with("fable") || short.starts_with("mythos") {
+        (10.0, 50.0)
+    } else if short.starts_with("sonnet") {
+        (3.0, 15.0)
+    } else if short.starts_with("haiku") {
+        (1.0, 5.0)
+    } else {
+        (5.0, 25.0)
+    }
 }
 
 /// Dollar cost of one model's token buckets.
@@ -356,7 +503,11 @@ fn bucket_cost(short: &str, b: &Buckets) -> f64 {
 
 /// "$4.20" / "$59.2k" — compact once the cents stop mattering.
 fn fmt_usd(v: f64) -> String {
-    if v >= 1000.0 { format!("${:.1}k", v / 1000.0) } else { format!("${v:.2}") }
+    if v >= 1000.0 {
+        format!("${:.1}k", v / 1000.0)
+    } else {
+        format!("${v:.2}")
+    }
 }
 
 /// Everything the usage card needs, from either data source.
@@ -385,9 +536,15 @@ struct Agg {
 
 impl Agg {
     fn merge(&mut self, o: Agg) {
-        for (h, n) in o.per_hour.iter().enumerate() { self.per_hour[h] += *n; }
-        for (d, n) in o.per_day { *self.per_day.entry(d).or_default() += n; }
-        for (m, b) in o.models { self.models.entry(m).or_default().merge(&b); }
+        for (h, n) in o.per_hour.iter().enumerate() {
+            self.per_hour[h] += *n;
+        }
+        for (d, n) in o.per_day {
+            *self.per_day.entry(d).or_default() += n;
+        }
+        for (m, b) in o.models {
+            self.models.entry(m).or_default().merge(&b);
+        }
         self.messages += o.messages;
         self.tools += o.tools;
         self.sessions += o.sessions;
@@ -395,18 +552,28 @@ impl Agg {
         // touched, so its widest span is not comparable (a daemon session idle
         // for two months spans 63 days of wall-clock and would swamp it). The
         // cache recomputes daily, so a genuinely longer session lands tomorrow.
-        if self.longest_sess == 0 { self.longest_sess = o.longest_sess; }
+        if self.longest_sess == 0 {
+            self.longest_sess = o.longest_sess;
+        }
         if !o.first_iso.is_empty() && (self.first_iso.is_empty() || o.first_iso < self.first_iso) {
             self.first_iso = o.first_iso;
         }
         self.today_turns += o.today_turns;
         self.today_big_ctx += o.today_big_ctx;
     }
-    fn tokens_io(&self) -> u64 { self.models.values().map(|b| b.io()).sum() }
-    fn cost(&self) -> f64 { self.models.iter().map(|(m, b)| bucket_cost(m, b)).sum() }
+    fn tokens_io(&self) -> u64 {
+        self.models.values().map(|b| b.io()).sum()
+    }
+    fn cost(&self) -> f64 {
+        self.models.iter().map(|(m, b)| bucket_cost(m, b)).sum()
+    }
     /// Most-used model by input+output tokens — the TUI's "Favorite model".
     fn favorite(&self) -> Option<&str> {
-        self.models.iter().filter(|(_, b)| b.io() > 0).max_by_key(|(_, b)| b.io()).map(|(m, _)| m.as_str())
+        self.models
+            .iter()
+            .filter(|(_, b)| b.io() > 0)
+            .max_by_key(|(_, b)| b.io())
+            .map(|(m, _)| m.as_str())
     }
 }
 
@@ -429,13 +596,18 @@ fn scan_transcripts(files: &[PathBuf], since_day: Option<i64>) -> Agg {
 
     for f in files {
         if since_day.is_some() {
-            let stale = std::fs::metadata(f).ok()
+            let stale = std::fs::metadata(f)
+                .ok()
                 .and_then(|md| md.modified().ok())
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .is_some_and(|d| (d.as_secs() as i64) / 86_400 < since);
-            if stale { continue; }
+            if stale {
+                continue;
+            }
         }
-        let Ok(bytes) = std::fs::read(f) else { continue };
+        let Ok(bytes) = std::fs::read(f) else {
+            continue;
+        };
         // Lossy so a single bad byte never drops a whole transcript.
         for line in String::from_utf8_lossy(&bytes).lines() {
             // Per-day activity counts what Claude Code counts — every message
@@ -453,23 +625,43 @@ fn scan_transcripts(files: &[PathBuf], since_day: Option<i64>) -> Agg {
                 }
             }
             // Cheap pre-filter: skip the (many) non-assistant lines without parsing.
-            if !line.contains("\"type\":\"assistant\"") { continue; }
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-            if v["type"].as_str() != Some("assistant") { continue; }
-            let Some(ts) = v["timestamp"].as_str() else { continue };
-            if ts.len() < 10 { continue; }
-            let Some(day) = day_key_epoch(&ts[..10]) else { continue };
+            if !line.contains("\"type\":\"assistant\"") {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if v["type"].as_str() != Some("assistant") {
+                continue;
+            }
+            let Some(ts) = v["timestamp"].as_str() else {
+                continue;
+            };
+            if ts.len() < 10 {
+                continue;
+            }
+            let Some(day) = day_key_epoch(&ts[..10]) else {
+                continue;
+            };
 
             if let Some(sid) = v["sessionId"].as_str() {
                 let seen = sess_first.entry(sid.to_string()).or_insert(day);
-                if day < *seen { *seen = day; }
+                if day < *seen {
+                    *seen = day;
+                }
                 if let Some(secs) = iso_epoch_secs(ts) {
                     let span = sess_span.entry(sid.to_string()).or_insert((secs, secs));
-                    if secs < span.0 { span.0 = secs; }
-                    if secs > span.1 { span.1 = secs; }
+                    if secs < span.0 {
+                        span.0 = secs;
+                    }
+                    if secs > span.1 {
+                        span.1 = secs;
+                    }
                 }
             }
-            if day < since { continue; }
+            if day < since {
+                continue;
+            }
 
             let m = &v["message"];
             let mut b = Buckets::default();
@@ -481,15 +673,22 @@ fn scan_transcripts(files: &[PathBuf], since_day: Option<i64>) -> Agg {
                 if day == today {
                     agg.today_turns += 1;
                     // Input side only — output doesn't sit in the context window.
-                    if b.input + b.cache_read + b.cache_write > 150_000 { agg.today_big_ctx += 1; }
+                    if b.input + b.cache_read + b.cache_write > 150_000 {
+                        agg.today_big_ctx += 1;
+                    }
                 }
             }
             if let Some(content) = m["content"].as_array() {
-                agg.tools += content.iter().filter(|x| x["type"].as_str() == Some("tool_use")).count() as u64;
+                agg.tools += content
+                    .iter()
+                    .filter(|x| x["type"].as_str() == Some("tool_use"))
+                    .count() as u64;
             }
             if ts.len() >= 13 {
                 if let Ok(h) = ts[11..13].parse::<usize>() {
-                    if h < 24 { agg.per_hour[h] += 1; }
+                    if h < 24 {
+                        agg.per_hour[h] += 1;
+                    }
                 }
             }
             if agg.first_iso.is_empty() || ts < agg.first_iso.as_str() {
@@ -518,16 +717,22 @@ fn scan_transcripts(files: &[PathBuf], since_day: Option<i64>) -> Agg {
 fn stats_cache() -> Option<(Agg, i64)> {
     let raw = std::fs::read_to_string(home().join(".claude/stats-cache.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    if v["version"].as_u64()? < 4 { return None; }
+    if v["version"].as_u64()? < 4 {
+        return None;
+    }
     let through = day_key_epoch(v["lastComputedDate"].as_str()?)?;
 
     let mut agg = Agg::default();
     for row in v["dailyActivity"].as_array()? {
-        let Some(day) = row["date"].as_str().and_then(day_key_epoch) else { continue };
+        let Some(day) = row["date"].as_str().and_then(day_key_epoch) else {
+            continue;
+        };
         *agg.per_day.entry(day).or_default() += row["messageCount"].as_u64().unwrap_or(0);
         agg.tools += row["toolCallCount"].as_u64().unwrap_or(0);
     }
-    if agg.per_day.is_empty() { return None; }
+    if agg.per_day.is_empty() {
+        return None;
+    }
     for (model, u) in v["modelUsage"].as_object()? {
         let b = agg.models.entry(short_model(model)).or_default();
         b.input += u["inputTokens"].as_u64().unwrap_or(0);
@@ -538,7 +743,9 @@ fn stats_cache() -> Option<(Agg, i64)> {
     if let Some(hours) = v["hourCounts"].as_object() {
         for (h, n) in hours {
             if let (Ok(h), Some(n)) = (h.parse::<usize>(), n.as_u64()) {
-                if h < 24 { agg.per_hour[h] += n; }
+                if h < 24 {
+                    agg.per_hour[h] += n;
+                }
             }
         }
     }
@@ -572,7 +779,9 @@ fn session_cost(workdir: &str, session: Option<&str>) -> Option<SessionCost> {
     use std::collections::HashMap;
     let id = match session {
         // Session ids are UUIDs; refuse anything path-ish before joining it.
-        Some(s) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') => s.to_string(),
+        Some(s) if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') => {
+            s.to_string()
+        }
         _ => list_project_sessions(workdir).into_iter().next()?.id,
     };
     let bytes = std::fs::read(project_dir(workdir).join(format!("{id}.jsonl"))).ok()?;
@@ -584,8 +793,12 @@ fn session_cost(workdir: &str, session: Option<&str>) -> Option<SessionCost> {
         // A single session can run to hundreds of megabytes — only parse the
         // two line shapes that carry anything we need.
         let assistant = line.contains("\"type\":\"assistant\"");
-        if !assistant && !line.contains("structuredPatch") { continue; }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if !assistant && !line.contains("structuredPatch") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
         if assistant && v["type"].as_str() == Some("assistant") {
             if let Some(secs) = v["timestamp"].as_str().and_then(iso_epoch_secs) {
                 first = first.min(secs);
@@ -593,12 +806,19 @@ fn session_cost(workdir: &str, session: Option<&str>) -> Option<SessionCost> {
             }
             let m = &v["message"];
             if let Some(model) = m["model"].as_str() {
-                models.entry(short_model(model)).or_default().add_usage(&m["usage"]);
+                models
+                    .entry(short_model(model))
+                    .or_default()
+                    .add_usage(&m["usage"]);
             }
         }
         // Edit/Write tool results carry the hunks they applied; their +/- lines
         // are the same "code changes" figure the TUI reports.
-        for h in v["toolUseResult"]["structuredPatch"].as_array().into_iter().flatten() {
+        for h in v["toolUseResult"]["structuredPatch"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
             for l in h["lines"].as_array().into_iter().flatten() {
                 match l.as_str().and_then(|s| s.chars().next()) {
                     Some('+') => added += 1,
@@ -608,8 +828,14 @@ fn session_cost(workdir: &str, session: Option<&str>) -> Option<SessionCost> {
             }
         }
     }
-    if models.is_empty() { return None; }
-    let model = models.iter().max_by_key(|(_, b)| b.io()).map(|(m, _)| m.clone()).unwrap_or_default();
+    if models.is_empty() {
+        return None;
+    }
+    let model = models
+        .iter()
+        .max_by_key(|(_, b)| b.io())
+        .map(|(m, _)| m.clone())
+        .unwrap_or_default();
     Some(SessionCost {
         usd: models.iter().map(|(m, b)| bucket_cost(m, b)).sum(),
         wall: if first <= last { last - first } else { 0 },
@@ -647,7 +873,12 @@ fn stats(limits_body: &str, workdir: &str, session: Option<&str>) -> String {
     };
 
     // Per-model bars, on the same input+output metric as the Tokens tile.
-    let mut models: Vec<(String, u64)> = agg.models.iter().map(|(m, b)| (m.clone(), b.io())).filter(|(_, t)| *t > 0).collect();
+    let mut models: Vec<(String, u64)> = agg
+        .models
+        .iter()
+        .map(|(m, b)| (m.clone(), b.io()))
+        .filter(|(_, t)| *t > 0)
+        .collect();
     models.sort_by(|a, b| b.1.cmp(&a.1));
     models.truncate(5);
 
@@ -657,18 +888,40 @@ fn stats(limits_body: &str, workdir: &str, session: Option<&str>) -> String {
     let active_days = day_epochs.len() as u64;
     let (cur_streak, best_streak) = streaks(&day_epochs, today);
     // Active days out of the calendar span since the first one — "141/191".
-    let span_days = day_epochs.first().map(|f| today - f + 1).unwrap_or(0).max(active_days as i64);
-    let busiest_day = agg.per_day.iter().max_by_key(|(_, n)| **n).map(|(d, _)| fmt_day_short(*d));
+    let span_days = day_epochs
+        .first()
+        .map(|f| today - f + 1)
+        .unwrap_or(0)
+        .max(active_days as i64);
+    let busiest_day = agg
+        .per_day
+        .iter()
+        .max_by_key(|(_, n)| **n)
+        .map(|(d, _)| fmt_day_short(*d));
 
     // Heatmap: continuous per-day series ending today, last 20 weeks (the card
     // trims further to its width). offset = Monday-based weekday of the start.
-    let start = day_epochs.first().copied().unwrap_or(today).max(today - 139);
-    let heat: Vec<u64> = (start..=today).map(|d| agg.per_day.get(&d).copied().unwrap_or(0)).collect();
+    let start = day_epochs
+        .first()
+        .copied()
+        .unwrap_or(today)
+        .max(today - 139);
+    let heat: Vec<u64> = (start..=today)
+        .map(|d| agg.per_day.get(&d).copied().unwrap_or(0))
+        .collect();
     // Sparkline only as the short-history fallback — otherwise the two would
     // show the SAME daily series twice.
-    let spark: Vec<u64> = day_epochs.iter().rev().take(45).rev().map(|d| agg.per_day[d]).collect();
+    let spark: Vec<u64> = day_epochs
+        .iter()
+        .rev()
+        .take(45)
+        .rev()
+        .map(|d| agg.per_day[d])
+        .collect();
 
-    let hour = (0..24usize).filter(|&h| agg.per_hour[h] > 0).max_by_key(|&h| agg.per_hour[h])
+    let hour = (0..24usize)
+        .filter(|&h| agg.per_hour[h] > 0)
+        .max_by_key(|&h| agg.per_hour[h])
         .map(|h| format!("{h:02}:00"))
         .unwrap_or_default();
 
@@ -685,21 +938,36 @@ fn stats(limits_body: &str, workdir: &str, session: Option<&str>) -> String {
         body.push_str(&format!("tile|cost|{}\n", fmt_usd(s.usd)));
         body.push_str(&format!("tile|elapsed|{}\n", fmt_dur(s.wall)));
         if s.added + s.removed > 0 {
-            body.push_str(&format!("tile|lines changed|+{} / −{}\n", s.added, s.removed));
+            body.push_str(&format!(
+                "tile|lines changed|+{} / −{}\n",
+                s.added, s.removed
+            ));
         }
     }
     // All time last: the card's prop-driven totals join whichever group is last.
     body.push_str("sec|All time\n");
     let all_cost = agg.cost();
-    if all_cost > 0.0 { body.push_str(&format!("tile|spent|{}\n", fmt_usd(all_cost))); }
+    if all_cost > 0.0 {
+        body.push_str(&format!("tile|spent|{}\n", fmt_usd(all_cost)));
+    }
     if heat.len() > 6 {
         body.push_str(&format!(
             "heat|{}|{}\n",
             weekday_mon0(start),
-            heat.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(","),
+            heat.iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
         ));
     } else if spark.len() > 1 {
-        body.push_str(&format!("spark|{}\n", spark.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",")));
+        body.push_str(&format!(
+            "spark|{}\n",
+            spark
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
     }
     for (m, tok) in &models {
         body.push_str(&format!("model|{}|{}|{}\n", m, humanize(*tok), tok));
@@ -707,18 +975,40 @@ fn stats(limits_body: &str, workdir: &str, session: Option<&str>) -> String {
     // The "interesting but not load-bearing" figures: a muted footnote rather
     // than competing with cost and limits for the eye.
     let mut trivia: Vec<String> = vec![];
-    if let Some(m) = agg.favorite() { trivia.push(format!("{m} most used")); }
-    if agg.longest_sess > 0 { trivia.push(format!("longest session {}", fmt_dur(agg.longest_sess))); }
-    if cur_streak > 0 { trivia.push(format!("streak {cur_streak}d")); }
-    if best_streak > cur_streak { trivia.push(format!("best {best_streak}d")); }
-    if let Some(d) = busiest_day { trivia.push(format!("most active {d}")); }
-    if !trivia.is_empty() { body.push_str(&format!("meta|{}\n", trivia.join(" · "))); }
+    if let Some(m) = agg.favorite() {
+        trivia.push(format!("{m} most used"));
+    }
+    if agg.longest_sess > 0 {
+        trivia.push(format!("longest session {}", fmt_dur(agg.longest_sess)));
+    }
+    if cur_streak > 0 {
+        trivia.push(format!("streak {cur_streak}d"));
+    }
+    if best_streak > cur_streak {
+        trivia.push(format!("best {best_streak}d"));
+    }
+    if let Some(d) = busiest_day {
+        trivia.push(format!("most active {d}"));
+    }
+    if !trivia.is_empty() {
+        body.push_str(&format!("meta|{}\n", trivia.join(" · ")));
+    }
     let mut volume: Vec<String> = vec![];
-    if active_days > 0 { volume.push(format!("{active_days}/{span_days} active days")); }
-    if agg.messages > 0 { volume.push(format!("{} messages", humanize(agg.messages))); }
-    if agg.tools > 0 { volume.push(format!("{} tool calls", humanize(agg.tools))); }
-    if !hour.is_empty() { volume.push(format!("busiest {hour}")); }
-    if !volume.is_empty() { body.push_str(&format!("meta|{}\n", volume.join(" · "))); }
+    if active_days > 0 {
+        volume.push(format!("{active_days}/{span_days} active days"));
+    }
+    if agg.messages > 0 {
+        volume.push(format!("{} messages", humanize(agg.messages)));
+    }
+    if agg.tools > 0 {
+        volume.push(format!("{} tool calls", humanize(agg.tools)));
+    }
+    if !hour.is_empty() {
+        volume.push(format!("busiest {hour}"));
+    }
+    if !volume.is_empty() {
+        body.push_str(&format!("meta|{}\n", volume.join(" · ")));
+    }
     // Behavior key-values (plan, updated-at) last, plus today's context profile —
     // the structured limits endpoint carries no behaviour data, so this is
     // derived from the transcripts we already walked.
@@ -762,15 +1052,25 @@ fn now_ms() -> i64 {
 /// None when it is missing, unreadable, or already expired. We deliberately do
 /// NOT use the refresh token — minting credentials is Claude Code's job, and an
 /// expired one simply drops us to the cached copy on the next line.
-fn oauth_token() -> Option<String> {
+pub(crate) fn oauth_token() -> Option<String> {
     let raw = match std::fs::read_to_string(home().join(".claude/.credentials.json")) {
         Ok(s) => s,
         Err(_) => {
-            if !cfg!(target_os = "macos") { return None; }
+            if !cfg!(target_os = "macos") {
+                return None;
+            }
             let out = std::process::Command::new("security")
-                .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
-                .output().ok()?;
-            if !out.status.success() { return None; }
+                .args([
+                    "find-generic-password",
+                    "-s",
+                    "Claude Code-credentials",
+                    "-w",
+                ])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
             String::from_utf8(out.stdout).ok()?
         }
     };
@@ -791,16 +1091,55 @@ fn oauth_token() -> Option<String> {
 /// and unlike the spawn it starts no session and burns no quota, which matters
 /// because that spawn was measuring the thing by consuming it. None on any
 /// failure, so the caller falls through to the cache.
-async fn fetch_utilization_live() -> Option<serde_json::Value> {
-    let token = oauth_token()?;
-    let res = reqwest::Client::new()
+/// Outcome of [`probe_utilization`]. The failure arms are kept DISTINCT because
+/// they mean different things to a seat owner: 401 → log in again; 403 → the
+/// account is no longer allowed to use this seat and re-logging-in won't help;
+/// unreachable → try later. Collapsing them into `None` (what this used to do)
+/// throws away exactly the signal seat-health reporting exists to carry.
+pub(crate) enum UtilizationProbe {
+    Ok(serde_json::Value),
+    /// Upstream answered with a non-2xx status.
+    Http(u16),
+    /// No readable / unexpired credential on this machine — no request was made.
+    NoCredential,
+    /// Never got an answer (DNS, TLS, timeout), or the body wasn't JSON.
+    Unreachable,
+}
+
+/// `GET /api/oauth/usage`, with the status preserved.
+///
+/// Single source for this call: the `/stats` card wants only the happy path,
+/// seat-health wants the failure taxonomy, and two probes of the same endpoint
+/// would drift (§0).
+pub(crate) async fn probe_utilization() -> UtilizationProbe {
+    let Some(token) = oauth_token() else {
+        return UtilizationProbe::NoCredential;
+    };
+    let res = match reqwest::Client::new()
         .get("https://api.anthropic.com/api/oauth/usage")
         .bearer_auth(token)
         .header("Content-Type", "application/json")
         .timeout(Duration::from_secs(5))
-        .send().await.ok()?;
-    if !res.status().is_success() { return None; }
-    res.json::<serde_json::Value>().await.ok()
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return UtilizationProbe::Unreachable,
+    };
+    if !res.status().is_success() {
+        return UtilizationProbe::Http(res.status().as_u16());
+    }
+    match res.json::<serde_json::Value>().await {
+        Ok(v) => UtilizationProbe::Ok(v),
+        Err(_) => UtilizationProbe::Unreachable,
+    }
+}
+
+async fn fetch_utilization_live() -> Option<serde_json::Value> {
+    match probe_utilization().await {
+        UtilizationProbe::Ok(v) => Some(v),
+        _ => None,
+    }
 }
 
 /// Claude Code's cached copy of the same payload, plus its age in seconds.
@@ -817,7 +1156,7 @@ fn cached_utilization() -> Option<(serde_json::Value, i64)> {
 /// The plan's rate-limit tier as a label: `default_claude_max_20x` → "Max (20x)".
 /// (`seatTier` and `userRateLimitTier` sit next to it and are both null — this is
 /// the field that actually carries the tier.)
-fn plan_tier() -> Option<String> {
+pub(crate) fn plan_tier() -> Option<String> {
     let raw = std::fs::read_to_string(home().join(".claude.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let t = v["oauthAccount"]["organizationRateLimitTier"].as_str()?;
@@ -840,13 +1179,17 @@ fn parse_utilization(util: &serde_json::Value, age_secs: i64) -> String {
     let now = now_ms() / 1000;
     let mut out = String::new();
     for l in util["limits"].as_array().into_iter().flatten() {
-        let Some(pct) = l["percent"].as_f64() else { continue };
+        let Some(pct) = l["percent"].as_f64() else {
+            continue;
+        };
         let label = match l["kind"].as_str().unwrap_or("") {
             "session" => "Session".to_string(),
             "weekly_all" => "Week (all models)".to_string(),
             "weekly_scoped" => format!(
                 "Week ({})",
-                l["scope"]["model"]["display_name"].as_str().unwrap_or("scoped"),
+                l["scope"]["model"]["display_name"]
+                    .as_str()
+                    .unwrap_or("scoped"),
             ),
             other => cap_first(&other.replace('_', " ")),
         };
@@ -857,10 +1200,14 @@ fn parse_utilization(util: &serde_json::Value, age_secs: i64) -> String {
         };
         out.push_str(&format!("limit|{label}|{}|{note}\n", pct.round() as i64));
     }
-    if out.is_empty() { return String::new(); }
+    if out.is_empty() {
+        return String::new();
+    }
     // The tier rides in the header badge, not a key-value row — it labels the
     // whole card, the way Claude's own panel puts "Max (20x)" next to the title.
-    if let Some(p) = plan_tier() { out.push_str(&format!("chip|{p}\n")); }
+    if let Some(p) = plan_tier() {
+        out.push_str(&format!("chip|{p}\n"));
+    }
     // WHEN, not "how long ago": we only know the age at emit time, so a baked
     // "just now" is still saying "just now" an hour later. The card holds the
     // clock and renders the interval itself.
@@ -879,11 +1226,15 @@ fn parse_utilization(util: &serde_json::Value, age_secs: i64) -> String {
 async fn fetch_limits() -> String {
     if let Some(u) = fetch_utilization_live().await {
         let s = parse_utilization(&u, 0);
-        if !s.is_empty() { return s; }
+        if !s.is_empty() {
+            return s;
+        }
     }
     if let Some((u, age)) = cached_utilization() {
         let s = parse_utilization(&u, age);
-        if !s.is_empty() { return s; }
+        if !s.is_empty() {
+            return s;
+        }
     }
     parse_usage_text(&run_claude_stdin("/usage", 30).await)
 }
@@ -911,19 +1262,29 @@ fn parse_usage_text(text: &str) -> String {
 
     for raw in text.lines() {
         let line = raw.trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
 
         if let Some(rest) = line.strip_prefix("You are currently using your ") {
             if let Some(p) = rest.split(" to power").next() {
                 plan = Some(p.trim().to_string());
             }
         } else if line.starts_with("Current ") && line.contains("% used") {
-            let Some((head, tail)) = line.split_once(':') else { continue };
+            let Some((head, tail)) = line.split_once(':') else {
+                continue;
+            };
             let label = cap_first(head.trim_start_matches("Current ").trim());
             let tail = tail.trim();
             let pct: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if pct.is_empty() { continue; }
-            let note = tail.split('·').nth(1).map(|s| strip_trailing_paren(s.trim())).unwrap_or_default();
+            if pct.is_empty() {
+                continue;
+            }
+            let note = tail
+                .split('·')
+                .nth(1)
+                .map(|s| strip_trailing_paren(s.trim()))
+                .unwrap_or_default();
             limits.push(format!("limit|{label}|{pct}|{note}"));
         } else if line.starts_with("Last ") && line.contains('·') {
             let mut it = line.splitn(2, '·');
@@ -935,14 +1296,24 @@ fn parse_usage_text(text: &str) -> String {
             }
         } else if line.contains("% of your usage") {
             let pct: String = line.chars().take_while(|c| c.is_ascii_digit()).collect();
-            let tag = if line.contains(">150k") { ">150k ctx" }
-                else if line.contains("8+ hours") { "8h+ sessions" }
-                else if line.contains("subagent") { "subagent-heavy" }
-                else { continue };
-            if !pct.is_empty() { profile.push(format!("{pct}% {tag}")); }
+            let tag = if line.contains(">150k") {
+                ">150k ctx"
+            } else if line.contains("8+ hours") {
+                "8h+ sessions"
+            } else if line.contains("subagent") {
+                "subagent-heavy"
+            } else {
+                continue;
+            };
+            if !pct.is_empty() {
+                profile.push(format!("{pct}% {tag}"));
+            }
         } else if let Some((label, val)) = ["Top skills", "Top subagents", "Top MCP servers"]
             .iter()
-            .find_map(|k| line.strip_prefix(&format!("{k}:")).map(|v| (k.to_string(), v.trim().to_string())))
+            .find_map(|k| {
+                line.strip_prefix(&format!("{k}:"))
+                    .map(|v| (k.to_string(), v.trim().to_string()))
+            })
         {
             if let Some(e) = tops.iter_mut().find(|(l, _)| *l == label) {
                 e.1 = val; // last (7d) wins
@@ -953,13 +1324,24 @@ fn parse_usage_text(text: &str) -> String {
     }
 
     let mut out = String::new();
-    for l in &limits { out.push_str(l); out.push('\n'); }
+    for l in &limits {
+        out.push_str(l);
+        out.push('\n');
+    }
     // Same header badge as the structured path — the prose only ever yields
     // "subscription" here, never the tier, but it belongs in the same slot.
-    if let Some(p) = plan { out.push_str(&format!("chip|{p}\n")); }
-    for (w, v) in &windows { out.push_str(&format!("kv|{w}|{v}\n")); }
-    if !profile.is_empty() { out.push_str(&format!("kv|Profile (7d)|{}\n", profile.join(" · "))); }
-    for (l, v) in &tops { out.push_str(&format!("kv|{l}|{}\n", v.replace(", ", " · "))); }
+    if let Some(p) = plan {
+        out.push_str(&format!("chip|{p}\n"));
+    }
+    for (w, v) in &windows {
+        out.push_str(&format!("kv|{w}|{v}\n"));
+    }
+    if !profile.is_empty() {
+        out.push_str(&format!("kv|Profile (7d)|{}\n", profile.join(" · ")));
+    }
+    for (l, v) in &tops {
+        out.push_str(&format!("kv|{l}|{}\n", v.replace(", ", " · ")));
+    }
     out
 }
 
@@ -967,7 +1349,10 @@ fn parse_usage_text(text: &str) -> String {
 /// output, or "" on any failure/timeout.
 async fn run_claude_stdin(input: &str, secs: u64) -> String {
     let mut cmd = tokio::process::Command::new("claude");
-    cmd.arg("-p").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.arg("-p")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     crate::platform::no_window(&mut cmd);
     let fut = async {
         let mut child = cmd.spawn()?;
@@ -1015,7 +1400,9 @@ fn civil_from_days(z: i64) -> (i64, usize, u32) {
 
 /// epoch day → "Mar 9" (the year is implied by the card's "since").
 fn fmt_day_short(epoch_day: i64) -> String {
-    const MON: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const MON: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
     let (_, m, d) = civil_from_days(epoch_day);
     format!("{} {d}", MON[m.clamp(1, 12) - 1])
 }
@@ -1038,7 +1425,7 @@ fn day_key_epoch(key: &str) -> Option<i64> {
 
 /// ISO "YYYY-MM-DDTHH:MM:SS…" → epoch seconds (sub-second/zone ignored; the
 /// transcripts are always UTC "Z").
-fn iso_epoch_secs(ts: &str) -> Option<i64> {
+pub(crate) fn iso_epoch_secs(ts: &str) -> Option<i64> {
     let day = day_key_epoch(ts.get(0..10)?)?;
     let h: i64 = ts.get(11..13)?.parse().ok()?;
     let mi: i64 = ts.get(14..16)?.parse().ok()?;
@@ -1069,7 +1456,9 @@ fn streaks(days: &[i64], today: i64) -> (u64, u64) {
     let mut prev = i64::MIN;
     for &d in days {
         run = if d == prev + 1 { run + 1 } else { 1 };
-        if run > best { best = run; }
+        if run > best {
+            best = run;
+        }
         prev = d;
     }
     let mut current = 0u64;
@@ -1078,7 +1467,12 @@ fn streaks(days: &[i64], today: i64) -> (u64, u64) {
             current = 1;
             let mut expect = last - 1;
             for &d in days.iter().rev().skip(1) {
-                if d == expect { current += 1; expect -= 1; } else { break; }
+                if d == expect {
+                    current += 1;
+                    expect -= 1;
+                } else {
+                    break;
+                }
             }
         }
     }
@@ -1090,7 +1484,13 @@ pub(crate) fn fmt_dur(secs: i64) -> String {
     let d = secs / 86400;
     let h = (secs % 86400) / 3600;
     let m = (secs % 3600) / 60;
-    if d > 0 { format!("{d}d {h}h") } else if h > 0 { format!("{h}h {m}m") } else { format!("{}m", m.max(1)) }
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else {
+        format!("{}m", m.max(1))
+    }
 }
 
 /// Uppercase the first ASCII letter ("week (all models)" → "Week (all models)").
@@ -1116,9 +1516,13 @@ fn strip_trailing_paren(s: &str) -> String {
 /// All `*.jsonl` transcripts under `<root>/<project>/` (one project dir per cwd).
 fn jsonl_transcripts(root: &Path) -> Vec<PathBuf> {
     let mut out = vec![];
-    let Ok(projects) = std::fs::read_dir(root) else { return out };
+    let Ok(projects) = std::fs::read_dir(root) else {
+        return out;
+    };
     for proj in projects.flatten() {
-        let Ok(entries) = std::fs::read_dir(proj.path()) else { continue };
+        let Ok(entries) = std::fs::read_dir(proj.path()) else {
+            continue;
+        };
         for e in entries.flatten() {
             let p = e.path();
             if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
@@ -1132,7 +1536,11 @@ fn jsonl_transcripts(root: &Path) -> Vec<PathBuf> {
 /// `claude --version` → "2.1.198" (first token; "" if the CLI is missing).
 pub(crate) async fn claude_version() -> String {
     let out = run_claude(&["--version"], 8).await;
-    out.split_whitespace().next().unwrap_or("").trim_start_matches('v').to_string()
+    out.split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('v')
+        .to_string()
 }
 
 /// Strip Windows' extended-length prefix (`\\?\C:\x`, `\\?\UNC\srv\share`).
@@ -1166,7 +1574,11 @@ pub(crate) fn project_dir(workdir: &str) -> PathBuf {
 /// end. None on any miss (no transcript, format drift, weird session id).
 pub(crate) fn session_context_tokens(workdir: &str, session_id: &str) -> Option<u64> {
     // Session ids are our own UUIDs; refuse anything path-ish anyway.
-    if session_id.is_empty() || !session_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
         return None;
     }
     let path = project_dir(workdir).join(format!("{session_id}.jsonl"));
@@ -1188,13 +1600,27 @@ pub(crate) fn session_context_tokens(workdir: &str, session_id: &str) -> Option<
         &buf
     };
     for line in body.lines().rev() {
-        if !line.contains("\"type\":\"assistant\"") { continue; }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        if v["type"].as_str() != Some("assistant") { continue; }
+        if !line.contains("\"type\":\"assistant\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v["type"].as_str() != Some("assistant") {
+            continue;
+        }
         let u = &v["message"]["usage"];
-        let ctx: u64 = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
-            .iter().filter_map(|k| u[*k].as_u64()).sum();
-        if ctx > 0 { return Some(ctx); }
+        let ctx: u64 = [
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ]
+        .iter()
+        .filter_map(|k| u[*k].as_u64())
+        .sum();
+        if ctx > 0 {
+            return Some(ctx);
+        }
     }
     None
 }
@@ -1216,22 +1642,39 @@ pub(crate) struct SessionMeta {
 pub(crate) fn list_project_sessions(workdir: &str) -> Vec<SessionMeta> {
     let dir = project_dir(workdir);
     let mut rows: Vec<(String, std::time::SystemTime)> = vec![];
-    let Ok(entries) = std::fs::read_dir(&dir) else { return vec![] };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return vec![];
+    };
     for e in entries.flatten() {
         let p = e.path();
-        if p.extension().and_then(|x| x.to_str()) != Some("jsonl") { continue; }
-        let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else { continue };
-        if !stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') { continue; }
-        let Some(mtime) = e.metadata().ok().and_then(|md| md.modified().ok()) else { continue };
+        if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            continue;
+        }
+        let Some(mtime) = e.metadata().ok().and_then(|md| md.modified().ok()) else {
+            continue;
+        };
         rows.push((stem.to_string(), mtime));
     }
     rows.sort_by(|a, b| b.1.cmp(&a.1));
     let now = std::time::SystemTime::now();
     rows.into_iter()
         .map(|(id, mtime)| {
-            let age_secs = now.duration_since(mtime).map(|d| d.as_secs() as i64).unwrap_or(0);
+            let age_secs = now
+                .duration_since(mtime)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
             let head = read_head(&dir.join(format!("{id}.jsonl")), 96 * 1024);
-            SessionMeta { id, age_secs, preview: preview_from_head(&head) }
+            SessionMeta {
+                id,
+                age_secs,
+                preview: preview_from_head(&head),
+            }
         })
         .collect()
 }
@@ -1239,7 +1682,9 @@ pub(crate) fn list_project_sessions(workdir: &str) -> Vec<SessionMeta> {
 /// First `max` bytes of a file, lossy ("" on any miss).
 fn read_head(path: &Path, max: u64) -> String {
     use std::io::Read;
-    let Ok(f) = std::fs::File::open(path) else { return String::new() };
+    let Ok(f) = std::fs::File::open(path) else {
+        return String::new();
+    };
     let mut bytes = Vec::new();
     let _ = f.take(max).read_to_end(&mut bytes);
     String::from_utf8_lossy(&bytes).into_owned()
@@ -1256,28 +1701,48 @@ pub(crate) fn preview_from_head(head: &str) -> String {
                 .ok()
                 .and_then(|v| v["summary"].as_str().map(str::to_string))
             {
-                if !s.trim().is_empty() { return clip(&s, 48); }
+                if !s.trim().is_empty() {
+                    return clip(&s, 48);
+                }
             }
             continue;
         }
-        if !line.contains("\"type\":\"user\"") { continue; }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        if v["type"].as_str() != Some("user") || v["isMeta"].as_bool() == Some(true) { continue; }
+        if !line.contains("\"type\":\"user\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v["type"].as_str() != Some("user") || v["isMeta"].as_bool() == Some(true) {
+            continue;
+        }
         let c = &v["message"]["content"];
         let text = match c {
             serde_json::Value::String(s) => s.clone(),
             serde_json::Value::Array(items) => items
                 .iter()
-                .find_map(|b| (b["type"].as_str() == Some("text")).then(|| b["text"].as_str().unwrap_or("").to_string()))
+                .find_map(|b| {
+                    (b["type"].as_str() == Some("text"))
+                        .then(|| b["text"].as_str().unwrap_or("").to_string())
+                })
                 .unwrap_or_default(),
             _ => String::new(),
         };
         // The daemon prefixes group turns with bracketed context blocks; the
         // real trigger is whatever follows the last END marker.
-        let t = ["[END RECENT CONVERSATION — now handle the triggering message below.]", "[END AVAILABLE APPS & ROOMS]"]
-            .iter()
-            .fold(text.trim(), |acc, marker| acc.rsplit(marker).next().unwrap_or(acc).trim());
-        if t.is_empty() || t.starts_with("Caveat:") || t.starts_with('<') || t.starts_with("[Request interrupted") {
+        let t = [
+            "[END RECENT CONVERSATION — now handle the triggering message below.]",
+            "[END AVAILABLE APPS & ROOMS]",
+        ]
+        .iter()
+        .fold(text.trim(), |acc, marker| {
+            acc.rsplit(marker).next().unwrap_or(acc).trim()
+        });
+        if t.is_empty()
+            || t.starts_with("Caveat:")
+            || t.starts_with('<')
+            || t.starts_with("[Request interrupted")
+        {
             continue;
         }
         return clip(t, 48);
@@ -1287,10 +1752,15 @@ pub(crate) fn preview_from_head(head: &str) -> String {
 
 /// Seconds → "just now" / "5m ago" / "3h ago" / "2d ago".
 pub(crate) fn fmt_age(secs: i64) -> String {
-    if secs < 60 { "just now".into() }
-    else if secs < 3600 { format!("{}m ago", secs / 60) }
-    else if secs < 86400 { format!("{}h ago", secs / 3600) }
-    else { format!("{}d ago", secs / 86400) }
+    if secs < 60 {
+        "just now".into()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
 }
 
 /// An interactive `claude` session someone else is holding right now — a
@@ -1335,15 +1805,25 @@ impl LiveTui {
 /// this whole function silently returned nothing on Windows.)
 pub(crate) fn live_tui_sessions() -> Vec<LiveTui> {
     let mut out: Vec<LiveTui> = vec![];
-    let Ok(entries) = std::fs::read_dir(home().join(".claude/sessions")) else { return out };
+    let Ok(entries) = std::fs::read_dir(home().join(".claude/sessions")) else {
+        return out;
+    };
     for e in entries.flatten() {
-        let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
-        let Some((pid, l)) = parse_live_entry(&text) else { continue };
-        if !crate::platform::pid_alive(pid) { continue; }
+        let Ok(text) = std::fs::read_to_string(e.path()) else {
+            continue;
+        };
+        let Some((pid, l)) = parse_live_entry(&text) else {
+            continue;
+        };
+        if !crate::platform::pid_alive(pid) {
+            continue;
+        }
         // Two registry entries can claim one session (a TUI relaunched via
         // `--resume`); busy beats idle.
         if let Some(prev) = out.iter_mut().find(|x| x.session_id == l.session_id) {
-            if prev.status != "busy" && l.status == "busy" { *prev = l; }
+            if prev.status != "busy" && l.status == "busy" {
+                *prev = l;
+            }
         } else {
             out.push(l);
         }
@@ -1355,14 +1835,26 @@ pub(crate) fn live_tui_sessions() -> Vec<LiveTui> {
 /// by somebody else (non-interactive kinds, our own `sdk*` turns, drift).
 pub(crate) fn parse_live_entry(text: &str) -> Option<(u32, LiveTui)> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
-    if v["kind"].as_str() != Some("interactive") { return None; }
+    if v["kind"].as_str() != Some("interactive") {
+        return None;
+    }
     let entrypoint = v["entrypoint"].as_str()?.to_string();
-    if entrypoint.starts_with("sdk") { return None; } // that's us
+    if entrypoint.starts_with("sdk") {
+        return None;
+    } // that's us
     let pid = v["pid"].as_u64()? as u32;
     let session_id = v["sessionId"].as_str()?.to_string();
     let cwd = v["cwd"].as_str().unwrap_or("").to_string();
     let status = v["status"].as_str().unwrap_or("").to_string();
-    Some((pid, LiveTui { session_id, cwd, status, entrypoint }))
+    Some((
+        pid,
+        LiveTui {
+            session_id,
+            cwd,
+            status,
+            entrypoint,
+        },
+    ))
 }
 
 /// Is this exact transcript open in someone else's claude process right now?
@@ -1372,7 +1864,9 @@ pub(crate) fn parse_live_entry(text: &str) -> Option<(u32, LiveTui)> {
 /// is holding puts two writers on one transcript. The turn asks this and forks
 /// instead — see `harness::claude_code`.
 pub(crate) fn session_held_elsewhere(session_id: &str) -> bool {
-    live_tui_sessions().iter().any(|l| l.session_id == session_id)
+    live_tui_sessions()
+        .iter()
+        .any(|l| l.session_id == session_id)
 }
 
 /// `/resume <arg>` resolution over the (newest-first) session list.
@@ -1397,11 +1891,18 @@ pub(crate) fn resolve_session<'a>(metas: &'a [SessionMeta], arg: &str) -> Resolv
 /// 1_234_567 → "1.2M" (K/M/B, trailing `.0` stripped).
 pub(crate) fn humanize(n: u64) -> String {
     let f = n as f64;
-    let s = if f >= 1e9 { format!("{:.1}B", f / 1e9) }
-        else if f >= 1e6 { format!("{:.1}M", f / 1e6) }
-        else if f >= 1e3 { format!("{:.1}K", f / 1e3) }
-        else { return n.to_string() };
-    s.replace(".0B", "B").replace(".0M", "M").replace(".0K", "K")
+    let s = if f >= 1e9 {
+        format!("{:.1}B", f / 1e9)
+    } else if f >= 1e6 {
+        format!("{:.1}M", f / 1e6)
+    } else if f >= 1e3 {
+        format!("{:.1}K", f / 1e3)
+    } else {
+        return n.to_string();
+    };
+    s.replace(".0B", "B")
+        .replace(".0M", "M")
+        .replace(".0K", "K")
 }
 
 /// "claude-opus-4-5-20251101" → "opus-4-5".
@@ -1417,8 +1918,12 @@ fn short_model(m: &str) -> String {
 
 /// ISO date → "Jan 23, 2026".
 fn fmt_date(iso: &str) -> String {
-    if iso.len() < 10 { return String::new(); }
-    const MON: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    if iso.len() < 10 {
+        return String::new();
+    }
+    const MON: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
     let mi = iso[5..7].parse::<usize>().unwrap_or(1).clamp(1, 12) - 1;
     let day = iso[8..10].parse::<u32>().unwrap_or(1);
     format!("{} {}, {}", MON[mi], day, &iso[0..4])
@@ -1474,7 +1979,9 @@ async fn run_claude(args: &[&str], secs: u64) -> String {
     match tokio::time::timeout(Duration::from_secs(secs), fut).await {
         Ok(Ok(o)) => {
             let mut s = String::from_utf8_lossy(&o.stdout).to_string();
-            if s.trim().is_empty() { s = String::from_utf8_lossy(&o.stderr).to_string(); }
+            if s.trim().is_empty() {
+                s = String::from_utf8_lossy(&o.stderr).to_string();
+            }
             cap_chars(strip_ansi(&s).trim(), 3000)
         }
         Ok(Err(e)) => format!("(couldn't run `claude {}`: {e})", args.join(" ")),
@@ -1487,7 +1994,9 @@ fn home() -> PathBuf {
 }
 
 fn read_capped(path: &Path, max: usize) -> Option<String> {
-    std::fs::read_to_string(path).ok().map(|s| cap_chars(&s, max))
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| cap_chars(&s, max))
 }
 
 fn cap_chars(s: &str, max: usize) -> String {
@@ -1508,19 +2017,29 @@ fn fence_block(title: &str, lang: &str, body: &str) -> String {
 
 fn clip(s: &str, max: usize) -> String {
     let one: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one.chars().count() > max { format!("{}…", one.chars().take(max - 1).collect::<String>()) } else { one }
+    if one.chars().count() > max {
+        format!("{}…", one.chars().take(max - 1).collect::<String>())
+    } else {
+        one
+    }
 }
 
 /// Pull a `description:` value from a markdown file's YAML frontmatter.
 fn frontmatter_desc(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
-    if lines.next()?.trim_end() != "---" { return None; }
+    if lines.next()?.trim_end() != "---" {
+        return None;
+    }
     for l in lines {
-        if l.trim_end() == "---" { break; }
+        if l.trim_end() == "---" {
+            break;
+        }
         if let Some(rest) = l.strip_prefix("description:") {
             let v = rest.trim().trim_matches('"').trim_matches('\'').trim();
-            if !v.is_empty() { return Some(v.to_string()); }
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
         }
     }
     None
@@ -1533,7 +2052,9 @@ pub fn strip_ansi(s: &str) -> String {
         if c == '\u{1b}' {
             // skip a CSI/escape sequence up to its final letter
             while let Some(n) = chars.next() {
-                if n.is_ascii_alphabetic() { break; }
+                if n.is_ascii_alphabetic() {
+                    break;
+                }
             }
         } else {
             out.push(c);
@@ -1580,7 +2101,9 @@ mod card_tag_lint {
                     .trim_start()
                     .trim_start_matches('/')
                     .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '/')
+                    .take_while(|c| {
+                        c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '/'
+                    })
                     .collect();
                 if !name.is_empty() {
                     out.push(name);
@@ -1625,13 +2148,19 @@ mod card_tag_lint {
         // forever. Comments must stay invisible, emissions must not.
         assert_eq!(emitted_tags("let s = \"{% stats a=1 %}\";"), vec!["stats"]); // LINT-IGNORE
         assert_eq!(emitted_tags("format!(\"{{% stats %}}\")"), vec!["stats"]); // LINT-IGNORE
-        assert_eq!(emitted_tags("/// the {% bash %} card"), Vec::<String>::new()); // LINT-IGNORE
+        assert_eq!(
+            emitted_tags("/// the {% bash %} card"),
+            Vec::<String>::new()
+        ); // LINT-IGNORE
         assert_eq!(
             emitted_tags("let s = \"{% mafold/stats %}…{% /mafold/stats %}\";"), // LINT-IGNORE
             vec!["mafold/stats", "mafold/stats"]
         );
         // The escape hatch must not be a blanket off-switch for a whole file.
-        assert_eq!(emitted_tags("\"{% stats %}\" // LINT-IGNORE"), Vec::<String>::new());
+        assert_eq!(
+            emitted_tags("\"{% stats %}\" // LINT-IGNORE"),
+            Vec::<String>::new()
+        );
         assert_eq!(emitted_tags("\"{% stats %}\""), vec!["stats"]); // LINT-IGNORE
     }
 }
@@ -1670,16 +2199,39 @@ Last 7d · 7983 requests · 30 sessions
     #[test]
     fn parses_usage_limits() {
         let body = parse_usage_text(USAGE_SAMPLE);
-        assert!(body.contains("limit|Session|5|resets Jul 3 at 9:19am\n"), "{body}");
-        assert!(body.contains("limit|Week (all models)|23|resets Jul 3 at 8:59pm\n"), "{body}");
-        assert!(body.contains("limit|Week (Fable)|20|resets Jul 3 at 8:59pm\n"), "{body}");
+        assert!(
+            body.contains("limit|Session|5|resets Jul 3 at 9:19am\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("limit|Week (all models)|23|resets Jul 3 at 8:59pm\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("limit|Week (Fable)|20|resets Jul 3 at 8:59pm\n"),
+            "{body}"
+        );
         assert!(body.contains("chip|subscription\n"), "{body}");
-        assert!(body.contains("kv|Last 24h|1634 requests · 11 sessions\n"), "{body}");
-        assert!(body.contains("kv|Last 7d|7983 requests · 30 sessions\n"), "{body}");
+        assert!(
+            body.contains("kv|Last 24h|1634 requests · 11 sessions\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("kv|Last 7d|7983 requests · 30 sessions\n"),
+            "{body}"
+        );
         // Behavior profile + Top rows come from the LAST (7d) block.
-        assert!(body.contains("kv|Profile (7d)|91% >150k ctx · 72% 8h+ sessions · 71% subagent-heavy\n"), "{body}");
+        assert!(
+            body.contains(
+                "kv|Profile (7d)|91% >150k ctx · 72% 8h+ sessions · 71% subagent-heavy\n"
+            ),
+            "{body}"
+        );
         assert!(body.contains("kv|Top subagents|workflow-subagent 2% · Explore 1% · general-purpose 1% · Plan 1%\n"), "{body}");
-        assert!(body.contains("kv|Top MCP servers|browser-use 1%\n"), "{body}");
+        assert!(
+            body.contains("kv|Top MCP servers|browser-use 1%\n"),
+            "{body}"
+        );
         // Top skills only appeared in the 24h block — still kept.
         assert!(body.contains("kv|Top skills|/claude-api 1%\n"), "{body}");
     }
@@ -1755,12 +2307,23 @@ Last 7d · 7983 requests · 30 sessions
     #[test]
     fn resolves_sessions_by_prefix_and_last() {
         let metas = vec![
-            SessionMeta { id: "aabb1111-x".into(), age_secs: 10, preview: String::new() },
-            SessionMeta { id: "aacc2222-y".into(), age_secs: 20, preview: String::new() },
+            SessionMeta {
+                id: "aabb1111-x".into(),
+                age_secs: 10,
+                preview: String::new(),
+            },
+            SessionMeta {
+                id: "aacc2222-y".into(),
+                age_secs: 20,
+                preview: String::new(),
+            },
         ];
         assert!(matches!(resolve_session(&metas, "last"), Resolve::One(m) if m.id == "aabb1111-x"));
         assert!(matches!(resolve_session(&metas, "aacc"), Resolve::One(m) if m.id == "aacc2222-y"));
-        assert!(matches!(resolve_session(&metas, "aa"), Resolve::Ambiguous(2)));
+        assert!(matches!(
+            resolve_session(&metas, "aa"),
+            Resolve::Ambiguous(2)
+        ));
         assert!(matches!(resolve_session(&metas, "zz"), Resolve::NotFound));
         assert!(matches!(resolve_session(&[], "last"), Resolve::NotFound));
     }
@@ -1777,10 +2340,19 @@ Last 7d · 7983 requests · 30 sessions
         // Non-interactive kinds, the daemon's own sdk-cli turns (they register
         // too — kind "interactive", entrypoint "sdk-cli"), and drift are all
         // rejected; a missing status is tolerated.
-        assert!(parse_live_entry(r#"{"pid":1,"sessionId":"x","kind":"print","entrypoint":"cli"}"#).is_none());
-        assert!(parse_live_entry(r#"{"pid":3,"sessionId":"z","kind":"interactive","entrypoint":"sdk-cli"}"#).is_none());
+        assert!(
+            parse_live_entry(r#"{"pid":1,"sessionId":"x","kind":"print","entrypoint":"cli"}"#)
+                .is_none()
+        );
+        assert!(parse_live_entry(
+            r#"{"pid":3,"sessionId":"z","kind":"interactive","entrypoint":"sdk-cli"}"#
+        )
+        .is_none());
         assert!(parse_live_entry("not json").is_none());
-        let (_, l) = parse_live_entry(r#"{"pid":2,"sessionId":"y","cwd":"/w","kind":"interactive","entrypoint":"cli"}"#).unwrap();
+        let (_, l) = parse_live_entry(
+            r#"{"pid":2,"sessionId":"y","cwd":"/w","kind":"interactive","entrypoint":"cli"}"#,
+        )
+        .unwrap();
         assert_eq!(l.status, "");
         assert_eq!(l.holder(), "a terminal");
     }
@@ -1798,7 +2370,10 @@ Last 7d · 7983 requests · 30 sessions
         assert_eq!((pid, l.session_id.as_str()), (10976, "0f9eda48"));
         assert_eq!(l.holder(), "VS Code");
         // …but our own headless turns still aren't, whatever they're called.
-        assert!(parse_live_entry(r#"{"pid":4,"sessionId":"s","kind":"interactive","entrypoint":"sdk"}"#).is_none());
+        assert!(parse_live_entry(
+            r#"{"pid":4,"sessionId":"s","kind":"interactive","entrypoint":"sdk"}"#
+        )
+        .is_none());
     }
 
     // ── machine-dependent smokes: read THIS machine's ~/.claude, run manually
@@ -1815,7 +2390,14 @@ Last 7d · 7983 requests · 30 sessions
         // against Claude Code's own `/usage` for that exact transcript.
         if let Some(m) = list_project_sessions(&workdir).into_iter().next() {
             if let Some(c) = session_cost(&workdir, Some(&m.id)) {
-                println!("session {} → {} · {} · +{}/-{}", m.id, fmt_usd(c.usd), fmt_dur(c.wall), c.added, c.removed);
+                println!(
+                    "session {} → {} · {} · +{}/-{}",
+                    m.id,
+                    fmt_usd(c.usd),
+                    fmt_dur(c.wall),
+                    c.added,
+                    c.removed
+                );
             }
         }
         let s = stats("", &workdir, None);
@@ -1845,12 +2427,21 @@ Last 7d · 7983 requests · 30 sessions
     #[test]
     #[ignore = "reads this machine's ~/.claude transcripts + live registry"]
     fn resume_listing_smoke() {
-        let dir = std::env::var("MAFOLD_SMOKE_DIR").unwrap_or_else(|_| "/Users/ops/Desktop/mafold".into());
-        println!("dir: {dir}  →  project dir: {}", project_dir(&dir).display());
+        let dir = std::env::var("MAFOLD_SMOKE_DIR")
+            .unwrap_or_else(|_| "/Users/ops/Desktop/mafold".into());
+        println!(
+            "dir: {dir}  →  project dir: {}",
+            project_dir(&dir).display()
+        );
         let metas = list_project_sessions(&dir);
         println!("{} sessions; newest 6:", metas.len());
         for m in metas.iter().take(6) {
-            println!("  {} · {} · {:?}", &m.id[..8], fmt_age(m.age_secs), m.preview);
+            println!(
+                "  {} · {} · {:?}",
+                &m.id[..8],
+                fmt_age(m.age_secs),
+                m.preview
+            );
         }
         // Newest-first ordering.
         assert!(metas.windows(2).all(|w| w[0].age_secs <= w[1].age_secs));
@@ -1871,7 +2462,9 @@ Last 7d · 7983 requests · 30 sessions
                 .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
                 .max_by_key(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
                 .map(|e| e.path().file_stem().unwrap().to_string_lossy().to_string())
-        }) else { return };
+        }) else {
+            return;
+        };
         let ctx = session_context_tokens("/Users/ops/Desktop/mafold", &sid);
         println!("session {sid} → context {ctx:?}");
         assert!(ctx.is_some());

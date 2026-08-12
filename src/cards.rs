@@ -112,7 +112,8 @@ fn valid_card_id(id: &str) -> bool {
         && owner.split(':').all(|s| {
             !s.is_empty()
                 && s.starts_with(|c: char| c.is_ascii_lowercase())
-                && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                && s.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         });
     owner_ok && valid_tag(slug)
 }
@@ -167,7 +168,11 @@ async fn cmd_dev(dir: &str, port: u16) -> Result<()> {
     let esbuild = ensure_esbuild().await?;
     let out = format!("dist/{}.js", manifest.slug());
 
-    println!("→ serving {} on http://127.0.0.1:{port}/{}.js", manifest.id, manifest.slug());
+    println!(
+        "→ serving {} on http://127.0.0.1:{port}/{}.js",
+        manifest.id,
+        manifest.slug()
+    );
     println!("  watching {} (Ctrl-C to stop)\n", manifest.entry);
 
     // esbuild runs the watch + static server itself; this blocks until Ctrl-C.
@@ -188,9 +193,8 @@ async fn cmd_dev(dir: &str, port: u16) -> Result<()> {
 // ───────────────────────────── publish ─────────────────────────────
 
 async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<()> {
-    let token = token.context(
-        "publish needs your bot token — pass --token or set $MAFOLD_BOT_TOKEN",
-    )?;
+    let token =
+        token.context("publish needs your bot token — pass --token or set $MAFOLD_BOT_TOKEN")?;
     let manifest = read_manifest(dir)?;
     if !valid_card_id(&manifest.id) {
         anyhow::bail!(
@@ -245,7 +249,10 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
         manifest.id, version, scope, url, manifest.id
     );
     if version != manifest.version {
-        println!("  note: server stored {version} (manifest says {}) — content-drift auto-bump", manifest.version);
+        println!(
+            "  note: server stored {version} (manifest says {}) — content-drift auto-bump",
+            manifest.version
+        );
     }
     // No shadow warning any more: the namespace is stated in the manifest, so
     // publishing into one you don't manage is a hard 403 rather than a silent
@@ -261,8 +268,8 @@ async fn cmd_unpublish(
     base: String,
     token: Option<String>,
 ) -> Result<()> {
-    let token = token
-        .context("unpublish needs your bot token — pass --token or set $MAFOLD_BOT_TOKEN")?;
+    let token =
+        token.context("unpublish needs your bot token — pass --token or set $MAFOLD_BOT_TOKEN")?;
     let client = Client::new(base, token);
     let r = client.unpublish_card(tag, version).await?;
     let scope = r["scope"].as_str().unwrap_or("?");
@@ -272,7 +279,11 @@ async fn cmd_unpublish(
         .unwrap_or_default();
     println!(
         "✓ retracted {tag} {} from the {scope} scope: {}",
-        if removed.len() == 1 { "version" } else { "versions" },
+        if removed.len() == 1 {
+            "version"
+        } else {
+            "versions"
+        },
         removed.join(", "),
     );
     // What it resolves to NOW is the only answer that matters — clearing a
@@ -286,13 +297,18 @@ async fn cmd_unpublish(
         None => println!(
             "  ⚠ {{% {tag} /%}} now resolves to NOTHING{} — clients without a cached\n  \
              copy will render it as unavailable. Publishing again brings it back.",
-            if scope == "global" { ", for every account" } else { ", and there is no global card to fall back to" },
+            if scope == "global" {
+                ", for every account"
+            } else {
+                ", and there is no global card to fall back to"
+            },
         ),
     }
     // Retracted labels stay spent: clients refetch only when the version string
     // moves, so handing an old label to new bytes would strand everyone holding
     // the old ones. Say so, because the next publish will visibly skip a number.
-    println!("  the retracted version number{} will not be reused — the next publish climbs past {}",
+    println!(
+        "  the retracted version number{} will not be reused — the next publish climbs past {}",
         if removed.len() == 1 { "" } else { "s" },
         removed.last().copied().unwrap_or("it"),
     );
@@ -302,7 +318,8 @@ async fn cmd_unpublish(
 // ───────────────────────────── list ─────────────────────────────
 
 async fn cmd_list(base: String, token: Option<String>) -> Result<()> {
-    let token = token.context("list needs your bot token — pass --token or set $MAFOLD_BOT_TOKEN")?;
+    let token =
+        token.context("list needs your bot token — pass --token or set $MAFOLD_BOT_TOKEN")?;
     let client = Client::new(base, token);
     let r = client.list_cards().await?;
     let items = r["items"].as_array().cloned().unwrap_or_default();
@@ -452,7 +469,9 @@ fn valid_tag(tag: &str) -> bool {
     !tag.is_empty()
         && tag.len() <= 64
         && tag.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-        && tag.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 pub(crate) fn title_case(tag: &str) -> String {

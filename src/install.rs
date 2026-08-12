@@ -93,7 +93,12 @@ fn list() -> Result<()> {
     println!("runtimes:");
     for t in TOOLS {
         let state = if crate::harness::on_path(t.bin) {
-            format!("✓ installed{}", version_of(t.bin).map(|v| format!(" ({v})")).unwrap_or_default())
+            format!(
+                "✓ installed{}",
+                version_of(t.bin)
+                    .map(|v| format!(" ({v})"))
+                    .unwrap_or_default()
+            )
         } else {
             format!("· not installed — `mafold install {}`", t.id)
         };
@@ -104,10 +109,17 @@ fn list() -> Result<()> {
 
 fn install(t: &Tool, yes: bool) -> Result<()> {
     if cfg!(windows) {
-        bail!("automatic install isn't supported on Windows yet — {}", t.fallback);
+        bail!(
+            "automatic install isn't supported on Windows yet — {}",
+            t.fallback
+        );
     }
     if crate::harness::on_path(t.bin) {
-        println!("✓ {} already installed ({})", t.name, version_of(t.bin).unwrap_or_else(|| "version unknown".into()));
+        println!(
+            "✓ {} already installed ({})",
+            t.name,
+            version_of(t.bin).unwrap_or_else(|| "version unknown".into())
+        );
         next_steps(t);
         return Ok(());
     }
@@ -137,7 +149,11 @@ fn install(t: &Tool, yes: bool) -> Result<()> {
     }
 
     if crate::harness::on_path(t.bin) {
-        println!("✓ {} installed ({})", t.name, version_of(t.bin).unwrap_or_else(|| "version unknown".into()));
+        println!(
+            "✓ {} installed ({})",
+            t.name,
+            version_of(t.bin).unwrap_or_else(|| "version unknown".into())
+        );
     } else {
         // Installers default to ~/.local/bin (or npm's prefix), which may not be
         // on PATH in this shell yet — installed-but-unresolvable is the common
@@ -155,7 +171,10 @@ fn install(t: &Tool, yes: bool) -> Result<()> {
 }
 
 fn version_of(bin: &str) -> Option<String> {
-    let out = std::process::Command::new(bin).arg("--version").output().ok()?;
+    let out = std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -167,5 +186,8 @@ fn next_steps(t: &Tool) {
     println!();
     println!("next steps:");
     println!("  1. {}", t.auth_hint);
-    println!("  2. in Mafold: pencil icon → New Bot → Runtime: {}", t.name);
+    println!(
+        "  2. in Mafold: pencil icon → New Bot → Runtime: {}",
+        t.name
+    );
 }

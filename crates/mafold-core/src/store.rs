@@ -54,6 +54,12 @@ struct ConvMeta {
     is_forum: bool,
     #[serde(default)]
     forum_member_channels: bool,
+    #[serde(default)]
+    member_add_members: bool,
+    #[serde(default)]
+    member_edit_info: bool,
+    #[serde(default)]
+    member_add_bots: bool,
     /// DENORMALIZED newest message, kept current as messages are upserted, so the
     /// dialog list reads it directly instead of scanning EVERY message of EVERY
     /// conversation. `#[serde(default)]` so caches written before this field still
@@ -393,6 +399,9 @@ impl<S: Storage> Store<S> {
             participants: c.participants.clone(),
             is_forum: c.is_forum,
             forum_member_channels: c.forum_member_channels,
+            member_add_members: c.member_add_members,
+            member_edit_info: c.member_edit_info,
+            member_add_bots: c.member_add_bots,
             last_message: prior.or_else(|| c.last_message.clone()),
         };
         self.store.put("conv", &c.id, ser(&meta)).await;
@@ -516,6 +525,9 @@ impl<S: Storage> Store<S> {
                 unread_count: meta.unread_count,
                 is_forum: meta.is_forum,
                 forum_member_channels: meta.forum_member_channels,
+                member_add_members: meta.member_add_members,
+                member_edit_info: meta.member_edit_info,
+                member_add_bots: meta.member_add_bots,
                 last_message: meta.last_message,
             });
         }
@@ -656,7 +668,7 @@ mod tests {
     fn acct() -> crate::CoreAccount {
         crate::CoreAccount {
             username: "ops".into(), display_name: "Ops".into(), kind: "human".into(),
-            avatar_url: None, parent_username: None, template: None, language: None,
+            avatar: None, parent_username: None, template: None, language: None,
             verified: false,
         }
     }
@@ -776,6 +788,7 @@ mod tests {
                 id: "convP".into(), kind: "direct".into(), title: None,
                 participants: vec![acct()], updated_at_ms: 0, unread_count: 0,
                 last_message: None, is_forum: false, forum_member_channels: false,
+                member_add_members: false, member_edit_info: false, member_add_bots: false,
             }).await;
             s.upsert_message(&msg("a", "convP", None, 10, None)).await;
             s.upsert_message(&msg("b", "convP", None, 20, None)).await;

@@ -28,7 +28,9 @@ fn path() -> PathBuf {
 }
 
 pub fn load() -> Option<Session> {
-    std::fs::read_to_string(path()).ok().and_then(|s| serde_json::from_str(&s).ok())
+    std::fs::read_to_string(path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
 }
 
 pub fn save(s: &Session) -> Result<()> {

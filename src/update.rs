@@ -58,8 +58,18 @@ pub fn platform_supported() -> bool {
 
 fn parse_semver(v: &str) -> (u64, u64, u64) {
     let v = v.trim().trim_start_matches('v');
-    let mut it = v.split('.').map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0));
-    (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
+    let mut it = v.split('.').map(|p| {
+        p.chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0)
+    });
+    (
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+    )
 }
 fn is_newer(latest: &str, current: &str) -> bool {
     parse_semver(latest) > parse_semver(current)
@@ -124,28 +134,54 @@ async fn latest(http: &reqwest::Client) -> Result<Release> {
         .get(&url)
         .header("User-Agent", "mafold-cli")
         .header("Accept", "application/vnd.github+json")
-        .send().await?
+        .send()
+        .await?
         .error_for_status()?
-        .json().await?;
+        .json()
+        .await?;
     let tag = v["tag_name"].as_str().context("no tag_name")?.to_string();
     let target = target_triple().context("unsupported platform for self-update")?;
     let asset_name = format!("mafold-{target}");
-    let dl = v["assets"].as_array()
-        .and_then(|a| a.iter().find(|x| x["name"].as_str() == Some(&asset_name)).and_then(|x| x["browser_download_url"].as_str()))
-        .with_context(|| format!("release has no asset {asset_name}"))?.to_string();
+    let dl = v["assets"]
+        .as_array()
+        .and_then(|a| {
+            a.iter()
+                .find(|x| x["name"].as_str() == Some(&asset_name))
+                .and_then(|x| x["browser_download_url"].as_str())
+        })
+        .with_context(|| format!("release has no asset {asset_name}"))?
+        .to_string();
     let sha256 = sha256_for(http, &v, &asset_name).await;
-    Ok(Release { version: tag.trim_start_matches('v').to_string(), url: dl, sha256 })
+    Ok(Release {
+        version: tag.trim_start_matches('v').to_string(),
+        url: dl,
+        sha256,
+    })
 }
 
 /// The expected SHA256 for `asset_name`, from its sibling `<asset>.sha256` asset
 /// (published by the release workflow). `None` if the asset is absent or the
 /// fetch fails → `apply` then ABORTS (an unverifiable binary is never swapped in).
-async fn sha256_for(http: &reqwest::Client, release: &serde_json::Value, asset_name: &str) -> Option<String> {
+async fn sha256_for(
+    http: &reqwest::Client,
+    release: &serde_json::Value,
+    asset_name: &str,
+) -> Option<String> {
     let want = format!("{asset_name}.sha256");
-    let url = release["assets"].as_array()?
-        .iter().find(|x| x["name"].as_str() == Some(want.as_str()))
+    let url = release["assets"]
+        .as_array()?
+        .iter()
+        .find(|x| x["name"].as_str() == Some(want.as_str()))
         .and_then(|x| x["browser_download_url"].as_str())?;
-    let text = http.get(url).header("User-Agent", "mafold-cli").send().await.ok()?.text().await.ok()?;
+    let text = http
+        .get(url)
+        .header("User-Agent", "mafold-cli")
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
     text.split_whitespace().next().map(|s| s.to_string())
 }
 
@@ -160,8 +196,14 @@ fn binary_path() -> Result<PathBuf> {
 struct Lock(#[allow(dead_code)] std::fs::File);
 fn acquire_lock() -> Result<Lock> {
     let p = mafold_dir().join("update.lock");
-    if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
-    let f = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&p)?;
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&p)?;
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -174,18 +216,28 @@ fn acquire_lock() -> Result<Lock> {
     Ok(Lock(f)) // released when the File (handle) drops
 }
 
-fn stamp_path() -> PathBuf { mafold_dir().join("installed-version") }
-fn read_stamp() -> Option<String> { std::fs::read_to_string(stamp_path()).ok().map(|s| s.trim().to_string()) }
+fn stamp_path() -> PathBuf {
+    mafold_dir().join("installed-version")
+}
+fn read_stamp() -> Option<String> {
+    std::fs::read_to_string(stamp_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+}
 
 // ── supervisor update nudge ──
-fn nudge_path() -> PathBuf { mafold_dir().join("update-nudge") }
+fn nudge_path() -> PathBuf {
+    mafold_dir().join("update-nudge")
+}
 /// Ask the supervisor to run an update check NOW. A `--no-auto-update` agent
 /// child writes this on `events.cliUpdate` (supervised mode) so the SUPERVISOR —
 /// which owns updates and respawns children — applies it, instead of the child
 /// self-re-execing out from under the supervisor.
 pub fn request_nudge() {
     let p = nudge_path();
-    if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
     let _ = std::fs::write(p, b"");
 }
 /// Consume a pending update nudge (true if one was set). The supervisor checks
@@ -249,7 +301,8 @@ fn binary_is(bin: &Path, version: &str) -> bool {
 // nudge, spamming the log and wasting bandwidth forever. Remember the version
 // that just failed and skip re-attempts for a while; a manual `mafold update`
 // is not throttled (it never consults this).
-static LAST_FAILED: std::sync::Mutex<Option<(String, std::time::Instant)>> = std::sync::Mutex::new(None);
+static LAST_FAILED: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
 const FAILURE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Record that auto-updating to `version` just failed (starts the cooldown).
@@ -284,7 +337,12 @@ pub async fn check(http: &reqwest::Client) -> Result<Option<Release>> {
 
 /// Safely download + verify + swap in the binary. Coordinated across processes
 /// via flock + a version stamp (a concurrent updater either wins or no-ops).
-pub async fn apply(http: &reqwest::Client, url: &str, version: &str, sha256: Option<&str>) -> Result<()> {
+pub async fn apply(
+    http: &reqwest::Client,
+    url: &str,
+    version: &str,
+    sha256: Option<&str>,
+) -> Result<()> {
     let _lock = acquire_lock()?;
     let bin = binary_path()?;
     // Someone else already installed this version while we waited on the lock —
@@ -311,7 +369,14 @@ pub async fn apply(http: &reqwest::Client, url: &str, version: &str, sha256: Opt
     let want = sha256.context(
         "release is missing its .sha256 checksum asset — refusing to update an unverifiable binary",
     )?;
-    let bytes = http.get(url).header("User-Agent", "mafold-cli").send().await?.error_for_status()?.bytes().await?;
+    let bytes = http
+        .get(url)
+        .header("User-Agent", "mafold-cli")
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
     let got = sha256_hex(&bytes);
     if !got.eq_ignore_ascii_case(want) {
         anyhow::bail!("checksum mismatch (want {want}, got {got}) — refusing to update");
@@ -384,18 +449,27 @@ pub fn rollback() -> Result<()> {
     let bin = binary_path()?;
     let backup = bin.with_file_name("mafold.old");
     if !backup.exists() {
-        anyhow::bail!("no backup to roll back to (looked for {})", backup.display());
+        anyhow::bail!(
+            "no backup to roll back to (looked for {})",
+            backup.display()
+        );
     }
     install_running_binary(&backup, &bin, false)?;
     let _ = std::fs::remove_file(stamp_path());
-    println!("✓ rolled back to the previous binary ({})", backup.display());
+    println!(
+        "✓ rolled back to the previous binary ({})",
+        backup.display()
+    );
     Ok(())
 }
 
 /// Check + update if newer. Returns the new version if updated. (`mafold update`)
 pub async fn update_to_latest(http: &reqwest::Client) -> Result<Option<String>> {
     match check(http).await? {
-        Some(r) => { apply(http, &r.url, &r.version, r.sha256.as_deref()).await?; Ok(Some(r.version)) }
+        Some(r) => {
+            apply(http, &r.url, &r.version, r.sha256.as_deref()).await?;
+            Ok(Some(r.version))
+        }
         None => Ok(None),
     }
 }

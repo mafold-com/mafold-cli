@@ -20,7 +20,7 @@ wasm_bindgen_test_configure!(run_in_browser);
 fn acct() -> CoreAccount {
     CoreAccount {
         username: "ops".into(), display_name: "Ops".into(), kind: "human".into(),
-        avatar_url: None, parent_username: None, template: None, language: None,
+        avatar: None, parent_username: None, template: None, language: None,
         verified: false,
     }
 }

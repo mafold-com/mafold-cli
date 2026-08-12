@@ -19,6 +19,20 @@ pub(crate) struct Captured {
     pub path: String,
     pub auth: Option<String>,
     pub body: String,
+    /// Every request header, names lowercased.
+    ///
+    /// `auth` above predates this and stays for its existing callers. The full
+    /// set exists because a provider's credential does not always ride in
+    /// `Authorization` — Figma's MCP server insists on `X-Figma-Token` — and a
+    /// test that could only see one header could not tell the two apart.
+    pub headers: Vec<(String, String)>,
+}
+
+impl Captured {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let want = name.to_ascii_lowercase();
+        self.headers.iter().find(|(k, _)| *k == want).map(|(_, v)| v.as_str())
+    }
 }
 
 pub(crate) struct MockApi {
@@ -118,8 +132,16 @@ async fn serve_one(
         let (k, v) = l.split_once(':')?;
         k.eq_ignore_ascii_case("authorization").then(|| v.trim().to_string())
     });
+    let headers: Vec<(String, String)> = head
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            Some((k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        })
+        .collect();
     let req_body = String::from_utf8_lossy(&buf[header_end..header_end + content_length]).to_string();
-    reqs.lock().unwrap().push(Captured { path, auth, body: req_body });
+    reqs.lock().unwrap().push(Captured { path, auth, body: req_body, headers });
 
     let resp = format!(
         "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",

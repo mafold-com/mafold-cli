@@ -13,7 +13,7 @@ impl From<&wire::Account> for CoreAccount {
             username: a.username.clone(),
             display_name: a.display_name.clone(),
             kind: if a.kind == wire::AccountKind::Bot { "bot" } else { "human" }.to_string(),
-            avatar_url: a.avatar_url.clone(),
+            avatar: a.avatar.as_ref().map(Into::into),
             parent_username: a.parent_username.clone(),
             template: a.template.clone(),
             language: a.language.clone(),
@@ -52,6 +52,9 @@ impl From<&wire::Conversation> for CoreConversation {
             unread_count: c.unread_count,
             is_forum: c.is_forum,
             forum_member_channels: c.forum_member_channels,
+            member_add_members: c.member_perms.add_members,
+            member_edit_info: c.member_perms.edit_info,
+            member_add_bots: c.member_perms.add_bots,
             last_message: c.last_message.as_ref().map(CoreMessage::from),
         }
     }

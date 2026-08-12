@@ -15,18 +15,19 @@ mod cardtags;
 mod channels;
 mod client;
 mod commands;
-mod connector;
+mod connection;
 mod daemon;
 mod discover;
 mod harness;
 mod install;
 mod langpack;
-mod session;
 mod platform;
 mod render;
 mod room;
+mod session;
 mod supervisor;
 mod update;
+mod vault;
 mod wallet;
 
 use anyhow::{Context, Result};
@@ -34,9 +35,18 @@ use clap::{Parser, Subcommand};
 use client::{Client, Dest};
 
 #[derive(Parser)]
-#[command(name = "mafold", version, about = "Mafold from your terminal — CLI client + coding-agent daemon (Claude Code, Codex, …)")]
+#[command(
+    name = "mafold",
+    version,
+    about = "Mafold from your terminal — CLI client + coding-agent daemon (Claude Code, Codex, …)"
+)]
 struct Cli {
-    #[arg(long, env = "MAFOLD_BASE", default_value = "https://api.mafold.com", global = true)]
+    #[arg(
+        long,
+        env = "MAFOLD_BASE",
+        default_value = "https://api.mafold.com",
+        global = true
+    )]
     base: String,
     #[arg(long, env = "MAFOLD_BOT_TOKEN", global = true)]
     token: Option<String>,
@@ -92,11 +102,13 @@ enum Cmd {
         #[arg(trailing_var_arg = true, required = true)]
         text: Vec<String>,
     },
-    /// Attach local image files to the reply you are streaming right now.
-    /// Run by an AGENT mid-turn (the daemon presets MAFOLD_DRAFT), so a picture
-    /// it just made arrives in the same bubble as the text about it.
+    /// Attach local files to the reply you are streaming right now — images,
+    /// clips, documents. Run by an AGENT mid-turn (the daemon presets
+    /// MAFOLD_DRAFT), so what it just made arrives in the same bubble as the
+    /// text about it. The kind is read from the bytes: an image becomes a photo,
+    /// a clip becomes a player, anything else becomes a file card.
     Attach {
-        /// Image files on this machine.
+        /// Files on this machine.
         #[arg(required = true)]
         files: Vec<String>,
         /// Message to attach to. Defaults to `$MAFOLD_DRAFT` — the in-flight
@@ -108,6 +120,13 @@ enum Cmd {
     Channels {
         #[command(subcommand)]
         cmd: channels::ChannelsCmd,
+    },
+    /// Your credentials at third parties (Claude Code, Anthropic, OpenAI,
+    /// Codex, Notion, Figma) — encrypted so only your own devices can read
+    /// them. `mafold connection list` to see them.
+    Connection {
+        #[command(subcommand)]
+        cmd: connection::ConnectionCmd,
     },
     /// Token wallet: balances / transfer / convert / rates / history / grants.
     Wallet {
@@ -130,14 +149,6 @@ enum Cmd {
     Room {
         #[command(subcommand)]
         cmd: room::RoomCmd,
-    },
-    /// Ask a connector (@notion, @github) for something on a person's own
-    /// credential — the agent side of the no-model/no-credential split. Needs a
-    /// grant they minted with `/allow @<this bot>`. Conversation via `--conv` /
-    /// `MAFOLD_CONV`; auth via `--token` / `MAFOLD_BOT_TOKEN`.
-    Connector {
-        #[command(subcommand)]
-        cmd: connector::ConnectorCmd,
     },
     /// Publish the cloud language packs (langpacks/*.json) — first-party only.
     Langpack {
@@ -213,14 +224,20 @@ async fn main() -> Result<()> {
 
     // The AskUserQuestion hook is invoked by claude (a child of the daemon) and
     // needs no auth — it just bridges stdin/the answer file. Handle it first.
-    if matches!(cli.cmd, Cmd::AskHook) { return ask_hook::run(); }
-    if matches!(cli.cmd, Cmd::BashHook) { return bash_hook::run(); }
+    if matches!(cli.cmd, Cmd::AskHook) {
+        return ask_hook::run();
+    }
+    if matches!(cli.cmd, Cmd::BashHook) {
+        return bash_hook::run();
+    }
 
     // Daemon control + self-update need no auth.
-    if matches!(cli.cmd, Cmd::Stop) { return daemon::stop(); }
+    if matches!(cli.cmd, Cmd::Stop) {
+        return daemon::stop();
+    }
     if matches!(cli.cmd, Cmd::Status) {
         let _ = daemon::status(); // legacy single `agent --detach`
-        supervisor::status();     // multi-daemon config
+        supervisor::status(); // multi-daemon config
         return Ok(());
     }
     match &cli.cmd {
@@ -255,71 +272,114 @@ async fn main() -> Result<()> {
     }
     // Cards: init/dev need no token; publish/list check for one themselves.
     if matches!(cli.cmd, Cmd::Cards { .. }) {
-        let Cmd::Cards { cmd } = cli.cmd else { unreachable!() };
+        let Cmd::Cards { cmd } = cli.cmd else {
+            unreachable!()
+        };
         return cards::run(cmd, cli.base, cli.token).await;
     }
     // Apps: init/dev need no token; publish/list/remove check for one themselves.
     if matches!(cli.cmd, Cmd::Apps { .. }) {
-        let Cmd::Apps { cmd } = cli.cmd else { unreachable!() };
+        let Cmd::Apps { cmd } = cli.cmd else {
+            unreachable!()
+        };
         return apps::run(cmd, cli.base, cli.token).await;
     }
     // Room: the AI's CRDT room peer. Auth via --token / MAFOLD_BOT_TOKEN.
     if matches!(cli.cmd, Cmd::Room { .. }) {
-        let Cmd::Room { cmd } = cli.cmd else { unreachable!() };
+        let Cmd::Room { cmd } = cli.cmd else {
+            unreachable!()
+        };
         return room::run(cmd, cli.base, cli.token).await;
-    }
-    // Connector: reach @notion / @github on a person's own credential, via the
-    // grant they minted with `/allow`. Bot token — the caller IS the agent.
-    if matches!(cli.cmd, Cmd::Connector { .. }) {
-        let Cmd::Connector { cmd } = cli.cmd else { unreachable!() };
-        return connector::run(cmd, cli.base, cli.token).await;
     }
     // Langpack: publish/list check for the first-party token themselves.
     if matches!(cli.cmd, Cmd::Langpack { .. }) {
-        let Cmd::Langpack { cmd } = cli.cmd else { unreachable!() };
+        let Cmd::Langpack { cmd } = cli.cmd else {
+            unreachable!()
+        };
         return langpack::run(cmd, cli.base, cli.token).await;
     }
     // Human control plane: `login` mints the s_ session; `report` uses it. No bot token.
     if matches!(cli.cmd, Cmd::Login { .. }) {
-        let Cmd::Login { username, password } = cli.cmd else { unreachable!() };
+        let Cmd::Login { username, password } = cli.cmd else {
+            unreachable!()
+        };
         return login(&cli.base, username, password).await;
     }
     if matches!(cli.cmd, Cmd::Report) {
         return report_harnesses(&cli.base).await;
+    }
+    // Connections are the PERSON's, so they run on the human session too — a bot
+    // token must never be able to enumerate its owner's credentials.
+    if let Cmd::Connection { cmd } = cli.cmd {
+        return connection::run(&cli.base, cmd).await;
     }
     // Machine setup — no account or token involved at all.
     if let Cmd::Install { tool, yes } = &cli.cmd {
         return install::run(tool.as_deref().unwrap_or(""), *yes);
     }
 
-    let token = cli
-        .token
-        .context("set --token or $MAFOLD_BOT_TOKEN (your bot's mb_ token — create a bot in the Mafold app)")?;
+    let token = cli.token.context(
+        "set --token or $MAFOLD_BOT_TOKEN (your bot's mb_ token — create a bot in the Mafold app)",
+    )?;
 
     match cli.cmd {
-        Cmd::Agent { workdir, harness, detach } => {
+        Cmd::Agent {
+            workdir,
+            harness,
+            detach,
+        } => {
             // An explicit --workdir wins; if omitted, the server owner-config (or
             // the current dir) decides at runtime. Resolve an explicit one to an
             // absolute path so the agent — and the detached child, which has a
             // different cwd — both operate on the same real directory.
             let workdir = workdir.map(|w| {
-                std::fs::canonicalize(&w).map(|p| p.to_string_lossy().into_owned()).unwrap_or(w)
+                std::fs::canonicalize(&w)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or(w)
             });
             if detach {
-                let pid = daemon::start_detached(&cli.base, &token, workdir.as_deref(), &harness, cli.no_auto_update)?;
-                if let Some(w) = &workdir { println!("  workdir: {w}"); }
+                let pid = daemon::start_detached(
+                    &cli.base,
+                    &token,
+                    workdir.as_deref(),
+                    &harness,
+                    cli.no_auto_update,
+                )?;
+                if let Some(w) = &workdir {
+                    println!("  workdir: {w}");
+                }
                 println!("✓ agent running in background (pid {pid})");
                 println!("  logs:   ~/.mafold/agent.log");
                 println!("  status: mafold status");
                 println!("  stop:   mafold stop");
             } else {
-                agent::run(Client::new(cli.base, token), workdir, harness, !cli.no_auto_update).await?;
+                agent::run(
+                    Client::new(cli.base, token),
+                    workdir,
+                    harness,
+                    !cli.no_auto_update,
+                )
+                .await?;
             }
         }
-        Cmd::Add { name, workdir, harness } => supervisor::add(name, token, workdir, harness, &cli.base, cli.no_auto_update)?,
+        Cmd::Add {
+            name,
+            workdir,
+            harness,
+        } => supervisor::add(name, token, workdir, harness, &cli.base, cli.no_auto_update)?,
         Cmd::Chats => chats(&Client::new(cli.base, token)).await?,
-        Cmd::Send { chat, channel, text } => {
-            send(&Client::new(cli.base, token), &chat, channel.as_deref(), &text.join(" ")).await?
+        Cmd::Send {
+            chat,
+            channel,
+            text,
+        } => {
+            send(
+                &Client::new(cli.base, token),
+                &chat,
+                channel.as_deref(),
+                &text.join(" "),
+            )
+            .await?
         }
         Cmd::Attach { files, message } => {
             attach(&Client::new(cli.base, token), &files, message.as_deref()).await?
@@ -327,7 +387,7 @@ async fn main() -> Result<()> {
         Cmd::Channels { cmd } => channels::run(cmd, &Client::new(cli.base, token)).await?,
         Cmd::Wallet { cmd } => wallet::run(cmd, &Client::new(cli.base, token)).await?,
         Cmd::Stop | Cmd::Status | Cmd::Update | Cmd::Install { .. } | Cmd::Cards { .. }
-        | Cmd::Apps { .. } | Cmd::Room { .. } | Cmd::Connector { .. }
+        | Cmd::Apps { .. } | Cmd::Room { .. } | Cmd::Connection { .. }
         | Cmd::Langpack { .. } | Cmd::Login { .. } | Cmd::Report
         | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
         | Cmd::Rollback | Cmd::Supervise { .. } | Cmd::AskHook | Cmd::BashHook => unreachable!(),
@@ -335,7 +395,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn prompt(label: &str) -> String {
+pub(crate) fn prompt(label: &str) -> String {
     use std::io::Write;
     print!("{label}");
     let _ = std::io::stdout().flush();
@@ -345,7 +405,7 @@ fn prompt(label: &str) -> String {
 }
 
 /// Read a secret without echoing (Unix: toggle the tty via `stty`).
-fn prompt_password(label: &str) -> String {
+pub(crate) fn prompt_password(label: &str) -> String {
     use std::io::Write;
     print!("{label}");
     let _ = std::io::stdout().flush();
@@ -370,14 +430,29 @@ async fn login(base: &str, username: Option<String>, password: Option<String>) -
     let resp: serde_json::Value = http
         .post(format!("{base}/api/auth/login"))
         .json(&serde_json::json!({ "username": username, "password": password }))
-        .send().await.context("login request failed")?
-        .json().await.context("login: non-JSON response")?;
+        .send()
+        .await
+        .context("login request failed")?
+        .json()
+        .await
+        .context("login: non-JSON response")?;
     if resp.get("ok").and_then(|v| v.as_bool()) == Some(false) {
-        anyhow::bail!("login failed: {}", resp["description"].as_str().unwrap_or("check username/password"));
+        anyhow::bail!(
+            "login failed: {}",
+            resp["description"]
+                .as_str()
+                .unwrap_or("check username/password")
+        );
     }
     let result = &resp["result"];
-    let token = result["token"].as_str().context("login: no token in response")?.to_string();
-    let uname = result["user"]["username"].as_str().unwrap_or(&username).to_string();
+    let token = result["token"]
+        .as_str()
+        .context("login: no token in response")?
+        .to_string();
+    let uname = result["user"]["username"]
+        .as_str()
+        .unwrap_or(&username)
+        .to_string();
     finish_login(base, token, uname).await
 }
 
@@ -392,9 +467,14 @@ async fn login_device(base: &str) -> Result<()> {
         .send().await.context("device/start failed")?
         .json().await.context("device/start: non-JSON response")?;
     let r = &start["result"];
-    let device_code = r["device_code"].as_str().context("device/start: no device_code")?.to_string();
+    let device_code = r["device_code"]
+        .as_str()
+        .context("device/start: no device_code")?
+        .to_string();
     let user_code = r["user_code"].as_str().unwrap_or("");
-    let verify_url = r["verify_url"].as_str().unwrap_or("https://mafold.com/login/device");
+    let verify_url = r["verify_url"]
+        .as_str()
+        .unwrap_or("https://mafold.com/login/device");
     let interval = r["interval"].as_u64().unwrap_or(3).max(1);
 
     println!("\n  Open this URL in your browser:  {verify_url}");
@@ -406,12 +486,22 @@ async fn login_device(base: &str) -> Result<()> {
         let poll: serde_json::Value = http
             .post(format!("{base}/api/auth/device/poll"))
             .json(&serde_json::json!({ "device_code": device_code }))
-            .send().await.context("device/poll failed")?
-            .json().await.context("device/poll: non-JSON response")?;
+            .send()
+            .await
+            .context("device/poll failed")?
+            .json()
+            .await
+            .context("device/poll: non-JSON response")?;
         match poll["result"]["status"].as_str().unwrap_or("") {
             "approved" => {
-                let token = poll["result"]["token"].as_str().context("approved but no token")?.to_string();
-                let uname = poll["result"]["username"].as_str().unwrap_or("").to_string();
+                let token = poll["result"]["token"]
+                    .as_str()
+                    .context("approved but no token")?
+                    .to_string();
+                let uname = poll["result"]["username"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
                 return finish_login(base, token, uname).await;
             }
             "expired" => anyhow::bail!("that code expired — run `mafold login` again"),
@@ -443,12 +533,12 @@ async fn report_harnesses(base: &str) -> Result<()> {
 }
 
 async fn report_with(base: &str, sess: &session::Session) -> Result<()> {
-    let probed = harness::probe_with_versions();
-    let harnesses: Vec<serde_json::Value> = probed
+    let harnesses = harness::report_rows().await;
+    let avail: Vec<&str> = harnesses
         .iter()
-        .map(|(id, available, version)| serde_json::json!({ "id": id, "available": available, "version": version }))
+        .filter(|h| h["available"].as_bool() == Some(true))
+        .filter_map(|h| h["id"].as_str())
         .collect();
-    let avail: Vec<&str> = probed.iter().filter(|(_, a, _)| *a).map(|(id, _, _)| *id).collect();
     Client::new(base.to_string(), sess.token.clone())
         .call(
             "reportHarnesses",
@@ -464,7 +554,11 @@ async fn report_with(base: &str, sess: &session::Session) -> Result<()> {
     println!(
         "✓ reported harnesses on {} — available: {}",
         sess.device_name,
-        if avail.is_empty() { "(none detected)".to_string() } else { avail.join(", ") }
+        if avail.is_empty() {
+            "(none detected)".to_string()
+        } else {
+            avail.join(", ")
+        }
     );
     Ok(())
 }
@@ -481,13 +575,23 @@ async fn chats(client: &Client) -> Result<()> {
     for c in items {
         let title = c["title"].as_str().map(str::to_string).unwrap_or_else(|| {
             // DM → the other participant's display name.
-            c["participants"].as_array().and_then(|ps| {
-                ps.iter().find(|p| p["username"].as_str().map(str::to_lowercase) != Some(my.clone()))
-            }).and_then(|p| p["display_name"].as_str()).unwrap_or("Chat").to_string()
+            c["participants"]
+                .as_array()
+                .and_then(|ps| {
+                    ps.iter()
+                        .find(|p| p["username"].as_str().map(str::to_lowercase) != Some(my.clone()))
+                })
+                .and_then(|p| p["display_name"].as_str())
+                .unwrap_or("Chat")
+                .to_string()
         });
         let preview = c["last_message"]["content"].as_str().unwrap_or("—");
         let unread = c["unread_count"].as_u64().unwrap_or(0);
-        let badge = if unread > 0 { format!("  ({unread})") } else { String::new() };
+        let badge = if unread > 0 {
+            format!("  ({unread})")
+        } else {
+            String::new()
+        };
         let oneline = preview.replace('\n', " ");
         let oneline = if oneline.chars().count() > 60 {
             format!("{}…", oneline.chars().take(60).collect::<String>())
@@ -499,10 +603,12 @@ async fn chats(client: &Client) -> Result<()> {
     Ok(())
 }
 
-/// Hang local images on a message we authored — the general door for "the agent
-/// made a picture, put it in the reply". Codex's own generated images are swept
+/// Hang local files on a message we authored — the general door for "the agent
+/// made something, put it in the reply". Images become photo bubbles, clips
+/// become players, everything else becomes a file card (the kind is decided from
+/// the bytes in `Client::attach_media`). Codex's own generated images are swept
 /// up without this (see `harness::codex::ImageSweep`); every other harness, and
-/// anything an agent draws with a script, comes through here.
+/// anything an agent writes with a script, comes through here.
 async fn attach(client: &Client, files: &[String], message: Option<&str>) -> Result<()> {
     let msg = match message {
         Some(m) => m.to_string(),
@@ -514,7 +620,7 @@ async fn attach(client: &Client, files: &[String], message: Option<&str>) -> Res
     for f in files {
         let path = std::path::Path::new(f);
         client
-            .attach_photo(&msg, path)
+            .attach_media(&msg, path)
             .await
             .with_context(|| format!("attaching {}", path.display()))?;
         println!("✓ attached {}", path.display());
@@ -527,7 +633,9 @@ async fn send(client: &Client, chat: &str, channel: Option<&str>, text: &str) ->
         Some(ch) => {
             let (chat_id, ch) = channels::resolve(client, chat, ch).await?;
             let name = ch["name"].as_str().unwrap_or("?");
-            client.send_to(Dest::chat(&chat_id).channel(ch["id"].as_str()), text).await?;
+            client
+                .send_to(Dest::chat(&chat_id).channel(ch["id"].as_str()), text)
+                .await?;
             println!("✓ sent to {chat} #{name}");
         }
         None => {

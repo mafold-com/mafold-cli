@@ -26,9 +26,17 @@ pub enum ChannelsCmd {
         icon: Option<String>,
     },
     /// Rename a channel.
-    Rename { chat: String, channel: String, name: String },
+    Rename {
+        chat: String,
+        channel: String,
+        name: String,
+    },
     /// Set a channel's emoji icon; omit <icon> to clear it.
-    Icon { chat: String, channel: String, icon: Option<String> },
+    Icon {
+        chat: String,
+        channel: String,
+        icon: Option<String>,
+    },
     /// Close a channel (read-only lock; history stays, reopen anytime).
     Close { chat: String, channel: String },
     /// Reopen a closed channel.
@@ -78,39 +86,76 @@ pub async fn run(cmd: ChannelsCmd, client: &Client) -> Result<()> {
                 if unread > 0 {
                     marks.push(format!("{unread} unread"));
                 }
-                let suffix = if marks.is_empty() { String::new() } else { format!("  ({})", marks.join(", ")) };
-                println!("{icon} {name}{suffix}\n  id: {}", c["id"].as_str().unwrap_or("?"));
+                let suffix = if marks.is_empty() {
+                    String::new()
+                } else {
+                    format!("  ({})", marks.join(", "))
+                };
+                println!(
+                    "{icon} {name}{suffix}\n  id: {}",
+                    c["id"].as_str().unwrap_or("?")
+                );
             }
         }
         ChannelsCmd::Create { chat, name, icon } => {
             let chat_id = client.resolve_chat(&chat).await?;
-            let ch = client.create_channel(&chat_id, &name, icon.as_deref()).await?;
-            println!("✓ created #{} (id {})", ch["name"].as_str().unwrap_or(&name), ch["id"].as_str().unwrap_or("?"));
+            let ch = client
+                .create_channel(&chat_id, &name, icon.as_deref())
+                .await?;
+            println!(
+                "✓ created #{} (id {})",
+                ch["name"].as_str().unwrap_or(&name),
+                ch["id"].as_str().unwrap_or("?")
+            );
         }
-        ChannelsCmd::Rename { chat, channel, name } => {
+        ChannelsCmd::Rename {
+            chat,
+            channel,
+            name,
+        } => {
             let (chat_id, ch) = resolve(client, &chat, &channel).await?;
-            client.edit_channel(&chat_id, &id(&ch)?, Some(&name), None).await?;
-            println!("✓ renamed #{} → #{}", ch["name"].as_str().unwrap_or("?"), name);
+            client
+                .edit_channel(&chat_id, &id(&ch)?, Some(&name), None)
+                .await?;
+            println!(
+                "✓ renamed #{} → #{}",
+                ch["name"].as_str().unwrap_or("?"),
+                name
+            );
         }
-        ChannelsCmd::Icon { chat, channel, icon } => {
+        ChannelsCmd::Icon {
+            chat,
+            channel,
+            icon,
+        } => {
             let (chat_id, ch) = resolve(client, &chat, &channel).await?;
             // The API contract: Some("") clears, absent = unchanged.
             let icon = icon.unwrap_or_default();
-            client.edit_channel(&chat_id, &id(&ch)?, None, Some(&icon)).await?;
+            client
+                .edit_channel(&chat_id, &id(&ch)?, None, Some(&icon))
+                .await?;
             if icon.is_empty() {
                 println!("✓ cleared icon on #{}", ch["name"].as_str().unwrap_or("?"));
             } else {
-                println!("✓ set icon {icon} on #{}", ch["name"].as_str().unwrap_or("?"));
+                println!(
+                    "✓ set icon {icon} on #{}",
+                    ch["name"].as_str().unwrap_or("?")
+                );
             }
         }
         ChannelsCmd::Close { chat, channel } => {
             let (chat_id, ch) = resolve(client, &chat, &channel).await?;
             client.set_channel_closed(&chat_id, &id(&ch)?, true).await?;
-            println!("✓ closed #{} (read-only; `reopen` to unlock)", ch["name"].as_str().unwrap_or("?"));
+            println!(
+                "✓ closed #{} (read-only; `reopen` to unlock)",
+                ch["name"].as_str().unwrap_or("?")
+            );
         }
         ChannelsCmd::Reopen { chat, channel } => {
             let (chat_id, ch) = resolve(client, &chat, &channel).await?;
-            client.set_channel_closed(&chat_id, &id(&ch)?, false).await?;
+            client
+                .set_channel_closed(&chat_id, &id(&ch)?, false)
+                .await?;
             println!("✓ reopened #{}", ch["name"].as_str().unwrap_or("?"));
         }
         ChannelsCmd::Pin { chat, channel } => {
@@ -120,17 +165,26 @@ pub async fn run(cmd: ChannelsCmd, client: &Client) -> Result<()> {
         }
         ChannelsCmd::Unpin { chat, channel } => {
             let (chat_id, ch) = resolve(client, &chat, &channel).await?;
-            client.set_channel_pinned(&chat_id, &id(&ch)?, false).await?;
+            client
+                .set_channel_pinned(&chat_id, &id(&ch)?, false)
+                .await?;
             println!("✓ unpinned #{}", ch["name"].as_str().unwrap_or("?"));
         }
         ChannelsCmd::Archive { chat, channel } => {
             let (chat_id, ch) = resolve(client, &chat, &channel).await?;
-            client.set_channel_archived(&chat_id, &id(&ch)?, true).await?;
-            println!("✓ archived #{} (still writable; `unarchive` to bring it back)", ch["name"].as_str().unwrap_or("?"));
+            client
+                .set_channel_archived(&chat_id, &id(&ch)?, true)
+                .await?;
+            println!(
+                "✓ archived #{} (still writable; `unarchive` to bring it back)",
+                ch["name"].as_str().unwrap_or("?")
+            );
         }
         ChannelsCmd::Unarchive { chat, channel } => {
             let (chat_id, ch) = resolve(client, &chat, &channel).await?;
-            client.set_channel_archived(&chat_id, &id(&ch)?, false).await?;
+            client
+                .set_channel_archived(&chat_id, &id(&ch)?, false)
+                .await?;
             println!("✓ unarchived #{}", ch["name"].as_str().unwrap_or("?"));
         }
         ChannelsCmd::Delete { chat, channel, yes } => {
@@ -151,7 +205,12 @@ fn id(ch: &Value) -> Result<String> {
 }
 
 async fn fetch(client: &Client, chat_id: &str) -> Result<Vec<Value>> {
-    Ok(client.list_channels(chat_id).await?.as_array().cloned().unwrap_or_default())
+    Ok(client
+        .list_channels(chat_id)
+        .await?
+        .as_array()
+        .cloned()
+        .unwrap_or_default())
 }
 
 /// Resolve `<chat>` + `<channel>` (channel id, or name with optional `#`) to
@@ -164,7 +223,13 @@ pub async fn resolve(client: &Client, chat: &str, channel: &str) -> Result<(Stri
     let found = channels
         .iter()
         .find(|c| c["id"].as_str() == Some(want))
-        .or_else(|| channels.iter().find(|c| c["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(want))));
+        .or_else(|| {
+            channels.iter().find(|c| {
+                c["name"]
+                    .as_str()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(want))
+            })
+        });
     match found {
         Some(c) => Ok((chat_id, c.clone())),
         None => {
@@ -174,7 +239,11 @@ pub async fn resolve(client: &Client, chat: &str, channel: &str) -> Result<(Stri
                 .collect();
             bail!(
                 "no channel `{channel}` here — channels: {}",
-                if names.is_empty() { "(none)".to_string() } else { names.join(", ") }
+                if names.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    names.join(", ")
+                }
             )
         }
     }

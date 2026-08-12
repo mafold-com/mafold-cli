@@ -23,17 +23,32 @@ const RESERVED: &[&str] = &["clear", "new", "stop", "model", "status", "cwd", "h
 /// /logout); terminal-only ones reply with a note; the rest forward to `claude`.
 /// (Removed in current versions and excluded: `pr-comments`, `vim`.)
 const BUILTINS: &[(&str, &str)] = &[
-    ("add-dir", "Add a working directory for file access this session"),
-    ("advisor", "Enable/disable the advisor tool for model guidance"),
+    (
+        "add-dir",
+        "Add a working directory for file access this session",
+    ),
+    (
+        "advisor",
+        "Enable/disable the advisor tool for model guidance",
+    ),
     ("agents", "Manage / list subagent configurations"),
-    ("autofix-pr", "Watch a PR and push fixes on CI failures/comments"),
+    (
+        "autofix-pr",
+        "Watch a PR and push fixes on CI failures/comments",
+    ),
     ("background", "Detach the session as a background agent"),
-    ("batch", "Decompose large codebase changes into parallel tasks"),
+    (
+        "batch",
+        "Decompose large codebase changes into parallel tasks",
+    ),
     ("branch", "Create a conversation branch at this point"),
     ("btw", "Ask a quick side question without bloating history"),
     ("cd", "Move the session to a new working directory"),
     ("chrome", "Configure Claude in Chrome"),
-    ("claude-api", "Load the Claude API reference + language helpers"),
+    (
+        "claude-api",
+        "Load the Claude API reference + language helpers",
+    ),
     ("code-review", "Review the diff for bugs and cleanups"),
     ("color", "Set the prompt bar color"),
     ("compact", "Summarize the conversation to free up context"),
@@ -42,7 +57,10 @@ const BUILTINS: &[(&str, &str)] = &[
     ("copy", "Copy the last response to the clipboard"),
     ("cost", "Show session cost and usage"),
     ("debug", "Enable debug logging and troubleshoot"),
-    ("deep-research", "Fan out web searches and synthesize a report"),
+    (
+        "deep-research",
+        "Fan out web searches and synthesize a report",
+    ),
     ("desktop", "Continue the session in the Desktop app"),
     ("diff", "Open the interactive diff viewer"),
     ("doctor", "Diagnose and verify the Claude Code install"),
@@ -51,7 +69,10 @@ const BUILTINS: &[(&str, &str)] = &[
     ("export", "Export the conversation as plain text"),
     ("fast", "Toggle fast mode"),
     ("feedback", "Submit feedback or report a bug"),
-    ("fewer-permission-prompts", "Scan transcripts to reduce permission prompts"),
+    (
+        "fewer-permission-prompts",
+        "Scan transcripts to reduce permission prompts",
+    ),
     ("focus", "Toggle focus view"),
     ("fork", "Spawn a forked subagent on a directive"),
     ("goal", "Set a goal for Claude to work toward"),
@@ -80,18 +101,30 @@ const BUILTINS: &[(&str, &str)] = &[
     ("release-notes", "View the changelog"),
     ("reload-plugins", "Reload active plugins without restarting"),
     ("reload-skills", "Re-scan skill directories for new skills"),
-    ("remote-control", "Make the session available for remote control"),
-    ("remote-env", "Choose the default environment for cloud agents"),
+    (
+        "remote-control",
+        "Make the session available for remote control",
+    ),
+    (
+        "remote-env",
+        "Choose the default environment for cloud agents",
+    ),
     ("rename", "Rename the current session"),
     ("resume", "Resume a conversation by ID or name"),
     ("review", "Review a pull request"),
     ("rewind", "Rewind the conversation/code to a previous point"),
     ("run", "Launch and drive the project app"),
-    ("run-skill-generator", "Teach /run and /verify to build/launch the app"),
+    (
+        "run-skill-generator",
+        "Teach /run and /verify to build/launch the app",
+    ),
     ("sandbox", "Toggle sandbox mode"),
     ("schedule", "Create/list/run scheduled cloud routines"),
     ("scroll-speed", "Adjust mouse wheel scroll speed"),
-    ("security-review", "Analyze pending changes for security issues"),
+    (
+        "security-review",
+        "Analyze pending changes for security issues",
+    ),
     ("setup-bedrock", "Configure Amazon Bedrock authentication"),
     ("setup-vertex", "Configure Google Vertex AI authentication"),
     ("simplify", "Review code for cleanup and apply fixes"),
@@ -101,12 +134,18 @@ const BUILTINS: &[(&str, &str)] = &[
     ("stickers", "Order Claude Code stickers"),
     ("tasks", "View background tasks"),
     ("team-onboarding", "Generate a team onboarding guide"),
-    ("teleport", "Pull a Claude Code web session into the terminal"),
+    (
+        "teleport",
+        "Pull a Claude Code web session into the terminal",
+    ),
     ("terminal-setup", "Configure terminal keybindings"),
     ("theme", "Change the color theme"),
     ("tui", "Set the terminal UI renderer"),
     ("ultraplan", "Draft a plan in an ultraplan session"),
-    ("ultrareview", "Run a deep multi-agent code review in the cloud"),
+    (
+        "ultrareview",
+        "Run a deep multi-agent code review in the cloud",
+    ),
     ("upgrade", "Open the plan upgrade page"),
     ("usage", "Show session cost and plan usage limits"),
     ("usage-credits", "Configure usage credits for work limits"),
@@ -180,7 +219,9 @@ fn scan_commands(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Found>) {
 }
 
 fn walk_md(root: &Path, dir: &Path, prefix: &str, out: &mut BTreeMap<String, Found>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -202,14 +243,19 @@ fn walk_md(root: &Path, dir: &Path, prefix: &str, out: &mut BTreeMap<String, Fou
                 .get("argument-hint")
                 .or_else(|| fm.get("argument_hint"))
                 .cloned();
-            out.entry(name).or_insert(Found { description, arg_hint });
+            out.entry(name).or_insert(Found {
+                description,
+                arg_hint,
+            });
         }
     }
 }
 
 /// Scan a `skills/` dir — each `<skill>/SKILL.md` becomes one command.
 fn scan_skills(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Found>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let skill_md = entry.path().join("SKILL.md");
         if !skill_md.is_file() {
@@ -223,7 +269,10 @@ fn scan_skills(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Found>) {
             .get("description")
             .cloned()
             .unwrap_or_else(|| format!("/{name}"));
-        out.entry(name).or_insert(Found { description, arg_hint: None });
+        out.entry(name).or_insert(Found {
+            description,
+            arg_hint: None,
+        });
     }
 }
 
@@ -231,9 +280,15 @@ fn scan_skills(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Found>) {
 /// `commands/` + `skills/`, namespaced `plugin:name`.
 fn scan_plugins(home: &Path, out: &mut BTreeMap<String, Found>) {
     let manifest = home.join(".claude/plugins/installed_plugins.json");
-    let Ok(text) = std::fs::read_to_string(&manifest) else { return };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else { return };
-    let Some(plugins) = v["plugins"].as_object() else { return };
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        return;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    let Some(plugins) = v["plugins"].as_object() else {
+        return;
+    };
     for (full_id, installs) in plugins {
         // "vercel@claude-plugins-official" → plugin short name "vercel".
         let short = full_id.split('@').next().unwrap_or(full_id);
@@ -254,7 +309,9 @@ fn scan_plugins(home: &Path, out: &mut BTreeMap<String, Found>) {
 /// (`>` / `|`). Nested mappings and lists are ignored (we only want scalars).
 fn read_frontmatter(path: &Path) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
-    let Ok(text) = std::fs::read_to_string(path) else { return map };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return map;
+    };
     let mut lines = text.lines();
     if lines.next().map(str::trim_end) != Some("---") {
         return map;
@@ -271,7 +328,9 @@ fn read_frontmatter(path: &Path) -> BTreeMap<String, String> {
         if line.starts_with(char::is_whitespace) || trimmed.starts_with('#') {
             continue;
         }
-        let Some(colon) = trimmed.find(':') else { continue };
+        let Some(colon) = trimmed.find(':') else {
+            continue;
+        };
         let key = trimmed[..colon].trim().to_lowercase();
         let mut rest = trimmed[colon + 1..].trim().to_string();
 
@@ -334,7 +393,9 @@ mod tests {
     /// menu and checks each entry has a non-empty command + description.
     #[test]
     fn discovers_local_skills() {
-        let Value::Array(items) = all(".") else { panic!("expected an array") };
+        let Value::Array(items) = all(".") else {
+            panic!("expected an array")
+        };
         eprintln!("discovered {} commands:", items.len());
         for it in &items {
             let cmd = it["command"].as_str().unwrap_or("");

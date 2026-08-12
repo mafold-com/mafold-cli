@@ -9,8 +9,8 @@
 //!   2. the hook ITSELF spawns it in a new session (fork + setsid — macOS has
 //!      no `setsid` utility) with output to the sibling `.log`; the hook exits
 //!      right after, so init adopts the task,
-//!   3. the pid lands in the sibling `.pid` — the daemon's completion-wakeup
-//!      monitor polls those and resumes the chat when all of them exit,
+//!   3. the pid lands in the sibling `.pid`; `.meta` records the exact cwd and
+//!      scoped surface so restart recovery resumes the right bot/harness/tree,
 //!   4. the tool input is rewritten (`updatedInput`) to a foreground `echo`
 //!      telling the model the task is detached and reported next turn.
 //! Anything that isn't a background Bash — or any internal failure — produces
@@ -80,7 +80,13 @@ fn detach(v: &Value, ti: &Value) -> Option<String> {
         .or_else(|| std::env::var("MAFOLD_CONV").ok())
         .unwrap_or_else(|| "untagged".into())
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -91,14 +97,26 @@ fn detach(v: &Value, ti: &Value) -> Option<String> {
     let script = dir.join(format!("{tag}.{ts}.sh"));
     let log = dir.join(format!("{tag}.{ts}.log"));
     let pidf = dir.join(format!("{tag}.{ts}.pid"));
+    let meta = dir.join(format!("{tag}.{ts}.meta"));
     std::fs::write(&script, format!("#!/bin/bash\n{command}\n")).ok()?;
 
     // The tool call's cwd (claude passes it in the hook input); fall back to
     // the hook's own cwd (claude spawns hooks in the session cwd).
-    let cwd = v["cwd"]
-        .as_str()
-        .map(String::from)
-        .or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()))?;
+    let cwd = v["cwd"].as_str().map(String::from).or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    })?;
+    std::fs::write(
+        &meta,
+        serde_json::json!({
+            "version": 2,
+            "surface": tag,
+            "cwd": cwd,
+        })
+        .to_string(),
+    )
+    .ok()?;
     let pid = spawn_detached(&script, &log, &cwd)?;
     std::fs::write(&pidf, pid.to_string()).ok()?;
 
@@ -132,7 +150,11 @@ fn detach(v: &Value, ti: &Value) -> Option<String> {
 fn spawn_detached(script: &Path, log: &Path, cwd: &str) -> Option<u32> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
-    let out = std::fs::OpenOptions::new().create(true).append(true).open(log).ok()?;
+    let out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .ok()?;
     let err = out.try_clone().ok()?;
     let mut cmd = Command::new("bash");
     cmd.arg(script)
