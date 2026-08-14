@@ -146,7 +146,7 @@ fn is_stale_thread(e: &anyhow::Error) -> bool {
 async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcome> {
     let RunParams { full_prompt, workdir, model, effort, conv, draft, cancel, sink } = *p;
 
-    let mut cmd = tokio::process::Command::new("codex");
+    let mut cmd = tokio::process::Command::new(super::program("codex"));
         cmd.arg("exec");
         // Resume the conversation's Codex thread for context. The subcommand form
         // is `codex exec resume <THREAD_ID> [options] [prompt]`; options and the
@@ -196,9 +196,7 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| {
-                format!("couldn't run `codex` in {workdir} — is Codex installed and on PATH?")
-            })?;
+            .with_context(|| super::spawn_hint("codex", workdir))?;
         // Register this run in the live-children set so a daemon shutdown kills
         // exactly THIS process (see harness::live_children) — same contract as
         // the Claude harness; RAII deregisters on every exit path.
@@ -619,7 +617,7 @@ async fn auth_status_line() -> String {
 /// `codex --version` → "0.5.0" (first numeric-ish token; "" if the CLI is missing).
 async fn codex_version() -> String {
     use std::time::Duration;
-    let mut cmd = tokio::process::Command::new("codex");
+    let mut cmd = tokio::process::Command::new(super::program("codex"));
     cmd.arg("--version").stdin(Stdio::null());
     crate::platform::no_window(&mut cmd);
     match tokio::time::timeout(Duration::from_secs(8), cmd.output()).await {

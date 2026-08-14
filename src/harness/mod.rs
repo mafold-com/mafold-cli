@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{mpsc::UnboundedSender, Notify};
 
@@ -534,7 +535,7 @@ pub fn invalidate_versions() {
 /// `<bin> --version` → a short version string ("2.1.198"): first token that
 /// starts with a digit, else the trimmed first line. None on any failure.
 fn bin_version(bin: &str) -> Option<String> {
-    let out = std::process::Command::new(bin)
+    let out = std::process::Command::new(program(bin))
         .arg("--version")
         .output()
         .ok()?;
@@ -555,25 +556,162 @@ fn bin_version(bin: &str) -> Option<String> {
 /// `probe()` report every harness unavailable on Windows, so this machine never
 /// showed up as a capable host.
 pub(crate) fn on_path(bin: &str) -> bool {
-    let names = exe_candidates(bin);
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| names.iter().any(|name| dir.join(name).is_file()))
-    })
+    resolve(bin).is_some()
 }
 
+/// The program string to hand [`std::process::Command`] for `bin`: the resolved
+/// `$PATH` entry when there is one, else the bare name (so the OS reports the
+/// failure exactly as it used to).
+///
+/// EVERY spawn of a harness CLI goes through this, and `on_path` answers from the
+/// same resolver — availability can no longer promise a spawn that then fails.
+/// Windows is why: `CreateProcessW` only ever appends `.exe`, while a normal npm
+/// install of these CLIs lays down a PAIR — `claude` (a POSIX sh script, which
+/// Windows cannot start) plus `claude.cmd`. `on_path` saw the sh script and said
+/// yes; `Command::new("claude")` looked for `claude.exe`, found nothing, and the
+/// daemon answered the chat with "couldn't run `claude` … is it on PATH?" — the
+/// one question it had already answered itself. Handing over the resolved
+/// `…\claude.cmd` fixes both halves: std recognizes `.cmd`/`.bat` and routes them
+/// through `cmd.exe` with hardened quoting (CVE-2024-24576).
+pub(crate) fn program(bin: &str) -> std::ffi::OsString {
+    resolve(bin).map_or_else(|| bin.into(), Into::into)
+}
+
+/// First `$PATH` entry for `bin` that we could actually execute.
+pub(crate) fn resolve(bin: &str) -> Option<PathBuf> {
+    // An explicit path (`/opt/bin/claude`, `C:\tools\claude.cmd`) is not a $PATH
+    // lookup — take it as given.
+    if bin.contains('/') || bin.contains('\\') {
+        let p = PathBuf::from(bin);
+        return launchable(&p).then_some(p);
+    }
+    let names = exe_candidates(bin);
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .flat_map(|dir| names.iter().map(move |n| dir.join(n)))
+        .find(|p| launchable(p))
+}
+
+/// Could `Command` start this file? Unix wants the execute bit (matching what
+/// `execvp` itself would accept while searching `$PATH`); on Windows the
+/// candidate list is already restricted to launchable extensions.
+#[cfg(not(windows))]
+fn launchable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+#[cfg(windows)]
+fn launchable(p: &Path) -> bool {
+    p.is_file()
+}
+
+/// Extensions `std::process::Command` can launch on Windows: the two it starts
+/// directly and the two it wraps in `cmd.exe`. A `.ps1`/`.vbs`/`.js` shim needs
+/// an interpreter, so it is NOT a candidate — counting it as "installed" is how
+/// detection and spawn drifted apart in the first place.
+#[cfg(windows)]
+const LAUNCHABLE_EXTS: &[&str] = &[".com", ".exe", ".bat", ".cmd"];
+
 /// Filenames to look for on `$PATH` for a program. On Unix that's just the bare
-/// name; on Windows the executable is `codex.exe` / `claude.cmd` / …, so we also
-/// try the bare name with each `PATHEXT` extension appended.
+/// name; on Windows the executable is `codex.exe` / `claude.cmd` / …, so we try
+/// the bare name with each `PATHEXT` extension appended.
 #[cfg(not(windows))]
 fn exe_candidates(bin: &str) -> Vec<String> {
     vec![bin.to_string()]
 }
 #[cfg(windows)]
 fn exe_candidates(bin: &str) -> Vec<String> {
-    let mut names = vec![bin.to_string()];
-    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
-    for ext in pathext.split(';').filter(|e| !e.is_empty()) {
-        names.push(format!("{bin}{}", ext.to_ascii_lowercase()));
+    // Deliberately NOT the bare name — see `program`. `PATHEXT` sets the order
+    // (the shell's own precedence); the defaults are appended so a trimmed
+    // `PATHEXT` can't hide an installed `claude.cmd`.
+    let pathext = std::env::var("PATHEXT").unwrap_or_default();
+    let mut names: Vec<String> = Vec::new();
+    for ext in pathext.split(';').chain(LAUNCHABLE_EXTS.iter().copied()) {
+        let ext = ext.trim().to_ascii_lowercase();
+        if LAUNCHABLE_EXTS.contains(&ext.as_str()) {
+            let name = format!("{bin}{ext}");
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
     }
     names
+}
+
+/// Why `bin` wouldn't start — one wording for every harness. Separates the two
+/// failures the old message ran together: nothing installed at all, vs. a shim we
+/// found and still couldn't launch.
+pub(crate) fn spawn_hint(bin: &str, workdir: &str) -> String {
+    match resolve(bin) {
+        Some(p) => format!("couldn't start `{bin}` ({}) in {workdir}", p.display()),
+        None => format!(
+            "`{bin}` is not on PATH — is it installed? (looked for: {})",
+            exe_candidates(bin).join(", ")
+        ),
+    }
+}
+
+#[cfg(test)]
+mod path_resolution_tests {
+    use super::*;
+
+    /// The invariant the Windows daemon broke: whatever `on_path` calls installed,
+    /// `program` must hand back something spawnable — never the bare name that
+    /// `CreateProcessW` then fails to find.
+    #[test]
+    fn availability_implies_a_resolved_program() {
+        for (_, bin) in BINS {
+            if on_path(bin) {
+                assert_ne!(
+                    program(bin),
+                    std::ffi::OsString::from(*bin),
+                    "{bin} reported available but resolved to the bare name"
+                );
+                assert!(resolve(bin).is_some_and(|p| p.is_absolute() || p.exists()));
+            }
+        }
+    }
+
+    /// A non-executable file named like the CLI is not an install — `execvp`
+    /// skips it while searching `$PATH` and so must we. (Tests `launchable`
+    /// directly rather than mutating the process `PATH`, which would race the
+    /// other tests in this binary.)
+    #[test]
+    fn non_executable_is_not_an_install() {
+        let dir = std::env::temp_dir().join(format!("mafold-resolve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let decoy = dir.join(if cfg!(windows) { "mafoldtest.exe" } else { "mafoldtest" });
+        std::fs::write(&decoy, "not a program").unwrap();
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(!launchable(&decoy));
+            std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Windows has no execute bit — a launchable extension IS the install there.
+        assert!(launchable(&decoy));
+        assert!(!launchable(&dir), "a directory is not a program");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An explicit path bypasses the `$PATH` walk instead of being searched for
+    /// as a filename (`resolve` is also the door for a configured absolute CLI).
+    #[test]
+    fn explicit_path_is_taken_as_given() {
+        assert!(resolve("/definitely/not/here/claude").is_none());
+    }
+
+    /// On Windows the extensionless npm shim (a POSIX sh script) is not a
+    /// candidate, and every candidate is something `Command` can launch.
+    #[cfg(windows)]
+    #[test]
+    fn windows_candidates_are_launchable_only() {
+        let names = exe_candidates("claude");
+        assert!(!names.contains(&"claude".to_string()));
+        assert!(names.contains(&"claude.cmd".to_string()));
+        assert!(names.iter().all(|n| LAUNCHABLE_EXTS
+            .iter()
+            .any(|e| n.ends_with(e))));
+    }
 }

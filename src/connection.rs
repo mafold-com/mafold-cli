@@ -43,6 +43,12 @@ pub enum ConnectionCmd {
         /// Read the value from the provider's conventional environment variable.
         #[arg(long)]
         from_env: bool,
+        /// Log in through the provider's own OAuth consent screen, right here:
+        /// the browser opens, the redirect lands on this machine, and the fresh
+        /// grant goes straight into the vault. Only for providers whose CLI
+        /// client is a published public client (Codex).
+        #[arg(long)]
+        oauth: bool,
         /// A human tag for the linked identity. Stored in CLEARTEXT so the list
         /// is readable; defaults to a masked tail of the secret.
         #[arg(long)]
@@ -344,8 +350,8 @@ pub async fn run(base: &str, cmd: ConnectionCmd) -> Result<()> {
             Ok(())
         }
         ConnectionCmd::List => list(&client).await,
-        ConnectionCmd::Add { name, provider, import, from_env, label } => {
-            add(&client, &sess, &name, &provider, import, from_env, label).await
+        ConnectionCmd::Add { name, provider, import, from_env, oauth, label } => {
+            add(&client, &sess, &name, &provider, import, from_env, oauth, label).await
         }
         ConnectionCmd::Show { name, reveal } => show(&client, &sess, &name, reveal).await,
         ConnectionCmd::Env { name } => env(&client, &sess, &name).await,
@@ -489,6 +495,372 @@ fn find_key(v: &Value, key: &str) -> Option<Value> {
     }
 }
 
+// ── the vendor-client OAuth dance (`add --oauth`) ──────────────────────────
+//
+// For providers whose OAuth client is a PUBLISHED PUBLIC client of the
+// vendor's own CLI (`ProviderSpec::oauth_client`), we can mint a fresh grant
+// instead of importing a file: PKCE, a localhost listener on the vendor's
+// registered redirect, and a form-encoded code exchange. The whole dance runs
+// on this machine — the registered redirect URI makes any server-side variant
+// impossible, which is not a limitation but the property that keeps the vault
+// honest: the token is born on a device the user controls and sealed there.
+//
+// A fresh grant also races NOTHING: `--import` shares a refresh token with the
+// vendor's own CLI, and two holders spending one rotating token is the classic
+// way an imported credential goes stale under it.
+
+fn hex_bytes(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Query-string percent-encoding (RFC 3986 unreserved survive).
+fn q_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// The claims segment of a JWT, unverified.
+///
+/// Unverified is CORRECT here, not lazy: these tokens arrive over TLS from the
+/// vendor's own token endpoint (or its CLI's credential file), and the values
+/// lifted out of them — account id, expiry, an email for the label — are hints
+/// for our own bookkeeping, not authorization inputs. The party that must
+/// trust the signature is the vendor's API, and it verifies for itself.
+fn jwt_claims(token: &str) -> Option<Value> {
+    use base64::Engine;
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Fill the ISSUED fields a link flow can't collect from a human: the
+/// registry's fixed OAuth client (what lets a *different* device refresh this
+/// grant), the account id buried in the id_token, and an expiry read from the
+/// access token itself when nothing recorded one. Import files vary; this
+/// makes every codex-oauth payload renewal-complete regardless of which flow
+/// produced it.
+fn enrich_oauth_payload(
+    spec: &mafold_core::mafold_types::connections::ProviderSpec,
+    fields: &mut serde_json::Map<String, Value>,
+) {
+    let missing = |m: &serde_json::Map<String, Value>, k: &str| {
+        m.get(k).and_then(|v| v.as_str()).map(str::trim).unwrap_or("").is_empty()
+    };
+    if let Some(oc) = spec.oauth_client {
+        if missing(fields, "client_id") {
+            fields.insert("client_id".into(), Value::String(oc.client_id.into()));
+        }
+        if missing(fields, "token_endpoint") {
+            fields.insert("token_endpoint".into(), Value::String(oc.token_endpoint.into()));
+        }
+    }
+    if missing(fields, "account_id") {
+        if let Some(claims) = fields.get("id_token").and_then(Value::as_str).and_then(jwt_claims) {
+            if let Some(acc) = claims
+                .pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                fields.insert("account_id".into(), Value::String(acc.into()));
+            }
+        }
+    }
+    if missing(fields, "expires_at") {
+        if let Some(exp) = fields
+            .get("access_token")
+            .and_then(Value::as_str)
+            .and_then(jwt_claims)
+            .and_then(|c| c.get("exp").and_then(Value::as_i64))
+        {
+            fields.insert("expires_at".into(), Value::String((exp * 1000).to_string()));
+        }
+    }
+}
+
+/// Serve the redirect: accept connections until the callback with our `state`
+/// arrives, answer it with a small "done" page, and hand back the code.
+async fn wait_for_callback(
+    listener: tokio::net::TcpListener,
+    expected_state: &str,
+    redirect_path: &str,
+) -> Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    loop {
+        let (mut sock, _) = listener.accept().await.context("accept on the redirect port")?;
+        let mut buf = vec![0u8; 8192];
+        let n = sock.read(&mut buf).await.unwrap_or(0);
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("");
+        let (route, query) = match path.split_once('?') {
+            Some((r, q)) => (r, q),
+            None => (path, ""),
+        };
+        // Browsers also ask for favicons and the like; only the registered
+        // callback path ends the wait.
+        if route != redirect_path {
+            let _ = sock
+                .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+            continue;
+        }
+        let mut code = None;
+        let mut state = None;
+        let mut error = None;
+        for pair in query.split('&') {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            let v = v.replace('+', " ");
+            match k {
+                "code" => code = Some(v),
+                "state" => state = Some(v),
+                "error" | "error_description" if error.is_none() => error = Some(v),
+                _ => {}
+            }
+        }
+        let ok = error.is_none() && code.is_some() && state.as_deref() == Some(expected_state);
+        // Neutral about WHERE the flow was started: the same listener serves
+        // `connection add --oauth` (a terminal) and a Connect button in the
+        // web pane, and telling a person who clicked a button to "return to
+        // the terminal" is the exact seam this feature exists to remove.
+        let page = if ok {
+            "<html><body style=\"font-family:system-ui;padding:2rem\"><h2>Linked ✓</h2>\
+             <p>You can close this tab — Mafold has the rest.</p></body></html>"
+        } else {
+            "<html><body style=\"font-family:system-ui;padding:2rem\"><h2>That didn't work</h2>\
+             <p>You can close this tab — Mafold will say what went wrong.</p></body></html>"
+        };
+        let _ = sock
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{page}",
+                    page.len()
+                )
+                .as_bytes(),
+            )
+            .await;
+        if let Some(e) = error {
+            bail!("the provider refused the login: {e}");
+        }
+        if state.as_deref() != Some(expected_state) {
+            bail!("state mismatch on the OAuth callback — refusing a code this flow didn't ask for");
+        }
+        return Ok(code.expect("checked above"));
+    }
+}
+
+/// The first leg of the dance, once the port is ours.
+///
+/// Split from the second leg because the two halves have different audiences:
+/// the terminal opens `authorize_url` itself, while a link started from another
+/// surface (`events.connectionLink`) hands it back so the browser the person is
+/// actually looking at opens it. Everything that must survive between them —
+/// the bound listener above all — travels in here rather than in a global, so
+/// two flows can never share a port by accident.
+struct OauthLeg {
+    listener: tokio::net::TcpListener,
+    verifier: String,
+    state: String,
+    redirect: url_parts::Parts,
+    authorize_url: String,
+    port: u16,
+}
+
+/// Bind the vendor's registered redirect and build its consent URL.
+async fn oauth_begin(
+    spec: &mafold_core::mafold_types::connections::ProviderSpec,
+) -> Result<OauthLeg> {
+    use sha2::{Digest, Sha256};
+    let oc = spec.oauth_client.ok_or_else(|| {
+        anyhow!(
+            "{} has no OAuth client this cli can drive — link it with --import or --from-env",
+            spec.id
+        )
+    })?;
+
+    // PKCE. The verifier is HEX (the shape the vendor's own CLI sends), the
+    // challenge standard base64url-nopad S256.
+    let verifier = format!("{}{}", hex_bytes(&Key::random().0), hex_bytes(&Key::random().0));
+    let challenge = {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+    };
+    let state = hex_bytes(&Key::random().0);
+
+    // Bind BEFORE the browser opens: if the port is taken (the vendor's own
+    // CLI mid-login, an earlier attempt wedged), fail now with a sentence —
+    // not after the user has clicked through a consent screen whose redirect
+    // will land on the wrong listener.
+    let redirect: url_parts::Parts = url_parts::split(oc.redirect_uri)?;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", redirect.port))
+        .await
+        .with_context(|| {
+            format!(
+                "can't listen on 127.0.0.1:{} — is another {} login already running?",
+                redirect.port, spec.display
+            )
+        })?;
+
+    let mut auth_url = format!(
+        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+        oc.authorize_url,
+        q_encode(oc.client_id),
+        q_encode(oc.redirect_uri),
+        q_encode(oc.scopes),
+        state,
+        challenge,
+    );
+    for (k, v) in oc.extra_params {
+        auth_url.push('&');
+        auth_url.push_str(&format!("{}={}", q_encode(k), q_encode(v)));
+    }
+
+    let port = redirect.port;
+    Ok(OauthLeg {
+        listener,
+        verifier,
+        state,
+        redirect,
+        authorize_url: auth_url,
+        port,
+    })
+}
+
+/// The second leg: wait for the vendor to come back to our port, then trade the
+/// code for tokens. Returns the token bag plus a suggested cleartext label
+/// (email · plan) read from the id_token.
+async fn oauth_finish(
+    spec: &mafold_core::mafold_types::connections::ProviderSpec,
+    leg: OauthLeg,
+) -> Result<(serde_json::Map<String, Value>, Option<String>)> {
+    let oc = spec
+        .oauth_client
+        .ok_or_else(|| anyhow!("{} has no OAuth client this cli can drive", spec.id))?;
+    let OauthLeg { listener, verifier, state, redirect, .. } = leg;
+
+    let code = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        wait_for_callback(listener, &state, redirect.path),
+    )
+    .await
+    .map_err(|_| anyhow!("no sign-in came back within 5 minutes — start it again to retry"))??;
+
+    let form = [
+        ("grant_type", "authorization_code"),
+        ("client_id", oc.client_id),
+        ("code", code.as_str()),
+        ("redirect_uri", oc.redirect_uri),
+        ("code_verifier", verifier.as_str()),
+    ];
+    let resp = reqwest::Client::new()
+        .post(oc.token_endpoint)
+        .form(&form)
+        .send()
+        .await
+        .context("token exchange failed to send")?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("token exchange answered HTTP {status}: {}", body.chars().take(300).collect::<String>());
+    }
+    let grant: Value = serde_json::from_str(&body).context("token endpoint returned non-JSON")?;
+    let take = |k: &str| grant.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+
+    let mut fields = serde_json::Map::new();
+    let access = take("access_token");
+    if access.is_empty() {
+        bail!("token endpoint returned no access token");
+    }
+    fields.insert("access_token".into(), Value::String(access));
+    for k in ["refresh_token", "id_token"] {
+        let v = take(k);
+        if !v.is_empty() {
+            fields.insert(k.to_string(), Value::String(v));
+        }
+    }
+    if let Some(secs) = grant.get("expires_in").and_then(Value::as_i64) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        fields.insert("expires_at".into(), Value::String((now_ms + secs * 1000).to_string()));
+    }
+
+    // Label: the human identity of the grant, from the id_token.
+    let label = fields
+        .get("id_token")
+        .and_then(Value::as_str)
+        .and_then(jwt_claims)
+        .map(|c| {
+            let email = c.get("email").and_then(Value::as_str).unwrap_or("").to_string();
+            let plan = c
+                .pointer("/https:~1~1api.openai.com~1auth/chatgpt_plan_type")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            match (email.is_empty(), plan.is_empty()) {
+                (false, false) => format!("{email} · {plan}"),
+                (false, true) => email,
+                _ => String::new(),
+            }
+        })
+        .filter(|s| !s.is_empty());
+
+    Ok((fields, label))
+}
+
+/// Both legs, driven from a terminal: bind, open the browser here, wait.
+async fn oauth_dance(
+    spec: &mafold_core::mafold_types::connections::ProviderSpec,
+) -> Result<(serde_json::Map<String, Value>, Option<String>)> {
+    let leg = oauth_begin(spec).await?;
+    println!("Opening {}'s consent screen…", spec.display);
+    if !crate::platform::open_browser(&leg.authorize_url) {
+        println!(
+            "  couldn't open a browser — visit this URL yourself:\n\n  {}\n",
+            leg.authorize_url
+        );
+    }
+    println!("  waiting for the login to come back to 127.0.0.1:{}…", leg.port);
+    oauth_finish(spec, leg).await
+}
+
+/// The two pieces of a redirect URI this flow needs. A module rather than a
+/// dependency: pulling a URL crate into the cli for one host:port/path split
+/// would be the heavier tool.
+mod url_parts {
+    use anyhow::{anyhow, Result};
+
+    pub struct Parts {
+        pub port: u16,
+        pub path: &'static str,
+    }
+
+    pub fn split(uri: &'static str) -> Result<Parts> {
+        let rest = uri
+            .strip_prefix("http://")
+            .ok_or_else(|| anyhow!("redirect URI must be http://localhost-style: {uri}"))?;
+        let (host_port, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, "/"),
+        };
+        let port = host_port
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+            .ok_or_else(|| anyhow!("redirect URI has no port: {uri}"))?;
+        Ok(Parts { port, path })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn add(
     client: &Client,
@@ -497,6 +869,7 @@ async fn add(
     provider: &str,
     import: bool,
     from_env: bool,
+    oauth: bool,
     label: Option<String>,
 ) -> Result<()> {
     let spec = provider_spec(provider).ok_or_else(|| {
@@ -504,7 +877,17 @@ async fn add(
             "unknown provider `{provider}` — see `mafold connection providers`"
         )
     })?;
-    let fields = collect(spec, import, from_env)?;
+    let (mut fields, suggested_label) = if oauth {
+        oauth_dance(spec).await?
+    } else {
+        (collect(spec, import, from_env)?, None)
+    };
+    // Issued fields the flows above can't know by themselves: the registry's
+    // fixed OAuth client (so ANY device can refresh later) and an expiry read
+    // out of the token itself when the vendor's file didn't record one.
+    enrich_oauth_payload(spec, &mut fields);
+    let fields = fields;
+    let label = label.or(suggested_label);
     let (umk, key_id, _) = unlock(client, sess).await?;
     let (blob, wrapped_dek) = seal_payload(&umk, &fields)?;
 
@@ -617,6 +1000,185 @@ async fn runtime(
     ))
 }
 
+// ── linking on behalf of another surface (`events.connectionLink`) ─────────
+//
+// The web pane has a Connect button for Codex and no command to copy, and this
+// is what stands behind it. A provider whose OAuth client redirects to a
+// loopback port can only be linked ON a machine — but the machine does not have
+// to be the INTERFACE. A client asks (`startConnectionLink`), the event fans out
+// to every device the person has online, one claims it, binds the port, and
+// answers with the URL for the asking surface to open. The credential is still
+// born here and sealed here; only the button moved.
+
+/// A connection name that isn't taken yet — `codex`, then `codex-2`.
+///
+/// Same rule as the web's `uniqueName`, for the same reason: a second Codex
+/// account must make a second row rather than overwrite the first. Naming is
+/// this device's job because the asking surface never sees the grant.
+async fn free_name(client: &Client, provider_id: &str) -> String {
+    let base = provider_id
+        .trim_end_matches("-api")
+        .trim_end_matches("-oauth")
+        .to_string();
+    let taken: Vec<String> = client
+        .call("listConnections", json!({}))
+        .await
+        .ok()
+        .map(|v| as_array(&v, "items").iter().map(|c| s(c, "name")).collect())
+        .unwrap_or_default();
+    if !taken.iter().any(|n| n == &base) {
+        return base;
+    }
+    (2..)
+        .map(|i| format!("{base}-{i}"))
+        .find(|c| !taken.iter().any(|n| n == c))
+        .unwrap_or(base)
+}
+
+/// Answer an `events.connectionLink` frame. `true` when this device took it.
+///
+/// Claim FIRST, like every other relayed event: the frame reaches every socket
+/// the account has, and two machines binding the vendor's port for one request
+/// is two consent screens for one click. The claim also decides who reports the
+/// outcome, so the asking surface hears exactly one ending.
+pub async fn handle_link_event(
+    client: &Client,
+    sess: &session::Session,
+    umk: &Key,
+    key_id: &str,
+    envelope: &str,
+) -> bool {
+    let env: Value = match serde_json::from_str(envelope) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if env.get("method").and_then(Value::as_str) != Some("events.connectionLink") {
+        return false;
+    }
+    let p = env.get("params").cloned().unwrap_or(Value::Null);
+    let link_id = s(&p, "link_id");
+    let provider = s(&p, "provider");
+    if link_id.is_empty() {
+        return false;
+    }
+
+    let claimed = client
+        .call("claimConnectionCall", json!({ "call_id": link_id }))
+        .await
+        .ok()
+        .and_then(|v| v.get("claimed").and_then(Value::as_bool))
+        .unwrap_or(false);
+    if !claimed {
+        return false;
+    }
+
+    // Answer once, whatever happens: the caller is parked on this and a silent
+    // device turns "your Mac is busy" into "no machine took it".
+    let answer = |result: Value, error: Option<String>| {
+        let mut body = json!({ "call_id": link_id, "result": result });
+        if let Some(e) = error {
+            body["error"] = Value::String(e);
+        }
+        client.call("answerConnectionCall", body)
+    };
+
+    let spec = match provider_spec(&provider) {
+        Some(sp) if sp.oauth_client.is_some() => sp,
+        Some(sp) => {
+            let _ = answer(
+                Value::Null,
+                Some(format!(
+                    "{} isn't linked by a consent screen — it's pasted or read from a file",
+                    sp.display
+                )),
+            )
+            .await;
+            return true;
+        }
+        None => {
+            let _ = answer(
+                Value::Null,
+                Some(format!(
+                    "this machine's Mafold doesn't know a provider called `{provider}` — update it"
+                )),
+            )
+            .await;
+            return true;
+        }
+    };
+
+    let leg = match oauth_begin(spec).await {
+        Ok(leg) => leg,
+        Err(e) => {
+            let _ = answer(Value::Null, Some(format!("{e:#}"))).await;
+            return true;
+        }
+    };
+    let authorize_url = leg.authorize_url.clone();
+    let _ = answer(
+        json!({ "authorize_url": authorize_url, "device": sess.device_name }),
+        None,
+    )
+    .await;
+
+    // The human half — a consent screen, on a person's clock — must not hold
+    // the socket loop. Everything it needs is owned here so the task outlives
+    // this frame.
+    let client = client.clone();
+    let umk = umk.clone();
+    let key_id = key_id.to_string();
+    tokio::spawn(async move {
+        let outcome = finish_linking(&client, spec, leg, &umk, &key_id).await;
+        let body = match &outcome {
+            Ok(name) => json!({ "link_id": link_id, "connection": name }),
+            Err(e) => json!({ "link_id": link_id, "error": format!("{e:#}") }),
+        };
+        let _ = client.call("reportConnectionLink", body).await;
+        match outcome {
+            Ok(name) => println!("· connections: linked {name} → {}", spec.display),
+            Err(e) => println!("· connections: {} link failed — {e:#}", spec.display),
+        }
+    });
+    true
+}
+
+/// Wait out the consent screen, seal what comes back, store it. The connection
+/// name it chose, so the report can name it.
+async fn finish_linking(
+    client: &Client,
+    spec: &'static mafold_core::mafold_types::connections::ProviderSpec,
+    leg: OauthLeg,
+    umk: &Key,
+    key_id: &str,
+) -> Result<String> {
+    let (mut fields, suggested) = oauth_finish(spec, leg).await?;
+    enrich_oauth_payload(spec, &mut fields);
+    let (blob, wrapped_dek) = seal_payload(umk, &fields)?;
+    let name = free_name(client, spec.id).await;
+    let label = suggested.unwrap_or_else(|| {
+        fields
+            .get("account_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_default()
+    });
+    client
+        .call(
+            "putConnection",
+            json!({
+                "name": name,
+                "provider": spec.id,
+                "label": label,
+                "blob": blob,
+                "wrapped_dek": wrapped_dek,
+                "key_id": key_id,
+            }),
+        )
+        .await
+        .context("putConnection failed")?;
+    Ok(name)
+}
+
 /// Hold a human WS open and let the CORE answer connection calls on it.
 ///
 /// This is the terminal's version of what the web client does passively: the
@@ -628,7 +1190,11 @@ async fn listen(base: &str, client: &Client, sess: &session::Session) -> Result<
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message as WsMsg;
 
-    let mut rt = runtime(base, client, sess).await?;
+    // Unlocked once, used twice: the core answers calls with the key, and a
+    // link started from another surface seals its new grant with the same one.
+    let (umk, key_id, _) = unlock(client, sess).await?;
+    let mut rt =
+        mafold_core::connections::Runtime::new(&format!("{base}/api"), &sess.token, umk.clone());
     println!(
         "✓ listening as @{} on {} — connection calls granted to your bots run here.\n  ctrl-c to stop.",
         sess.username, sess.device_name
@@ -647,6 +1213,8 @@ async fn listen(base: &str, client: &Client, sess: &session::Session) -> Result<
                 Ok(WsMsg::Text(t)) => {
                     if mafold_core::connections::handle_event(&mut rt, &t).await {
                         println!("· answered a connection call");
+                    } else if handle_link_event(client, sess, &umk, &key_id, &t).await {
+                        println!("· took a link request — finish the sign-in in your browser");
                     }
                 }
                 // The server pings every 25s and treats silence as death; an
@@ -662,6 +1230,100 @@ async fn listen(base: &str, client: &Client, sess: &session::Session) -> Result<
         eprintln!("ws dropped — reconnecting in 2s");
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
+}
+
+/// The `mafold up` resident listener: the reason "start your daemons" is
+/// enough for granted bots (@chatgpt on your Codex connection) to work, with
+/// no second command to know about.
+///
+/// QUIET by construction: it only serves when this machine already holds a
+/// cached, still-current vault key — it never creates a vault, never prompts,
+/// never prints. Locked (or logged-out) machines just re-check on a slow tick,
+/// so running `mafold connection unlock` later brings this to life without
+/// restarting the supervisor.
+pub async fn supervise_listener(base: String) {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMsg;
+    let mut said_locked = false;
+    loop {
+        let Some(sess) = session::load() else {
+            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            continue;
+        };
+        let client = Client::new(base.clone(), sess.token.clone());
+        let (mut rt, umk, key_id) = match quiet_runtime(&base, &client, &sess).await {
+            Some(rt) => {
+                said_locked = false;
+                rt
+            }
+            None => {
+                if !said_locked {
+                    println!("· connections: vault locked here — `mafold connection unlock` lets granted bots use your connections on this machine");
+                    said_locked = true;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                continue;
+            }
+        };
+        println!("· connections: answering granted calls as @{}", sess.username);
+        loop {
+            let mut ws = match client.ws_connect().await {
+                Ok((ws, _)) => ws,
+                Err(e) => {
+                    let _ = e;
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    break; // re-check session + key, then come back
+                }
+            };
+            while let Some(frame) = ws.next().await {
+                match frame {
+                    Ok(WsMsg::Text(t)) => {
+                        if mafold_core::connections::handle_event(&mut rt, &t).await {
+                            println!("· connections: answered a call");
+                        } else {
+                            // A Connect button somewhere else (the web pane, a
+                            // phone) asking this machine to run a consent
+                            // screen it can and the asker can't.
+                            handle_link_event(&client, &sess, &umk, &key_id, &t).await;
+                        }
+                    }
+                    Ok(WsMsg::Ping(p)) => {
+                        let _ = ws.send(WsMsg::Pong(p)).await;
+                    }
+                    Ok(WsMsg::Close(_)) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
+}
+
+/// The unlocked runtime IF this machine can produce one silently: registered
+/// device + cached UMK that still matches the server's recorded generation.
+/// Anything less returns None — enrollment is `unlock`'s interactive job.
+///
+/// The key comes back alongside the runtime because answering a call and
+/// SEALING a new grant (a link this device runs for another surface) are the
+/// same permission — a machine that can do one can do the other, and handing
+/// out both from one place is what keeps that true.
+async fn quiet_runtime(
+    base: &str,
+    client: &Client,
+    sess: &session::Session,
+) -> Option<(mafold_core::connections::Runtime, Key, String)> {
+    let dev = vault::device_key().ok()?;
+    let reg = register(client, sess, &dev).await.ok()?;
+    let (umk, key_id) = vault::cached_umk(&dev)?;
+    if key_id.is_empty() || s(&reg["device"], "key_id") != key_id {
+        return None;
+    }
+    let rt = mafold_core::connections::Runtime::new(
+        &format!("{base}/api"),
+        &sess.token,
+        umk.clone(),
+    );
+    Some((rt, umk, key_id))
 }
 
 /// What a connection can do, asked of the provider itself.
@@ -1064,5 +1726,323 @@ mod tests {
         for p in PROVIDERS {
             assert!(provider_spec(p.id).is_some());
         }
+    }
+
+    // ── the --oauth machinery ──
+
+    fn fake_jwt(claims: Value) -> String {
+        use base64::Engine;
+        let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        format!(
+            "{}.{}.{}",
+            b64(br#"{"alg":"RS256"}"#),
+            b64(claims.to_string().as_bytes()),
+            b64(b"sig")
+        )
+    }
+
+    #[test]
+    fn jwt_claims_reads_the_middle_segment_unverified() {
+        let t = fake_jwt(serde_json::json!({ "exp": 1234, "email": "a@b.c" }));
+        let c = jwt_claims(&t).unwrap();
+        assert_eq!(c["exp"], 1234);
+        assert!(jwt_claims("not-a-jwt").is_none());
+    }
+
+    /// The import file carries neither the OAuth client nor an expiry; the
+    /// enrichment is what makes an imported codex payload renewal-complete on
+    /// any device.
+    #[test]
+    fn enrich_fills_client_account_and_expiry_without_clobbering() {
+        use mafold_core::mafold_types::connections::codex;
+        let spec = provider_spec("codex-oauth").unwrap();
+        let id_token = fake_jwt(serde_json::json!({
+            "email": "ops@example.com",
+            "https://api.openai.com/auth": { "chatgpt_account_id": "acc-42", "chatgpt_plan_type": "pro" },
+        }));
+        let access = fake_jwt(serde_json::json!({ "exp": 1_900_000_000i64 }));
+        let mut fields = serde_json::Map::new();
+        fields.insert("access_token".into(), Value::String(access));
+        fields.insert("id_token".into(), Value::String(id_token));
+
+        enrich_oauth_payload(spec, &mut fields);
+        assert_eq!(fields["client_id"], codex::CLIENT_ID);
+        assert_eq!(fields["token_endpoint"], codex::TOKEN_ENDPOINT);
+        assert_eq!(fields["account_id"], "acc-42");
+        assert_eq!(fields["expires_at"], (1_900_000_000i64 * 1000).to_string());
+
+        // A payload that already knows better keeps its own values.
+        fields.insert("account_id".into(), Value::String("acc-original".into()));
+        fields.insert("expires_at".into(), Value::String("777".into()));
+        enrich_oauth_payload(spec, &mut fields);
+        assert_eq!(fields["account_id"], "acc-original");
+        assert_eq!(fields["expires_at"], "777");
+    }
+
+    /// Providers without a fixed OAuth client must pass through untouched —
+    /// enrichment is additive, never a codex branch inside `add`.
+    #[test]
+    fn enrich_is_a_noop_for_providers_without_an_oauth_client() {
+        let spec = provider_spec("notion").unwrap();
+        let mut fields = serde_json::Map::new();
+        fields.insert("access_token".into(), Value::String("ntn_x".into()));
+        enrich_oauth_payload(spec, &mut fields);
+        assert!(!fields.contains_key("client_id"));
+        assert!(!fields.contains_key("token_endpoint"));
+    }
+
+    #[test]
+    fn query_encoding_survives_token_alphabets() {
+        assert_eq!(q_encode("openid profile email"), "openid%20profile%20email");
+        assert_eq!(q_encode("http://localhost:1455/auth/callback"), "http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback");
+    }
+
+    #[test]
+    fn redirect_uri_splits_into_port_and_path() {
+        let p = url_parts::split("http://localhost:1455/auth/callback").unwrap();
+        assert_eq!(p.port, 1455);
+        assert_eq!(p.path, "/auth/callback");
+        assert!(url_parts::split("https://example.com/cb").is_err(), "https redirect would mean a public callback — refuse");
+    }
+
+    /// The callback server ends only on OUR state, answers noise with 404, and
+    /// refuses a code minted for someone else's flow.
+    #[tokio::test]
+    async fn callback_waits_past_noise_and_checks_state() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let wait = tokio::spawn(async move {
+            wait_for_callback(listener, "st-1", "/auth/callback").await
+        });
+
+        // Favicon noise first — must be 404'd and NOT end the wait.
+        let mut s1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s1.write_all(b"GET /favicon.ico HTTP/1.1\r\n\r\n").await.unwrap();
+        let mut buf = String::new();
+        let _ = s1.read_to_string(&mut buf).await;
+        assert!(buf.starts_with("HTTP/1.1 404"));
+
+        // The real callback.
+        let mut s2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s2.write_all(b"GET /auth/callback?code=c-9&state=st-1 HTTP/1.1\r\n\r\n").await.unwrap();
+        let mut buf = String::new();
+        let _ = s2.read_to_string(&mut buf).await;
+        assert!(buf.contains("Linked"), "{buf}");
+        assert_eq!(wait.await.unwrap().unwrap(), "c-9");
+
+        // And a wrong-state flow dies rather than returning the code.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let wait = tokio::spawn(async move {
+            wait_for_callback(listener, "st-2", "/auth/callback").await
+        });
+        let mut s3 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s3.write_all(b"GET /auth/callback?code=c-9&state=EVIL HTTP/1.1\r\n\r\n").await.unwrap();
+        let mut buf = String::new();
+        let _ = s3.read_to_string(&mut buf).await;
+        let err = wait.await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("state mismatch"), "{err}");
+    }
+
+    // ── the device side of a link started somewhere else ──────────────────
+
+    /// A one-shot API stand-in: records every `(path, body)` and answers each
+    /// call from `replies` by METHOD NAME, defaulting to `{ok:true}`. Local
+    /// rather than shared because the cli has no test harness crate and one
+    /// screen of tokio is cheaper than inventing one.
+    struct MockApi {
+        base: String,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+    }
+
+    impl MockApi {
+        fn calls(&self, method: &str) -> Vec<Value> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(p, _)| p == &format!("/api/{method}"))
+                .map(|(_, b)| b.clone())
+                .collect()
+        }
+        /// Block until `method` has been called (or the test's patience runs
+        /// out). Polling beats a sleep: the device answers in microseconds and
+        /// a fixed wait would either be flaky or slow.
+        async fn wait_for(&self, method: &str) -> Value {
+            for _ in 0..200 {
+                if let Some(b) = self.calls(method).into_iter().next() {
+                    return b;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("{method} was never called: {:?}", self.seen.lock().unwrap());
+        }
+    }
+
+    fn spawn_api(replies: Vec<(&'static str, Value)>) -> MockApi {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        std_listener.set_nonblocking(true).expect("nonblocking");
+        let base = format!("http://{}", std_listener.local_addr().unwrap());
+        let listener = tokio::net::TcpListener::from_std(std_listener).expect("tokio");
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>> = Default::default();
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let sink = sink.clone();
+                let replies = replies.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16384];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("")
+                        .to_string();
+                    let body: Value = req
+                        .split_once("\r\n\r\n")
+                        .and_then(|(_, b)| serde_json::from_str(b).ok())
+                        .unwrap_or(Value::Null);
+                    sink.lock().unwrap().push((path.clone(), body));
+                    let result = replies
+                        .iter()
+                        .find(|(m, _)| path == format!("/api/{m}"))
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_else(|| json!({}));
+                    let payload = json!({ "ok": true, "result": result }).to_string();
+                    let _ = sock
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                                payload.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        MockApi { base, seen }
+    }
+
+    fn a_session() -> session::Session {
+        session::Session {
+            token: "s_test".into(),
+            username: "ops".into(),
+            device_id: "d-1".into(),
+            device_name: "ops-mbp".into(),
+        }
+    }
+
+    fn link_frame(provider: &str) -> String {
+        json!({
+            "method": "events.connectionLink",
+            "params": { "link_id": "11111111-1111-4111-8111-111111111111", "provider": provider },
+        })
+        .to_string()
+    }
+
+    /// The frames this handler must NOT touch. A device that claims events it
+    /// can't finish is worse than one that ignores them: the claim is what
+    /// stops another machine from doing the work.
+    #[tokio::test]
+    async fn an_unrelated_frame_is_ignored_without_a_claim() {
+        let api = spawn_api(vec![]);
+        let client = Client::new(api.base.clone(), "s_test".into());
+        let umk = Key::random();
+        for frame in [
+            r#"{"method":"events.connectionCall","params":{"call_id":"c-1"}}"#.to_string(),
+            r#"{"method":"events.message","params":{}}"#.to_string(),
+            "not json at all".to_string(),
+        ] {
+            assert!(!handle_link_event(&client, &a_session(), &umk, "k1", &frame).await);
+        }
+        assert!(api.calls("claimConnectionCall").is_empty());
+    }
+
+    /// Losing the claim ends it. Two laptops online must not mean two consent
+    /// screens for one click.
+    #[tokio::test]
+    async fn losing_the_claim_stops_before_binding_anything() {
+        let api = spawn_api(vec![("claimConnectionCall", json!({ "claimed": false }))]);
+        let client = Client::new(api.base.clone(), "s_test".into());
+        let umk = Key::random();
+        assert!(!handle_link_event(&client, &a_session(), &umk, "k1", &link_frame("codex-oauth")).await);
+        assert_eq!(api.calls("claimConnectionCall").len(), 1);
+        assert!(api.calls("answerConnectionCall").is_empty());
+    }
+
+    /// A provider this build has never heard of still gets an ANSWER. The
+    /// caller is parked on the rendezvous; a silent device turns "your Mafold
+    /// is out of date" into "no machine took it", which sends the user looking
+    /// at the wrong thing entirely.
+    #[tokio::test]
+    async fn an_unknown_provider_answers_with_words() {
+        let api = spawn_api(vec![("claimConnectionCall", json!({ "claimed": true }))]);
+        let client = Client::new(api.base.clone(), "s_test".into());
+        let umk = Key::random();
+        assert!(handle_link_event(&client, &a_session(), &umk, "k1", &link_frame("nope-oauth")).await);
+        let answer = api.wait_for("answerConnectionCall").await;
+        assert!(answer["error"].as_str().unwrap().contains("nope-oauth"), "{answer}");
+        assert!(answer["result"].is_null());
+    }
+
+    /// A provider linked by paste or import is not a bug either — it is a
+    /// sentence about the provider, not about the machine.
+    #[tokio::test]
+    async fn a_pasted_provider_says_so_rather_than_binding() {
+        let api = spawn_api(vec![("claimConnectionCall", json!({ "claimed": true }))]);
+        let client = Client::new(api.base.clone(), "s_test".into());
+        let umk = Key::random();
+        assert!(handle_link_event(&client, &a_session(), &umk, "k1", &link_frame("notion")).await);
+        let answer = api.wait_for("answerConnectionCall").await;
+        assert!(
+            answer["error"].as_str().unwrap().contains("isn't linked by a consent screen"),
+            "{answer}"
+        );
+    }
+
+    /// The whole point: a codex link event comes back with a real consent URL
+    /// and the machine's name, so the asking surface can send the person there
+    /// and say where the sign-in is happening.
+    ///
+    /// The vendor's redirect port is a fixed constant (1455), so this test
+    /// tolerates a machine where a real `codex login` already owns it — the
+    /// handler must then answer with THAT sentence rather than go quiet.
+    #[tokio::test]
+    async fn a_codex_link_answers_with_a_consent_url_and_the_device_name() {
+        let api = spawn_api(vec![
+            ("claimConnectionCall", json!({ "claimed": true })),
+            ("listConnections", json!({ "items": [] })),
+        ]);
+        let client = Client::new(api.base.clone(), "s_test".into());
+        let umk = Key::random();
+        assert!(handle_link_event(&client, &a_session(), &umk, "k1", &link_frame("codex-oauth")).await);
+        let answer = api.wait_for("answerConnectionCall").await;
+        if let Some(err) = answer["error"].as_str() {
+            assert!(err.contains("127.0.0.1:1455"), "unexpected failure: {err}");
+            return;
+        }
+        let url = answer["result"]["authorize_url"].as_str().expect("a url");
+        assert!(url.starts_with("https://auth.openai.com/oauth/authorize?"), "{url}");
+        assert!(url.contains("code_challenge_method=S256"), "{url}");
+        assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback"), "{url}");
+        assert!(url.contains("codex_cli_simplified_flow=true"), "{url}");
+        assert_eq!(answer["result"]["device"], "ops-mbp");
+    }
+
+    /// Names don't collide: a second Codex account makes a second row.
+    #[tokio::test]
+    async fn a_free_name_steps_around_what_is_already_linked() {
+        let api = spawn_api(vec![(
+            "listConnections",
+            json!({ "items": [ { "name": "codex" }, { "name": "codex-2" } ] }),
+        )]);
+        let client = Client::new(api.base.clone(), "s_test".into());
+        assert_eq!(free_name(&client, "codex-oauth").await, "codex-3");
     }
 }

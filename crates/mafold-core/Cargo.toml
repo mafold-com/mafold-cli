@@ -81,7 +81,7 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 # Already in the tree via gloo-net; declared here only to turn on the abort
 # types, so a timed-out fetch is actually CANCELLED rather than left pending
 # for the life of the page (see net.rs `rpc_ex`).
-web-sys = { version = "0.3", features = ["AbortController", "AbortSignal"] }
+web-sys = { version = "0.3", features = ["AbortController", "AbortSignal", "console"] }
 
 # ── test/bench-only ──
 # Benches are native-only; target-gating keeps criterion's native dep tree out

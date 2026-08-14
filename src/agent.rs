@@ -2613,7 +2613,7 @@ async fn compact_session(client: Client, workdir: String, chat_id: String, skey:
         return;
     };
     let _ = client.send_to(Dest::chat(&chat_id).channel(channel_id), "🗜️ Compacting the conversation…").await;
-    let mut cmd = tokio::process::Command::new("claude");
+    let mut cmd = tokio::process::Command::new(crate::harness::program("claude"));
     cmd.arg("-p").arg("/compact")
         .arg("--resume").arg(&sid)
         .arg("--output-format").arg("json")
@@ -2803,7 +2803,9 @@ async fn login_flow(
     )
     .map(|p| p.to_string_lossy().into_owned())
     .unwrap_or_else(|_| std::env::var("PATH").unwrap_or_default());
-    let mut cmd = tokio::process::Command::new("claude");
+    // Resolved, not bare: the child's PATH is overridden below (the no-op `open`
+    // shim), and on Windows only the resolved `claude.cmd` is spawnable at all.
+    let mut cmd = tokio::process::Command::new(crate::harness::program("claude"));
     cmd.args(["auth", "login", mode])
         .env("PATH", path)
         .env("COLUMNS", "4096")

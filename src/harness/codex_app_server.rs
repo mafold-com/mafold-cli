@@ -44,7 +44,7 @@ pub struct CodexAppServerOptions {
 impl Default for CodexAppServerOptions {
     fn default() -> Self {
         Self {
-            program: OsString::from("codex"),
+            program: super::program("codex"),
             args: vec![
                 OsString::from("app-server"),
                 OsString::from("--listen"),

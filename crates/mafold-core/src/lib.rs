@@ -17,6 +17,7 @@ mod wire;
 mod i18n;
 pub mod flags;
 pub mod connections;
+mod codex;
 pub mod mcp;
 pub mod methods;
 pub mod vault;

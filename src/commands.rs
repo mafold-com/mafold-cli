@@ -1348,7 +1348,7 @@ fn parse_usage_text(text: &str) -> String {
 /// Pipe `input` into a headless `claude -p` and return its (ANSI-stripped)
 /// output, or "" on any failure/timeout.
 async fn run_claude_stdin(input: &str, secs: u64) -> String {
-    let mut cmd = tokio::process::Command::new("claude");
+    let mut cmd = tokio::process::Command::new(crate::harness::program("claude"));
     cmd.arg("-p")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1972,7 +1972,7 @@ fn mock_reply(name: &str) -> String {
 // ───────────────────────── helpers ─────────────────────────
 
 async fn run_claude(args: &[&str], secs: u64) -> String {
-    let mut cmd = tokio::process::Command::new("claude");
+    let mut cmd = tokio::process::Command::new(crate::harness::program("claude"));
     cmd.args(args).stdin(Stdio::null());
     crate::platform::no_window(&mut cmd);
     let fut = cmd.output();

@@ -148,7 +148,7 @@ struct RunParams<'a> {
 async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcome> {
     let RunParams { full_prompt, workdir, model, thinking, conv, draft, cancel, sink } = *p;
 
-    let mut cmd = tokio::process::Command::new("kimi");
+    let mut cmd = tokio::process::Command::new(super::program("kimi"));
     // `--print` runs one turn non-interactively (and implies `--yolo`, so tools
     // run without approval prompts, which would hang a headless run).
     cmd.arg("--print").arg("--output-format").arg("stream-json");
@@ -203,7 +203,7 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("couldn't run `kimi` in {workdir} — is Kimi Code installed and on PATH?"))?;
+        .with_context(|| super::spawn_hint("kimi", workdir))?;
     // Register this run in the live-children set so a daemon shutdown kills exactly
     // THIS process (see harness::live_children); RAII deregisters on every path.
     let _child_guard = crate::harness::ChildGuard::new(child.id());
@@ -612,7 +612,7 @@ fn auth_status_line() -> String {
 /// `kimi --version` → "1.49.0" (first numeric-ish token; "" if the CLI is missing).
 async fn kimi_version() -> String {
     use std::time::Duration;
-    let mut cmd = tokio::process::Command::new("kimi");
+    let mut cmd = tokio::process::Command::new(super::program("kimi"));
     cmd.arg("--version").stdin(Stdio::null());
     crate::platform::no_window(&mut cmd);
     match tokio::time::timeout(Duration::from_secs(8), cmd.output()).await {

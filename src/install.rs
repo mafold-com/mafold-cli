@@ -139,11 +139,18 @@ fn install(t: &Tool, yes: bool) -> Result<()> {
         }
     }
 
-    let status = std::process::Command::new("bash")
+    // `bash` is the installer's shell everywhere it exists; where it doesn't (a
+    // stock Windows box) the manual route in `fallback` IS the answer. Bailing
+    // with a bare "failed to run bash" left the user with no next step on the one
+    // platform that had no other way in.
+    let status = match std::process::Command::new("bash")
         .arg("-c")
         .arg(t.install_cmd)
         .status()
-        .context("failed to run bash")?;
+    {
+        Ok(s) => s,
+        Err(e) => bail!("couldn't run the installer ({e}) — {}", t.fallback),
+    };
     if !status.success() {
         bail!("installer exited with {status} — {}", t.fallback);
     }
@@ -171,7 +178,7 @@ fn install(t: &Tool, yes: bool) -> Result<()> {
 }
 
 fn version_of(bin: &str) -> Option<String> {
-    let out = std::process::Command::new(bin)
+    let out = std::process::Command::new(crate::harness::program(bin))
         .arg("--version")
         .output()
         .ok()?;

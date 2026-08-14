@@ -174,6 +174,54 @@ pub struct ProviderSpec {
     /// "the server cannot read your credentials". Prefer this wherever it
     /// exists — owner ruling, 2026-08-10.
     pub mcp_url: Option<&'static str>,
+    /// A NATIVE driver in the core, for providers whose callable surface is
+    /// not MCP. Data, not a branch: the row names its driver ("codex-responses")
+    /// and the core keeps one dispatch table — an `if provider == "codex-oauth"`
+    /// inside the transport is exactly the shape §9 forbids. `None` for the
+    /// majority, whose callable surface is MCP or nothing.
+    pub native_api: Option<&'static str>,
+    /// A FIXED public OAuth client the cli can drive end-to-end (`add --oauth`),
+    /// for vendors whose client id is a published constant of their own CLI
+    /// rather than dynamically registered. The registered redirect is a
+    /// localhost URI, so the dance can only land on a machine the user controls
+    /// — which is exactly where the vault wants a credential born. `None` for
+    /// providers linked by paste, env, import, or MCP dynamic registration.
+    pub oauth_client: Option<OAuthClientSpec>,
+}
+
+/// See [`ProviderSpec::oauth_client`].
+#[derive(Debug, Clone, Copy)]
+pub struct OAuthClientSpec {
+    pub client_id: &'static str,
+    pub authorize_url: &'static str,
+    pub token_endpoint: &'static str,
+    /// The redirect registered at the vendor — a localhost URI the linking
+    /// machine must be able to listen on.
+    pub redirect_uri: &'static str,
+    pub scopes: &'static str,
+    /// Vendor-specific extra authorize-URL params, sent verbatim.
+    pub extra_params: &'static [(&'static str, &'static str)],
+}
+
+// MARK: - Codex OAuth constants
+//
+// These are the Codex CLI's own public-client parameters, verbatim. They are
+// CONSTANTS of that client, not configuration: the redirect URI is registered
+// at OpenAI as `localhost:1455`, which is why the browser leg of this flow can
+// only ever land on a machine the user controls — precisely the place the
+// vault wants a credential born. The link flows (cli `--oauth` / `--import`)
+// copy `client_id` + `token_endpoint` into the sealed payload so the core's
+// ONE generic renewal path drives Codex like every other OAuth bag.
+pub mod codex {
+    /// Codex CLI's official OAuth client id (a public client — no secret exists).
+    pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+    pub const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
+    pub const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
+    /// Registered redirect — the reason a server-side callback is impossible.
+    pub const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+    pub const SCOPES: &str = "openid profile email offline_access";
+    /// The ChatGPT-internal endpoint the `codex-responses` native driver calls.
+    pub const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 }
 
 const OAUTH_BAG: &[SecretField] = &[
@@ -221,6 +269,30 @@ const CODEX_BAG: &[SecretField] = &[
         label: "Account id",
         required: false,
         issued: false,
+    },
+    // The renewal trio (see `TOKEN` for why these live in the payload): a
+    // laptop daemon must be able to refresh a grant that another device — or
+    // `--import` from the Codex CLI's own file — obtained. Codex's client id
+    // is a fixed public constant rather than dynamically registered, but
+    // storing it per-connection keeps ONE renewal path in the core instead of
+    // a codex branch reading a different source.
+    SecretField {
+        key: "expires_at",
+        label: "Expires at (unix ms)",
+        required: false,
+        issued: true,
+    },
+    SecretField {
+        key: "client_id",
+        label: "OAuth client id",
+        required: false,
+        issued: true,
+    },
+    SecretField {
+        key: "token_endpoint",
+        label: "Token endpoint",
+        required: false,
+        issued: true,
     },
 ];
 
@@ -284,6 +356,8 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         oauth_capable: false,
         help_url: None,
         mcp_url: None,
+        native_api: None,
+        oauth_client: None,
     },
     ProviderSpec {
         id: "anthropic-api",
@@ -298,6 +372,8 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         oauth_capable: false,
         help_url: Some("https://console.anthropic.com/settings/keys"),
         mcp_url: None,
+        native_api: None,
+        oauth_client: None,
     },
     ProviderSpec {
         id: "openai-api",
@@ -312,6 +388,8 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         oauth_capable: false,
         help_url: Some("https://platform.openai.com/api-keys"),
         mcp_url: None,
+        native_api: None,
+        oauth_client: None,
     },
     ProviderSpec {
         id: "codex-oauth",
@@ -326,6 +404,21 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         oauth_capable: false,
         help_url: None,
         mcp_url: None,
+        native_api: Some("codex-responses"),
+        oauth_client: Some(OAuthClientSpec {
+            client_id: codex::CLIENT_ID,
+            authorize_url: codex::AUTHORIZE_URL,
+            token_endpoint: codex::TOKEN_ENDPOINT,
+            redirect_uri: codex::REDIRECT_URI,
+            scopes: codex::SCOPES,
+            // What the Codex CLI itself sends: organizations in the id_token
+            // (that is where chatgpt_account_id rides), and the simplified
+            // consent screen built for exactly this dance.
+            extra_params: &[
+                ("id_token_add_organizations", "true"),
+                ("codex_cli_simplified_flow", "true"),
+            ],
+        }),
     },
     ProviderSpec {
         id: "notion",
@@ -340,6 +433,8 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         oauth_capable: true,
         help_url: Some("https://www.notion.so/my-integrations"),
         mcp_url: Some("https://mcp.notion.com/mcp"),
+        native_api: None,
+        oauth_client: None,
     },
     ProviderSpec {
         id: "figma",
@@ -359,6 +454,8 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         oauth_capable: false,
         help_url: Some("https://www.figma.com/developers/api#access-tokens"),
         mcp_url: Some("https://mcp.figma.com/mcp"),
+        native_api: None,
+        oauth_client: None,
     },
 ];
 
@@ -426,6 +523,20 @@ pub struct ProviderInfo {
     /// what you're told" and every surface re-deriving the same rule slightly
     /// differently — and the browser has no `$HOME` to check against anyway.
     pub browser_linkable: bool,
+    /// One of the user's own **devices** can run this provider's consent screen
+    /// end-to-end, so any client — a browser with no filesystem, a phone — links
+    /// it with one tap: `startConnectionLink` hands the request to a machine
+    /// that holds the vault key, that machine binds the vendor's registered
+    /// loopback redirect and answers with the authorize URL, and the credential
+    /// is born and sealed there.
+    ///
+    /// Derived from the registry's fixed public client, because that client's
+    /// `redirect_uri` is exactly what makes the dance device-only. A UI reads
+    /// this instead of naming providers: `browser_linkable` says "this surface
+    /// can finish it alone", `device_link` says "ask a device to". A provider
+    /// with neither is the only one left that needs a terminal.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub device_link: bool,
 }
 
 /// One field of a provider's secret, as a form needs it.
@@ -458,6 +569,7 @@ pub fn provider_infos() -> Vec<ProviderInfo> {
                 .collect(),
             payload_keys: p.fields.iter().map(|f| f.key.to_string()).collect(),
             browser_linkable: p.import_path.is_none(),
+            device_link: p.oauth_client.is_some(),
             oauth: p.oauth_capable,
             help_url: p.help_url.map(str::to_string),
             mcp_url: p.mcp_url.map(str::to_string),
@@ -657,6 +769,34 @@ mod tests {
         assert!(!by("codex-oauth").browser_linkable);
     }
 
+    /// `browser_linkable: false` must not be read as "terminal only". Codex is
+    /// the case that matters: no browser can finish it alone (the vendor's
+    /// redirect is a loopback port), and yet ONE TAP links it anywhere, because
+    /// a device of yours runs the dance. A client decides which of the two
+    /// affordances to draw from these booleans and from nothing else — the day
+    /// this pair says "neither" for codex is the day the web pane silently
+    /// starts telling people to open a terminal again.
+    #[test]
+    fn device_link_marks_the_providers_a_machine_can_consent_for() {
+        for info in provider_infos() {
+            let spec = provider(&info.id).unwrap();
+            assert_eq!(
+                info.device_link,
+                spec.oauth_client.is_some(),
+                "{} disagrees with its oauth_client",
+                info.id
+            );
+            assert!(
+                info.browser_linkable || info.device_link || spec.import_path.is_some(),
+                "{}: a provider a client can neither finish nor delegate is unlinkable",
+                info.id
+            );
+        }
+        let by = |id: &str| provider_infos().into_iter().find(|p| p.id == id).unwrap();
+        assert!(by("codex-oauth").device_link, "codex links in one tap");
+        assert!(!by("notion").device_link, "notion finishes in the browser");
+    }
+
     /// A form can't render an input it has no label for.
     #[test]
     fn every_provider_exposes_its_fields() {
@@ -747,14 +887,17 @@ mod tests {
     /// otherwise the device that logged in is the only one that could ever
     /// renew, and it is usually not the device doing the calling.
     ///
-    /// Scoped to `mcp_url` deliberately: we renew what we drive. `codex-oauth`
-    /// and `claude-code-oauth` also hold refresh tokens, but those are spent by
-    /// the vendor's own CLI against a file we merely imported — reaching in to
-    /// rotate them would be two things racing over one credential.
+    /// Scoped to callable surfaces (`mcp_url` OR `native_api`) deliberately: we
+    /// renew what we drive. `claude-code-oauth` also holds a refresh token, but
+    /// it is spent by the vendor's own CLI against a file we merely imported —
+    /// reaching in to rotate it would be two things racing over one credential.
+    /// `codex-oauth` crossed this line the day it gained a native driver: a
+    /// grant we call with is a grant we must be able to renew, and `--oauth`
+    /// mints a fresh grant precisely so that renewal races nothing.
     #[test]
     fn a_provider_we_call_can_store_what_a_refresh_needs() {
         for p in PROVIDERS {
-            if p.mcp_url.is_none() {
+            if p.mcp_url.is_none() && p.native_api.is_none() {
                 continue;
             }
             let keys: Vec<&str> = p.fields.iter().map(|f| f.key).collect();
@@ -828,5 +971,30 @@ mod tests {
             "lookup must be exact — ids are canonical lowercase"
         );
         assert!(provider("dropbox").is_none());
+    }
+
+    /// The codex row is the one native (non-MCP) callable surface, and the
+    /// contract has three parts a regression would break separately: the driver
+    /// name the core dispatches on, the renewal trio the link flows must fill,
+    /// and the fact that `client_id`/`token_endpoint` never render as inputs —
+    /// they are the CLI's own constants, not something a human should type.
+    #[test]
+    fn codex_is_natively_callable_and_renewable() {
+        let p = provider("codex-oauth").unwrap();
+        assert_eq!(p.native_api, Some("codex-responses"));
+        let keys: Vec<&str> = p.fields.iter().map(|f| f.key).collect();
+        for k in ["access_token", "refresh_token", "account_id", "expires_at", "client_id", "token_endpoint"] {
+            assert!(keys.contains(&k), "codex payload must store `{k}`");
+        }
+        let info = provider_infos().into_iter().find(|i| i.id == "codex-oauth").unwrap();
+        assert!(
+            !info.fields.iter().any(|f| f.key == "client_id" || f.key == "token_endpoint" || f.key == "expires_at"),
+            "issued fields must not become form inputs"
+        );
+        // The constants the link flows copy into the payload — a typo here
+        // strands every new connection at the token endpoint.
+        assert!(codex::TOKEN_ENDPOINT.starts_with("https://auth.openai.com/"));
+        assert!(codex::REDIRECT_URI.starts_with("http://localhost:1455/"));
+        assert!(codex::RESPONSES_URL.ends_with("/backend-api/codex/responses"));
     }
 }

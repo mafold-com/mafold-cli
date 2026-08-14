@@ -300,6 +300,89 @@ pub async fn http_post(
     }
 }
 
+// ── streaming HTTP, for provider surfaces that answer as SSE ───────────────
+//
+// Same two-transport split as everything above, with one honest asymmetry: the
+// browser's `gloo` fetch surfaces the body only when it is complete, so on wasm
+// a "stream" is the whole body delivered as one chunk at the end. That is a
+// degradation, not a lie — callers see identical types and the same terminal
+// behaviour, they just see it later. The devices that actually answer long
+// streaming calls are native daemons; the wasm arm exists so the core keeps
+// compiling everywhere rather than to make a browser a good streaming device.
+
+/// One in-flight streaming reply. `next()` yields raw body bytes as they
+/// arrive (native) or the whole body once (wasm), then `None`.
+pub struct StreamingReply {
+    pub status: u16,
+    #[cfg(not(target_arch = "wasm32"))]
+    inner: Option<reqwest::Response>,
+    #[cfg(target_arch = "wasm32")]
+    inner: Option<Vec<u8>>,
+}
+
+impl StreamingReply {
+    pub async fn next(&mut self) -> Result<Option<Vec<u8>>, RpcError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(resp) = self.inner.as_mut() else { return Ok(None) };
+            match resp.chunk().await {
+                Ok(Some(b)) => Ok(Some(b.to_vec())),
+                Ok(None) => {
+                    self.inner = None;
+                    Ok(None)
+                }
+                Err(e) => {
+                    self.inner = None;
+                    Err(RpcError::Transport(e.to_string()))
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Ok(self.inner.take())
+        }
+    }
+}
+
+/// POST and hold the reply open. On a NON-success status the caller usually
+/// wants the error body in one piece — use `next()` all the same; error bodies
+/// are small and arrive in one or two chunks.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn http_post_streaming(
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+) -> Result<StreamingReply, RpcError> {
+    let mut req = client().post(url).body(body.to_string());
+    for (k, v) in headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    let resp = req.send().await.map_err(|e| {
+        if e.is_connect() {
+            RpcError::Connect(e.to_string())
+        } else {
+            RpcError::Transport(e.to_string())
+        }
+    })?;
+    Ok(StreamingReply {
+        status: resp.status().as_u16(),
+        inner: Some(resp),
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn http_post_streaming(
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+) -> Result<StreamingReply, RpcError> {
+    let reply = http_post(url, headers, body).await?;
+    Ok(StreamingReply {
+        status: reply.status,
+        inner: Some(reply.body.into_bytes()),
+    })
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;

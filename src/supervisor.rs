@@ -694,6 +694,11 @@ pub async fn supervise(base: String, auto_update: bool) {
         let _ = writeln!(f, "{}", std::process::id());
     }
     println!("supervisor up (pid {}) · base {base}", std::process::id());
+    // Answer granted connection calls for the OWNER's account while the
+    // daemons run — the piece that makes "@chatgpt on my Codex subscription"
+    // work whenever this machine is up. Quiet: it only serves when the vault
+    // key is already cached here (see `connection::supervise_listener`).
+    tokio::spawn(crate::connection::supervise_listener(base.clone()));
     let http = reqwest::Client::new();
     let mut ticks: u64 = 0;
     loop {

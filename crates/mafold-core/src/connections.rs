@@ -84,7 +84,7 @@ impl Runtime {
             .unwrap_or_default())
     }
 
-    async fn get(&self, name: &str) -> Result<Value> {
+    pub(crate) async fn get(&self, name: &str) -> Result<Value> {
         let items = self.list().await?;
         items
             .into_iter()
@@ -165,7 +165,40 @@ impl Runtime {
         client.list_tools().await
     }
 
-    /// Run one method.
+    /// Run one call on whatever surface the provider exposes: a native driver
+    /// when the registry row names one, MCP otherwise. Streaming (chunked
+    /// answers back to the api) is a native-driver affair — MCP answers stay
+    /// single-shot.
+    pub async fn call_any(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        method: &str,
+        params: &Value,
+        stream: bool,
+    ) -> Result<Value> {
+        let conn = self.get(name).await?;
+        let spec = Self::spec_of(&conn)?;
+        match spec.native_api {
+            Some("codex-responses") => {
+                if method != "responses" {
+                    return Err(format!(
+                        "{} offers exactly one method, `responses` — `{method}` is not it",
+                        spec.display
+                    ));
+                }
+                crate::codex::run(self, call_id, name, &conn, spec, params, stream).await
+            }
+            // A row this build has never heard of: a version problem, phrased
+            // as one (the same stance as `spec_of`).
+            Some(other) => Err(format!(
+                "`{name}` is driven by `{other}`, which this version doesn't know — update mafold"
+            )),
+            None => self.call(name, method, params.clone()).await,
+        }
+    }
+
+    /// Run one MCP method.
     pub async fn call(&mut self, name: &str, method: &str, params: Value) -> Result<Value> {
         let conn = self.get(name).await?;
         let spec = Self::spec_of(&conn)?;
@@ -193,7 +226,7 @@ impl Runtime {
     /// first call after an idle hour pay a failed round trip, and it cannot
     /// distinguish "expired" from "revoked" — so it retries credentials that
     /// will never work again.
-    async fn refreshed_payload(
+    pub(crate) async fn refreshed_payload(
         &self,
         name: &str,
         conn: &Value,
@@ -220,7 +253,7 @@ impl Runtime {
     /// that a browser obtained. That is the entire reason those two are stored
     /// rather than treated as configuration: the browser registers its OAuth
     /// client dynamically, so the client id exists nowhere else in the world.
-    async fn renew(
+    pub(crate) async fn renew(
         &self,
         name: &str,
         conn: &Value,
@@ -349,7 +382,8 @@ pub async fn handle_event(rt: &mut Runtime, envelope: &str) -> bool {
     }
 
     let params = p.get("params").cloned().unwrap_or(serde_json::json!({}));
-    let answer = match rt.call(&name, &method, params).await {
+    let stream = p.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let answer = match rt.call_any(&call_id, &name, &method, &params, stream).await {
         Ok(result) => serde_json::json!({ "call_id": call_id, "result": result }),
         Err(e) => serde_json::json!({ "call_id": call_id, "error": e }),
     };

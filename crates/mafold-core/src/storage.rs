@@ -143,9 +143,54 @@ mod idb_store {
     /// KV shape SqliteStore exposes, so the portable `Store` logic is identical.
     pub struct IdbStore { db: Database }
 
+    /// How long an open (and its version upgrade) may take before we stop
+    /// waiting on it. Milliseconds; a healthy open resolves in single digits.
+    const OPEN_TIMEOUT_MS: u32 = 2_500;
+    /// The scratch database a wedged boot falls back to — see `open`.
+    const FALLBACK_SUFFIX: &str = "!fallback";
+
     impl IdbStore {
         pub async fn open(name: &str) -> Result<Self, String> {
             let factory = Factory::new().map_err(|e| e.to_string())?;
+            match Self::open_at(&factory, name).await? {
+                Some(db) => {
+                    // The real cache opened — drop any scratch left behind by a
+                    // previously wedged boot (fire-and-forget: nobody holds a
+                    // fallback db open past its own page).
+                    let _ = factory.delete(&format!("{name}{FALLBACK_SUFFIX}"));
+                    Ok(Self { db })
+                }
+                None => {
+                    // 2026-08-14, web@0.1.65: a tab still on the PREVIOUS build
+                    // holds this database at its old version and — having no
+                    // versionchange handler (that close arrived WITH the schema
+                    // bump) — never lets go. The upgrade open then blocks
+                    // forever, and every later open of the same name queues
+                    // BEHIND it (spec order), so waiting longer cannot help,
+                    // and the whole app sat on a blank screen that a hard
+                    // refresh could not fix. A rebuildable CACHE must never be
+                    // able to do that: boot on a scratch database instead (cold
+                    // cache — correct, just slower), while the queued upgrade
+                    // finishes in the background whenever the old tab goes
+                    // away; the next boot then gets the real store, rebuilt.
+                    web_sys::console::warn_1(&format!(
+                        "[mafold-core] {name} blocked by an old-version holder — booting on a scratch cache"
+                    ).into());
+                    match Self::open_at(&factory, &format!("{name}{FALLBACK_SUFFIX}")).await? {
+                        Some(db) => Ok(Self { db }),
+                        None => Err(format!("indexeddb open blocked: {name} (and its fallback)")),
+                    }
+                }
+            }
+        }
+
+        /// One guarded open: attach the rebuild-on-upgrade + close-on-version-
+        /// change handlers, race the request against `OPEN_TIMEOUT_MS`. `None`
+        /// = timed out (blocked); the still-pending request is handed to a
+        /// background task that CLOSES the connection when it eventually
+        /// resolves — releasing it and leaving the store rebuilt for next boot.
+        async fn open_at(factory: &Factory, name: &str) -> Result<Option<Database>, String> {
+            use futures::future::{select, Either};
             let mut req = factory.open(name, Some(SCHEMA_VERSION)).map_err(|e| e.to_string())?;
             req.on_upgrade_needed(|event| {
                 if let Ok(db) = event.database() {
@@ -159,13 +204,26 @@ mod idb_store {
                     let _ = db.create_object_store(STORE, ObjectStoreParams::new());
                 }
             });
-            let mut db = req.await.map_err(|e| e.to_string())?;
-            // Never make another tab's future schema upgrade wait forever on
-            // this connection. The next access reopens the rebuildable cache.
-            db.on_version_change(|event| {
-                if let Ok(db) = event.database() { db.close(); }
-            });
-            Ok(Self { db })
+            let deadline = Box::pin(gloo_timers::future::TimeoutFuture::new(OPEN_TIMEOUT_MS));
+            match select(Box::pin(std::future::IntoFuture::into_future(req)), deadline).await {
+                Either::Left((db, _)) => {
+                    let mut db = db.map_err(|e| e.to_string())?;
+                    // Never make another tab's future schema upgrade wait forever on
+                    // this connection. The next access reopens the rebuildable cache.
+                    db.on_version_change(|event| {
+                        if let Ok(db) = event.database() { db.close(); }
+                    });
+                    Ok(Some(db))
+                }
+                Either::Right(((), pending)) => {
+                    wasm_bindgen_futures::spawn_local(async move {
+                        if let Ok(db) = pending.await {
+                            db.close();
+                        }
+                    });
+                    Ok(None)
+                }
+            }
         }
     }
 

@@ -31,7 +31,7 @@ impl Harness for ClaudeCode {
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");
         }
-        let mut cmd = tokio::process::Command::new("claude");
+        let mut cmd = tokio::process::Command::new(super::program("claude"));
         cmd.arg("-p").arg(&prompt)
             .arg("--output-format").arg("stream-json")
             .arg("--verbose")
@@ -123,7 +123,7 @@ impl Harness for ClaudeCode {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("couldn't run `claude` in {workdir} — is Claude Code installed and on PATH?"))?;
+            .with_context(|| super::spawn_hint("claude", &workdir))?;
         // Register this run in the live-children set so a daemon shutdown kills
         // exactly THIS process (see harness::live_children); RAII — deregisters
         // on every exit path.
