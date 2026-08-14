@@ -203,7 +203,7 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| super::spawn_hint("kimi", workdir))?;
+        .map_err(|e| super::spawn_err("kimi", workdir, e))?;
     // Register this run in the live-children set so a daemon shutdown kills exactly
     // THIS process (see harness::live_children); RAII deregisters on every path.
     let _child_guard = crate::harness::ChildGuard::new(child.id());

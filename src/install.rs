@@ -10,7 +10,7 @@
 //! command in-app, so keep behaviour aligned with the product guide
 //! (mafold-api brains/prompts.rs) and the api's `INSTALLABLE_RUNTIMES`.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 /// One installable runtime. Order = the product's canonical display order
 /// (claude code / codex / kimi / opencode) — the web install page mirrors it.

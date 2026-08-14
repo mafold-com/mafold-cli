@@ -120,10 +120,16 @@ impl Harness for ClaudeCode {
             .current_dir(&workdir)
             .env_remove("CLAUDECODE")
             .env_remove("ANTHROPIC_API_KEY")
+            // NULL stdin, like the codex/kimi harnesses — this was the last spawn
+            // still inheriting ours. The prompt rides on `-p`, so the child has no
+            // use for it, and inheriting made the spawn depend on whatever handle
+            // the daemon happens to hold: on Windows that is a duplication
+            // `CreateProcessW` can refuse outright.
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| super::spawn_hint("claude", &workdir))?;
+            .map_err(|e| super::spawn_err("claude", &workdir, e))?;
         // Register this run in the live-children set so a daemon shutdown kills
         // exactly THIS process (see harness::live_children); RAII — deregisters
         // on every exit path.

@@ -196,7 +196,7 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| super::spawn_hint("codex", workdir))?;
+            .map_err(|e| super::spawn_err("codex", workdir, e))?;
         // Register this run in the live-children set so a daemon shutdown kills
         // exactly THIS process (see harness::live_children) — same contract as
         // the Claude harness; RAII deregisters on every exit path.

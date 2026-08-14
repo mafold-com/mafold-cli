@@ -641,13 +641,61 @@ fn exe_candidates(bin: &str) -> Vec<String> {
 /// Why `bin` wouldn't start — one wording for every harness. Separates the two
 /// failures the old message ran together: nothing installed at all, vs. a shim we
 /// found and still couldn't launch.
-pub(crate) fn spawn_hint(bin: &str, workdir: &str) -> String {
-    match resolve(bin) {
+///
+/// The second half has to carry the CAUSE. `couldn't start \`claude\`
+/// (C:\Users\…\claude.exe)` on its own is unfalsifiable — it names a file that
+/// demonstrably exists (we just resolved it) and then says nothing about which
+/// syscall refused. The `io::Error` holding that answer stays attached as the
+/// anyhow source, and the codes a spawn of an already-resolved file can fail
+/// with get spelled out here, because "os error 193" is not something the person
+/// reading the chat can act on.
+pub(crate) fn spawn_err(bin: &str, workdir: &str, e: std::io::Error) -> anyhow::Error {
+    let head = match resolve(bin) {
         Some(p) => format!("couldn't start `{bin}` ({}) in {workdir}", p.display()),
         None => format!(
             "`{bin}` is not on PATH — is it installed? (looked for: {})",
             exe_candidates(bin).join(", ")
         ),
+    };
+    match spawn_cause(&e) {
+        Some(why) => anyhow::Error::new(e).context(format!("{head} — {why}")),
+        None => anyhow::Error::new(e).context(head),
+    }
+}
+
+/// Plain language for the handful of OS errors that can reject a program we
+/// already found on `$PATH`. Raw codes are per-OS, so each set is gated; the
+/// kinds std normalizes are matched first.
+fn spawn_cause(e: &std::io::Error) -> Option<&'static str> {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        return Some("access denied — antivirus or file permissions are blocking it");
+    }
+    #[cfg(windows)]
+    {
+        // CreateProcessW's own codes (winerror.h).
+        return match e.raw_os_error() {
+            Some(2) => Some("it disappeared between the PATH lookup and the spawn"),
+            Some(193) => Some(
+                "not a valid Windows program — a truncated download or the wrong architecture; \
+                 reinstall Claude Code",
+            ),
+            Some(206) => Some(
+                "the command line is past the Windows 32,767-character limit — the prompt plus \
+                 system prompt is too long for argv",
+            ),
+            Some(267) => Some("the working directory isn't usable"),
+            Some(1455) => Some("Windows is out of commit charge (paging file too small)"),
+            _ => None,
+        };
+    }
+    #[allow(unreachable_code)]
+    {
+        // ENOEXEC / E2BIG — the two Unix equivalents worth naming.
+        match e.raw_os_error() {
+            Some(8) => Some("not an executable format — a script with no `#!` line?"),
+            Some(7) => Some("the argument list is too long for exec"),
+            _ => None,
+        }
     }
 }
 
@@ -670,6 +718,22 @@ mod path_resolution_tests {
                 assert!(resolve(bin).is_some_and(|p| p.is_absolute() || p.exists()));
             }
         }
+    }
+
+    /// A spawn failure has to say WHY, and it has to survive the trip to chat.
+    /// The daemon renders with `{:#}`, so the `io::Error` we keep as the source —
+    /// the only part that names the syscall's refusal — must show up there;
+    /// plain `{}` shows just the context line, which is the dead end two Windows
+    /// rounds were spent staring at.
+    #[test]
+    fn spawn_error_carries_the_os_cause() {
+        // EACCES / ERROR_ACCESS_DENIED — both normalize to PermissionDenied.
+        let raw = if cfg!(windows) { 5 } else { 13 };
+        let e = spawn_err("claude", "/tmp/wd", std::io::Error::from_raw_os_error(raw));
+        let full = format!("{e:#}");
+        assert!(full.contains("access denied"), "no plain-language cause: {full}");
+        assert!(full.contains("os error"), "OS code dropped: {full}");
+        assert!(!format!("{e}").contains("os error"), "test is asserting nothing");
     }
 
     /// A non-executable file named like the CLI is not an install — `execvp`
