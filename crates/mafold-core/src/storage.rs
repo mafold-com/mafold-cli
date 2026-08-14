@@ -13,6 +13,13 @@ pub trait Storage {
     async fn scan_prefix(&self, table: &str, prefix: &str) -> Vec<(String, Vec<u8>)>;
 }
 
+/// Shape version of the rebuildable client cache.
+///
+/// Native SQLite and browser IndexedDB must move together: both persist the
+/// same opaque `CoreMessage.payload`, so a wire-shape change (for example the
+/// file-id attachment cutover) invalidates both stores equally.
+const SCHEMA_VERSION: u32 = 101;
+
 // ───────────────────────── native: SQLite as a KV table ─────────────────────────
 #[cfg(not(target_arch = "wasm32"))]
 mod sqlite {
@@ -24,8 +31,6 @@ mod sqlite {
     /// Bump to invalidate the local cache (the value JSON shape changed, etc.).
     /// The DB is a rebuildable cache: a mismatch DROPs `kv` and the network
     /// repopulates — no fragile in-place migrations.
-    const SCHEMA_VERSION: i64 = 100;
-
     pub struct SqliteStore {
         conn: Mutex<Connection>,
     }
@@ -35,9 +40,9 @@ mod sqlite {
             let conn = Connection::open(path)?;
             conn.pragma_update(None, "journal_mode", "WAL").ok();
             let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
-            if v != SCHEMA_VERSION {
+            if v != i64::from(super::SCHEMA_VERSION) {
                 conn.execute("DROP TABLE IF EXISTS kv", []).ok();
-                let _ = conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"));
+                let _ = conn.execute_batch(&format!("PRAGMA user_version = {};", super::SCHEMA_VERSION));
             }
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS kv (tbl TEXT NOT NULL, k TEXT NOT NULL, v BLOB NOT NULL, PRIMARY KEY (tbl, k))",
@@ -121,7 +126,7 @@ mod idb_store {
     use idb::{Database, DatabaseEvent, Factory, KeyRange, ObjectStoreParams, Query, TransactionMode};
     use js_sys::Uint8Array;
     use wasm_bindgen::JsValue;
-    use super::Storage;
+    use super::{Storage, SCHEMA_VERSION};
 
     const STORE: &str = "kv";
     const SEP: char = '\u{1f}'; // unit separator joining {table}{SEP}{key} into one IDB key
@@ -141,15 +146,25 @@ mod idb_store {
     impl IdbStore {
         pub async fn open(name: &str) -> Result<Self, String> {
             let factory = Factory::new().map_err(|e| e.to_string())?;
-            let mut req = factory.open(name, Some(1)).map_err(|e| e.to_string())?;
+            let mut req = factory.open(name, Some(SCHEMA_VERSION)).map_err(|e| e.to_string())?;
             req.on_upgrade_needed(|event| {
                 if let Ok(db) = event.database() {
-                    if !db.store_names().iter().any(|n| n == STORE) {
-                        let _ = db.create_object_store(STORE, ObjectStoreParams::new());
+                    // This database is only a network-rebuildable cache. Keeping
+                    // opaque payloads across a schema bump is actively unsafe:
+                    // old attachment JSON reached new React code after the
+                    // file-id cutover and crashed the whole chat timeline.
+                    if db.store_names().iter().any(|n| n == STORE) {
+                        let _ = db.delete_object_store(STORE);
                     }
+                    let _ = db.create_object_store(STORE, ObjectStoreParams::new());
                 }
             });
-            let db = req.await.map_err(|e| e.to_string())?;
+            let mut db = req.await.map_err(|e| e.to_string())?;
+            // Never make another tab's future schema upgrade wait forever on
+            // this connection. The next access reopens the rebuildable cache.
+            db.on_version_change(|event| {
+                if let Ok(db) = event.database() { db.close(); }
+            });
             Ok(Self { db })
         }
     }

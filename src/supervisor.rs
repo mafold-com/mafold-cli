@@ -113,16 +113,25 @@ fn reap() {
     platform::reap_children();
 }
 
-/// `mafold add <name> --workdir … [--harness …]` (token from global --token).
-/// A daemon should simply exist — so adding one brings the boot-persistent
-/// supervisor up: it runs now AND after every reboot, no extra step.
-pub fn add(name: String, token: String, workdir: String, harness: Option<String>, base: &str, no_auto_update: bool) -> Result<()> {
+/// Wire a daemon into the config — the shared write both doors use. The
+/// supervisor's own provision claim calls THIS (its next tick starts the
+/// daemon); routing it through `add()` would have the running supervisor call
+/// `up()` → `kill_supervisor_process()` — terminating itself mid-claim.
+pub fn wire(name: String, token: String, workdir: String, harness: Option<String>) -> Result<()> {
     let workdir = fs::canonicalize(&workdir).map(|p| p.to_string_lossy().into_owned()).unwrap_or(workdir);
     let mut c = load();
     c.daemons.retain(|d| d.name != name);
     c.daemons.push(DaemonCfg { name: name.clone(), token, workdir, harness: harness.filter(|s| !s.is_empty()) });
     store(&c)?;
     println!("✓ added daemon `{name}`");
+    Ok(())
+}
+
+/// `mafold add <name> --workdir … [--harness …]` (token from global --token).
+/// A daemon should simply exist — so adding one brings the boot-persistent
+/// supervisor up: it runs now AND after every reboot, no extra step.
+pub fn add(name: String, token: String, workdir: String, harness: Option<String>, base: &str, no_auto_update: bool) -> Result<()> {
+    wire(name, token, workdir, harness)?;
     up(base, no_auto_update)
 }
 
@@ -592,8 +601,17 @@ fn autostart_loaded() -> bool { false }
 /// picks up add/rm within ~10s).
 pub fn up(base: &str, no_auto_update: bool) -> Result<()> {
     let c = load();
-    if c.daemons.is_empty() {
-        println!("No daemons configured. Add one:\n  mafold --token mb_… add <bot> --workdir /path/to/repo");
+    // ZERO daemons is not a reason to stay down: after `mafold login` the
+    // supervisor is also this machine's control plane — it keeps the harness
+    // report fresh (the api's online window is 90s, so a one-shot report goes
+    // dark before the user even finishes naming their bot) and claims
+    // auto-provisioned bots, which is how the FIRST bot arrives. Refusing to
+    // run on an empty config was a chicken-and-egg that killed onboarding:
+    // the web can only provision onto a machine whose supervisor is up.
+    if c.daemons.is_empty() && crate::session::load().is_none() {
+        println!("Nothing to do yet — this machine has no login and no daemons. Either:");
+        println!("  mafold login                                    # connect it (bots you create on the web then auto-install)");
+        println!("  mafold --token mb_… add <bot> --workdir /path   # or wire a bot by hand");
         return Ok(());
     }
     if autostart_current(base, no_auto_update) {
@@ -609,13 +627,13 @@ pub fn up(base: &str, no_auto_update: bool) -> Result<()> {
             }
             println!("↑ revived the supervisor (task was registered but no process was running)");
         }
-        println!("✓ supervisor enabled (boot-persistent) — managing {} daemon(s); picks up changes within ~10s", c.daemons.len());
+        println!("✓ supervisor enabled (boot-persistent) — {}; picks up changes within ~10s", managing(c.daemons.len()));
         return Ok(());
     }
     kill_supervisor_process(); // clear any stale detached supervisor first
     match ensure_autostart(base, no_auto_update) {
         Ok(()) => {
-            println!("✓ supervisor enabled — managing {} daemon(s); starts on login + relaunches on crash", c.daemons.len());
+            println!("✓ supervisor enabled — {}; starts on login + relaunches on crash", managing(c.daemons.len()));
             println!("  logs:   ~/.mafold/daemons/<name>/log  (supervisor: ~/.mafold/supervisor.log)");
             println!("  status: mafold status   ·   stop: mafold down");
         }
@@ -624,13 +642,23 @@ pub fn up(base: &str, no_auto_update: bool) -> Result<()> {
             eprintln!("note: couldn't enable autostart ({e}); running detached (won't survive reboot)");
             if sup_running().is_none() {
                 let pid = start_supervisor(base, no_auto_update)?;
-                println!("✓ supervisor running (pid {pid}) — managing {} daemon(s)", c.daemons.len());
+                println!("✓ supervisor running (pid {pid}) — {}", managing(c.daemons.len()));
             } else {
                 println!("supervisor already running (detached)");
             }
         }
     }
     Ok(())
+}
+
+/// The "what it's doing" clause of `up`'s confirmations — with zero daemons the
+/// supervisor isn't managing anything yet, it's WAITING for the first one.
+fn managing(n: usize) -> String {
+    if n == 0 {
+        "waiting to auto-install the first bot you create on the web".into()
+    } else {
+        format!("managing {n} daemon(s)")
+    }
 }
 
 /// Spawn the detached `mafold supervise` process.
@@ -728,7 +756,7 @@ pub async fn supervise(base: String, auto_update: bool) {
         // (→ add + start their daemons, no `mafold add` paste) and keep this
         // machine's harness report fresh (~every 30s) so New-Bot sees it online.
         if let Some(sess) = crate::session::load() {
-            if let Err(e) = poll_provisions(&http, &base, &sess, !auto_update).await {
+            if let Err(e) = poll_provisions(&http, &base, &sess).await {
                 eprintln!("provision poll failed: {e}");
             }
             if ticks % 3 == 0 {
@@ -741,9 +769,8 @@ pub async fn supervise(base: String, auto_update: bool) {
 
 /// Claim auto-provision requests for this device and wire each bot into the local
 /// config (the next loop tick starts its daemon). The bot's mb_ token arrives over
-/// the owner's authenticated session — no copy-paste. `no_auto_update` carries the
-/// supervisor's own update setting into the (re)registered autostart entry.
-async fn poll_provisions(http: &reqwest::Client, base: &str, sess: &crate::session::Session, no_auto_update: bool) -> Result<()> {
+/// the owner's authenticated session — no copy-paste.
+async fn poll_provisions(http: &reqwest::Client, base: &str, sess: &crate::session::Session) -> Result<()> {
     let resp: serde_json::Value = http
         .post(format!("{base}/api/claimProvisions"))
         .bearer_auth(&sess.token)
@@ -761,7 +788,9 @@ async fn poll_provisions(http: &reqwest::Client, base: &str, sess: &crate::sessi
         }
         let harness = it["harness"].as_str().map(str::to_string);
         let workdir = provision_workdir(&name);
-        match add(name.clone(), token, workdir, harness, base, no_auto_update) {
+        // wire(), NOT add(): add()'s `up()` would kill_supervisor_process() —
+        // i.e. this very process, mid-claim. The next tick starts the daemon.
+        match wire(name.clone(), token, workdir, harness) {
             Ok(()) => println!("⬇ provisioned @{name} — its daemon starts on the next tick"),
             Err(e) => eprintln!("provision @{name} failed: {e}"),
         }

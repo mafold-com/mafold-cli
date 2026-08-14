@@ -303,7 +303,7 @@ async fn main() -> Result<()> {
         let Cmd::Login { username, password } = cli.cmd else {
             unreachable!()
         };
-        return login(&cli.base, username, password).await;
+        return login(&cli.base, username, password, cli.no_auto_update).await;
     }
     if matches!(cli.cmd, Cmd::Report) {
         return report_harnesses(&cli.base).await;
@@ -418,11 +418,11 @@ pub(crate) fn prompt_password(label: &str) -> String {
 }
 
 /// `mafold login` — mint a human `s_` session + report this machine's harnesses.
-async fn login(base: &str, username: Option<String>, password: Option<String>) -> Result<()> {
+async fn login(base: &str, username: Option<String>, password: Option<String>, no_auto_update: bool) -> Result<()> {
     // Default (no args) → browser device flow, à la `gh auth login`. Passing
     // --username/--password keeps the direct password login (CI / scripted).
     if username.is_none() && password.is_none() {
-        return login_device(base).await;
+        return login_device(base, no_auto_update).await;
     }
     let username = username.unwrap_or_else(|| prompt("Mafold username: "));
     let password = password.unwrap_or_else(|| prompt_password("Password: "));
@@ -453,13 +453,15 @@ async fn login(base: &str, username: Option<String>, password: Option<String>) -
         .as_str()
         .unwrap_or(&username)
         .to_string();
-    finish_login(base, token, uname).await
+    // Scripted path (CI, harnesses): mint the session + report, nothing more —
+    // registering a boot-persistent supervisor is an interactive-machine move.
+    finish_login(base, token, uname, false, no_auto_update).await
 }
 
 /// gh-style device login: get a short code, the user approves it in the Mafold
 /// web app, and we poll until the session token comes back. Works on headless /
 /// remote machines (no browser needed on THIS box — approve from your phone).
-async fn login_device(base: &str) -> Result<()> {
+async fn login_device(base: &str, no_auto_update: bool) -> Result<()> {
     let http = reqwest::Client::new();
     let start: serde_json::Value = http
         .post(format!("{base}/api/auth/device/start"))
@@ -477,8 +479,17 @@ async fn login_device(base: &str) -> Result<()> {
         .unwrap_or("https://mafold.com/login/device");
     let interval = r["interval"].as_u64().unwrap_or(3).max(1);
 
-    println!("\n  Open this URL in your browser:  {verify_url}");
-    println!("  and enter the code:             {user_code}\n");
+    // The url carries the code (server-side), so the page can approve in one
+    // tap — but print both anyway: the person may be reading this over ssh and
+    // opening the page on another device, where they'll type the code by hand.
+    let opened = platform::open_browser(verify_url);
+    if opened {
+        println!("\n  Opened your browser to approve this device.");
+        println!("  (URL: {verify_url} — code {user_code})\n");
+    } else {
+        println!("\n  Open this URL in your browser:  {verify_url}");
+        println!("  and enter the code:             {user_code}\n");
+    }
     println!("  Waiting for you to approve…  (Ctrl-C to cancel)");
 
     loop {
@@ -502,7 +513,7 @@ async fn login_device(base: &str) -> Result<()> {
                     .as_str()
                     .unwrap_or("")
                     .to_string();
-                return finish_login(base, token, uname).await;
+                return finish_login(base, token, uname, true, no_auto_update).await;
             }
             "expired" => anyhow::bail!("that code expired — run `mafold login` again"),
             _ => {} // pending — keep polling
@@ -511,7 +522,13 @@ async fn login_device(base: &str) -> Result<()> {
 }
 
 /// Persist the session + report this machine's harnesses (shared by both paths).
-async fn finish_login(base: &str, token: String, uname: String) -> Result<()> {
+///
+/// `auto_up`: the interactive (device-flow) login also brings the supervisor up.
+/// A one-shot harness report goes stale after 90s (the api's online window), and
+/// bots created on the web arrive as provisions only a running supervisor can
+/// claim — so "logged in" without it is a machine that flickers online once and
+/// then can never receive its first bot. The scripted path passes `false`.
+async fn finish_login(base: &str, token: String, uname: String, auto_up: bool, no_auto_update: bool) -> Result<()> {
     let prev = session::load();
     let sess = session::Session {
         token,
@@ -522,7 +539,14 @@ async fn finish_login(base: &str, token: String, uname: String) -> Result<()> {
     session::save(&sess)?;
     println!("✓ logged in as {uname} on {}", sess.device_name);
     report_with(base, &sess).await?;
-    println!("\n→ keep this machine available + auto-provision new bots:  mafold up");
+    if auto_up {
+        // Best-effort: a failure here must not fail the login itself.
+        if let Err(e) = supervisor::up(base, no_auto_update) {
+            eprintln!("note: couldn't start the supervisor ({e:#}) — run `mafold up` to keep this machine available");
+        }
+    } else {
+        println!("\n→ keep this machine available + auto-provision new bots:  mafold up");
+    }
     Ok(())
 }
 

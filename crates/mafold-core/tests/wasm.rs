@@ -13,9 +13,44 @@
 
 use mafold_core::internal::{IdbStore, Storage, Store};
 use mafold_core::{CoreAccount, CoreMessage};
+use idb::{DatabaseEvent, Factory, ObjectStoreParams, TransactionMode};
+use js_sys::Uint8Array;
+use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
+
+/// IndexedDB used to stay at version 1 forever while SQLite had a real cache
+/// schema version. Prove that opening today's core over a v1 database removes
+/// opaque old message payloads instead of feeding them to a new client shape.
+#[wasm_bindgen_test]
+async fn schema_upgrade_drops_old_idb_payloads() {
+    const NAME: &str = "wasmtest-schema-upgrade";
+    let factory = Factory::new().expect("idb factory");
+    let mut req = factory.open(NAME, Some(1)).expect("open old idb");
+    req.on_upgrade_needed(|event| {
+        let db = event.database().expect("old database");
+        db.create_object_store("kv", ObjectStoreParams::new()).expect("old kv store");
+    });
+    let old = req.await.expect("old idb ready");
+    let tx = old.transaction(&["kv"], TransactionMode::ReadWrite).expect("old write tx");
+    let store = tx.object_store("kv").expect("old kv");
+    let bytes = Uint8Array::from(b"legacy attachment payload".as_slice());
+    store
+        .put(&bytes.into(), Some(&JsValue::from_str("msg\u{1f}old")))
+        .expect("put old payload")
+        .await
+        .expect("old payload written");
+    tx.commit().expect("commit old tx").await.expect("old tx committed");
+    old.close();
+
+    let current = IdbStore::open(NAME).await.expect("upgrade current idb");
+    assert_eq!(
+        current.get("msg", "old").await,
+        None,
+        "a cache schema bump must not retain opaque payloads from the old wire"
+    );
+}
 
 fn acct() -> CoreAccount {
     CoreAccount {

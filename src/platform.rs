@@ -170,6 +170,38 @@ pub fn no_window_std(cmd: &mut Command) {
     }
 }
 
+/// Best-effort "open this URL in the default browser" (`mafold login`'s device
+/// flow, à la `gh auth login`). Headless boxes and weird shells just fail the
+/// spawn — the caller always prints the URL too, so nothing depends on this.
+pub fn open_browser(url: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        // `start` is a cmd.exe builtin; the empty "" is its window-title slot,
+        // which otherwise eats a quoted URL.
+        let mut c = Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        no_window_std(&mut c);
+        c
+    };
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 // ────────────────────── cross-process file lock ──────────────────────
 // `update.rs` holds an exclusive lock on `~/.mafold/update.lock` while it swaps
 // the binary. Unix does this inline with `flock`; Windows needs `LockFileEx`.
