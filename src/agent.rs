@@ -3170,7 +3170,7 @@ async fn stamp_finalized_ask(
         return;
     }
     let Some(content) = msg.get("content").and_then(|c| c.as_str()) else { return };
-    let Some(stamped) = crate::render::stamp_unanswered_ask(content, answer) else { return };
+    let Some(stamped) = mafold_transcript::render::stamp_unanswered_ask(content, answer) else { return };
     let _ = client
         .call("editMessage", serde_json::json!({ "message_id": message_id, "text": stamped }))
         .await;
@@ -4342,18 +4342,25 @@ async fn render_loop(
     // snapshot drops the card (it now ends with `{% mafold/result %}`); `handle()` then
     // finalizes. Clients are dumb renderers — the generating indicator is
     // content-driven, never synthesized from `finalized_at`.
+    use mafold_transcript::{Advance, Transcript};
+
     const THROTTLE: Duration = Duration::from_millis(300);
-    let mut names: HashMap<String, String> = HashMap::new();
-    let mut full = String::new(); // content committed to the draft so far
-    let mut buf = String::new(); // pending narration text
-    // The pending consecutive tool cards → one {% mafold/run %}. Held as SLOTS,
-    // not as appended text: a tool call takes its slot immediately (it paints
-    // right away) and its result fills that same slot when it lands, so the
-    // group reads `call → its output` even though the harness streams every
-    // call first and every result after. `open` maps tool_use_id → slot.
-    let mut group: Vec<crate::render::GroupItem> = Vec::new();
-    let mut open: HashMap<String, usize> = HashMap::new();
-    let mut counts: HashMap<&'static str, usize> = HashMap::new();
+    // WHAT the reply says — narration/tool interleaving, consecutive tool cards
+    // collapsing into one `{% mafold/run %}`, each result landing inside the
+    // card of the call that produced it — belongs to the shared transcript
+    // (`mafold-transcript`), so a turn driven by a harness here and one driven
+    // by a brain inside the api render as the same cards.
+    //
+    // This loop owns only WHEN content goes out, and the daemon-only extras
+    // around it: the liveness props on the generating card, background shells,
+    // image uploads, the ask handshake, the bgtasks promise.
+    //
+    // The text policy is the daemon's: hold back a chunk that ends mid-tag, and
+    // splice the official namespace into bare card tags a model wrote.
+    let mut tx = Transcript::with_text_policy(
+        crate::cardtags::commit_boundary,
+        crate::cardtags::qualify,
+    );
     let mut last_push = std::time::Instant::now();
 
     // Live progress props on the generating card: `started` seeds the card's
@@ -4393,9 +4400,14 @@ async fn render_loop(
     }
     macro_rules! generating_tag {
         () => {
-            format!(
-                "\n{{% mafold/generating started={started_ms} beat={beat} beatAt={beat_at_ms} tokens={} shells={shells} /%}}\n",
-                tokens_real.unwrap_or(chars / 4)
+            // Built by the shared renderer, so the api's server-side brains
+            // emit a byte-identical indicator.
+            mafold_transcript::render::generating_tag(
+                started_ms,
+                beat,
+                beat_at_ms,
+                tokens_real.unwrap_or(chars / 4),
+                shells,
             )
         };
     }
@@ -4403,76 +4415,20 @@ async fn render_loop(
     // Show the generating card immediately (covers the model's initial latency).
     let _ = client.edit_draft(&msg_id, &generating_tag!()).await;
 
-    // Model prose → message content. This is the only place text the MODEL
-    // wrote enters `full`, so it is where a bare card tag gets its namespace
-    // spliced in (`{% html %}` → `{% mafold/html %}`, see `cardtags`): the
-    // preamble asks for the qualified form, but a conversation that predates
-    // the namespace migration copies its own `{% html %}` history over any
-    // instruction, and a bare tag renders as a grey "Unsupported card" box
-    // that also eats the card's body.
-    //
-    // Streaming cuts wherever the model breathes, so a chunk ending mid-tag is
-    // held back (`commit_boundary`) rather than committed as half a tag —
-    // `full` never holds a tag the qualifier couldn't see whole. `all` is the
-    // terminal flush: the stream is over, so whatever is left goes out as-is
-    // and the finished message is canonicalised one last time.
-    macro_rules! commit_buf {
-        (all) => {
-            if !buf.is_empty() {
-                full.push_str(&buf);
-                buf.clear();
-            }
-            full = crate::cardtags::qualify(&full);
-        };
-        () => {
-            if !buf.is_empty() {
-                let n = crate::cardtags::commit_boundary(&buf);
-                if n > 0 {
-                    let tagged = buf[..n].contains("{%");
-                    full.push_str(&buf[..n]);
-                    buf.drain(..n);
-                    if tagged {
-                        full = crate::cardtags::qualify(&full);
-                    }
-                }
-            }
-        };
-    }
-    macro_rules! commit_group {
-        () => {
-            if !group.is_empty() {
-                full.push_str(&crate::render::run_card(
-                    &crate::render::run_summary(&counts),
-                    &crate::render::render_group(&group),
-                ));
-                group.clear();
-                // Slots are gone once committed — a result arriving after this
-                // takes the orphan path instead of writing into a stale index.
-                open.clear();
-                counts.clear();
-            }
-        };
-    }
     // Push the running snapshot, throttled. `$force` bypasses the throttle
     // (interactive ask; every tool event — first paint must not lag). The
-    // snapshot INCLUDES the still-open tool group as a live `{% mafold/run %}` with
-    // its CURRENT counts, so the summary ticks "Read 1 file" → "Read 2 files"
-    // and tool cards stream out one by one instead of arriving as a finished
-    // block at commit time. Snapshots are full rewrites (the Telegram-draft
-    // model), so re-rendering the same group each flush is free; committing it
-    // later produces identical text — visually seamless.
+    // snapshot INCLUDES the still-open tool group as a live `{% mafold/run %}`
+    // with its CURRENT counts, so the summary ticks "Read 1 file" → "Read 2
+    // files" and tool cards stream out one by one instead of arriving as a
+    // finished block at commit time. Snapshots are full rewrites (the
+    // Telegram-draft model), so re-rendering the same group each flush is free;
+    // committing it later produces identical text — visually seamless.
     macro_rules! push_running {
         ($force:expr) => {
             if $force || last_push.elapsed() >= THROTTLE {
-                let live_group = if group.is_empty() {
-                    String::new()
-                } else {
-                    crate::render::run_card(
-                        &crate::render::run_summary(&counts),
-                        &crate::render::render_group(&group),
-                    )
-                };
-                let _ = client.edit_draft(&msg_id, &format!("{full}{live_group}{}", generating_tag!())).await;
+                let _ = client
+                    .edit_draft(&msg_id, &format!("{}{}", tx.snapshot(), generating_tag!()))
+                    .await;
                 last_push = std::time::Instant::now();
             }
         };
@@ -4480,174 +4436,134 @@ async fn render_loop(
 
     loop {
         match tokio::time::timeout(Duration::from_millis(120), rx.recv()).await {
-            Ok(Some(ev)) => match &ev {
-                AgentEvent::Text(t) => {
-                    bump_beat!();
-                    chars += t.len() as u64;
-                    commit_group!(); // tools so far → one run card, before this narration
-                    buf.push_str(t);
-                    if buf.len() >= 240 {
-                        commit_buf!();
+            Ok(Some(ev)) => {
+                // ── daemon-only bookkeeping, before the transcript sees it ──
+                // Liveness: `beat` bumps on stream ACTIVITY, which is not the
+                // same as content. Session ids, the ask answer and the end-of-
+                // turn stamp are not the harness making progress, so they don't
+                // bump — a frozen beat has to mean "the stream stalled".
+                match &ev {
+                    AgentEvent::Session(_) | AgentEvent::AskAnswered(_) | AgentEvent::Done { .. } => {}
+                    AgentEvent::Text(t) => {
+                        bump_beat!();
+                        chars += t.len() as u64;
                     }
-                    push_running!(false);
-                }
-                // Heartbeat: silent stream progress (thinking / tool-arg deltas,
-                // real usage counts). Bumps the generating card's props only —
-                // no content commit, and the 300ms throttle caps the traffic.
-                AgentEvent::Pulse { chars: n, tokens } => {
-                    bump_beat!();
-                    chars += n;
-                    if let Some(t) = tokens {
-                        tokens_real = Some(*t);
-                    }
-                    push_running!(false);
-                }
-                // AskUserQuestion blocks the turn — commit everything + the live
-                // interactive card now (force-push), and mark THIS turn (by its
-                // draft id) awaiting an answer. The user answers by replying to this
-                // draft, so concurrent asks in one conversation never cross.
-                AgentEvent::ToolCall { name, .. } if name.eq_ignore_ascii_case("AskUserQuestion") => {
-                    bump_beat!();
-                    commit_buf!();
-                    commit_group!();
-                    if let Some(s) = crate::render::render(&ev, &mut names) {
-                        full.push_str(&s);
-                    }
-                    push_running!(true);
-                    if let Some(st) = chat_states.lock().await.get_mut(&chat_id) {
-                        if let Some(t) = st.turns.get_mut(&msg_id) {
-                            t.ask_file = Some(ask_file.clone());
+                    // Heartbeat: silent stream progress (thinking / tool-arg
+                    // deltas, real usage counts). Props only — no content.
+                    AgentEvent::Pulse { chars: n, tokens } => {
+                        bump_beat!();
+                        chars += n;
+                        if let Some(t) = tokens {
+                            tokens_real = Some(*t);
                         }
                     }
+                    _ => bump_beat!(),
                 }
-                // The pending ask was answered — stamp `a|` rows into the open
-                // ask card (it's the last one in `full`; the turn was blocked on
-                // it, so nothing streamed past it) and force-push so every
-                // client flips the card to answered right away.
-                AgentEvent::AskAnswered(answer) => {
-                    if crate::render::stamp_ask_answered(&mut full, answer) {
-                        push_running!(true);
+                // A Bash started in the background = a live shell the user
+                // should see (CC's "1 shell" footer parity).
+                if let AgentEvent::ToolCall { name, input, .. } = &ev {
+                    if name.eq_ignore_ascii_case("Bash")
+                        && input["run_in_background"].as_bool() == Some(true)
+                    {
+                        shells += 1;
+                        bg_shells.store(shells, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
-                AgentEvent::Done { .. } => {
-                    commit_buf!(all);
-                    commit_group!();
-                    // Detached tasks outlive the turn — leave a visible,
-                    // EXPANDABLE trace instead of letting them run invisibly
-                    // (the 2026-07-18 watcher incident): the card body carries
-                    // each task's command, start time and log tail, and the
-                    // completion-wakeup monitor keeps it fresh after finalize.
-                    //
-                    // THE CARD IS A PROMISE ("结果会出现在下一条回复里"), so it is
-                    // emitted ONLY when the registry proves a task was really
-                    // detached — the same condition `handle()` arms the monitor
-                    // on. The old bare-tag fallback made that promise whenever
-                    // the model merely ASKED for a background Bash, including
-                    // every case where nothing could keep it: no detach story on
-                    // this platform, an older claude that ignores `updatedInput`,
-                    // hook not installed. Silence beats a promise nobody holds.
-                    if shells > 0 {
-                        let snap = bgtasks_snapshot(&surface);
-                        if !snap.is_empty() {
-                            full.push_str(&format!("\n{}\n", bgtasks_block(&snap)));
-                        }
-                    }
-                    if let Some(s) = crate::render::render(&ev, &mut names) {
-                        full.push_str(&s); // {% mafold/result %}
-                    }
-                    // Final snapshot WITHOUT the generating card; handle() finalizes.
-                    // Done is terminal: return NOW so no later timeout tick can
-                    // re-push the generating card over the finished reply.
-                    let _ = client.edit_draft(&msg_id, &full).await;
-                    *final_md.lock().unwrap() = full;
-                    return;
-                }
-                // An image the agent PRODUCED — upload it and hang it on THIS
-                // reply, so it arrives in the same bubble as the text the model
-                // wrote about it. Attachments and content are independent axes
-                // server-side, so this never disturbs the streaming snapshots.
+                // An image the agent PRODUCED is not transcript content — upload
+                // it and hang it on THIS reply, so it arrives in the same bubble
+                // as the text the model wrote about it. Attachments and content
+                // are independent axes server-side, so this never disturbs the
+                // streaming snapshots.
                 //
                 // Awaited, not spawned: a silently-dropped upload reproduces
                 // exactly the bug this path exists to close — the reply says
                 // "已生成" and nothing ever shows up. If it fails, say so in the
                 // transcript rather than leaving the claim standing.
-                AgentEvent::Image { path } => {
-                    bump_beat!();
+                if let AgentEvent::Image { path } = &ev {
                     if let Err(e) = client.attach_media(&msg_id, path).await {
-                        commit_buf!();
-                        commit_group!();
-                        full.push_str(&format!("\n_(couldn't send the image: {e})_\n"));
+                        tx.push_raw(&format!("\n_(couldn't send the image: {e})_\n"));
                     }
                     push_running!(true);
+                    continue;
                 }
-                AgentEvent::Session(_) => {}
-                // tool / diff / bash result / thinking → into the current group.
-                _ => {
-                    bump_beat!(); // any harness event is stream activity
-                    commit_buf!(); // any narration before this group goes out first
-                    // A Bash started in the background = a live shell the user
-                    // should see (CC's "1 shell" footer parity).
-                    if let AgentEvent::ToolCall { name, input, .. } = &ev {
-                        if name.eq_ignore_ascii_case("Bash")
-                            && input["run_in_background"].as_bool() == Some(true)
-                        {
-                            shells += 1;
-                            bg_shells.store(shells, std::sync::atomic::Ordering::Relaxed);
+                // Detached tasks outlive the turn — leave a visible, EXPANDABLE
+                // trace instead of letting them run invisibly (the 2026-07-18
+                // watcher incident): the card body carries each task's command,
+                // start time and log tail, and the completion-wakeup monitor
+                // keeps it fresh after finalize.
+                //
+                // THE CARD IS A PROMISE ("结果会出现在下一条回复里"), so it is
+                // emitted ONLY when the registry proves a task was really
+                // detached — the same condition `handle()` arms the monitor on.
+                // The old bare-tag fallback made that promise whenever the model
+                // merely ASKED for a background Bash, including every case where
+                // nothing could keep it: no detach story on this platform, an
+                // older claude that ignores `updatedInput`, hook not installed.
+                // Silence beats a promise nobody holds.
+                //
+                // Spliced BEFORE the Done event, because Done stamps the
+                // `{% mafold/result %}` card and that goes last.
+                if matches!(ev, AgentEvent::Done { .. }) && shells > 0 {
+                    tx.seal();
+                    let snap = bgtasks_snapshot(&surface);
+                    if !snap.is_empty() {
+                        tx.push_raw(&format!("\n{}\n", bgtasks_block(&snap)));
+                    }
+                }
+
+                match tx.push(&ev) {
+                    // No content of its own. A Pulse still moved the liveness
+                    // props, so let the throttle carry them out; a session id
+                    // changes nothing anyone can see.
+                    Advance::Quiet => {
+                        if matches!(ev, AgentEvent::Pulse { .. }) {
+                            push_running!(false);
                         }
                     }
-                    if let Some(k) = crate::render::tool_kind(&ev) {
-                        *counts.entry(k).or_insert(0) += 1;
-                    }
-                    match &ev {
-                        // The call takes a slot NOW — it paints this push, with
-                        // its output still pending — and holds it for its result.
-                        AgentEvent::ToolCall { id, name, input } => {
-                            names.insert(id.clone(), name.to_lowercase());
-                            open.insert(id.clone(), group.len());
-                            group.push(crate::render::GroupItem::Step(
-                                crate::render::ToolStep::new(name, input),
-                            ));
-                        }
-                        // Into its call's slot. No slot (the group was already
-                        // committed) → fall back to the standalone output card,
-                        // which is where these lived before pairing existed.
-                        AgentEvent::ToolResult { id, text } => match open.get(id) {
-                            Some(&i) => {
-                                if let Some(crate::render::GroupItem::Step(s)) = group.get_mut(i) {
-                                    s.land(text);
-                                }
-                            }
-                            None => {
-                                if let Some(s) = crate::render::render(&ev, &mut names) {
-                                    group.push(crate::render::GroupItem::Card(s));
-                                }
-                            }
-                        },
-                        _ => {
-                            if let Some(s) = crate::render::render(&ev, &mut names) {
-                                group.push(crate::render::GroupItem::Card(s));
-                            }
-                        }
-                    }
+                    Advance::Streamed => push_running!(false),
                     // Force: a tool call/result must paint NOW, not at the next
                     // 300ms tick — this is the "middle states" the transcript
                     // model promises (工具第一时间返回, no batching).
-                    push_running!(true);
+                    Advance::Immediate => {
+                        push_running!(true);
+                        // AskUserQuestion blocks the turn: mark THIS turn (by
+                        // its draft id) as awaiting an answer. The user answers
+                        // by replying to this draft, so concurrent asks in one
+                        // conversation never cross.
+                        if let AgentEvent::ToolCall { name, .. } = &ev {
+                            if name.eq_ignore_ascii_case("AskUserQuestion") {
+                                if let Some(st) = chat_states.lock().await.get_mut(&chat_id) {
+                                    if let Some(t) = st.turns.get_mut(&msg_id) {
+                                        t.ask_file = Some(ask_file.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Final snapshot WITHOUT the generating card; handle()
+                    // finalizes. Done is terminal: return NOW so no later
+                    // timeout tick can re-push the generating card over the
+                    // finished reply.
+                    Advance::Done => {
+                        let out = tx.finish();
+                        let _ = client.edit_draft(&msg_id, &out).await;
+                        *final_md.lock().unwrap() = out;
+                        return;
+                    }
                 }
-            },
+            }
             Ok(None) => break, // harness done → channel closed
             Err(_) => {
-                commit_buf!(); // keep narration moving
+                tx.flush_text(); // keep narration moving
                 push_running!(false);
             }
         }
     }
     // Safety net: stream closed without a Done (error/kill) → commit pending and
     // push a final snapshot WITHOUT the generating card.
-    commit_buf!(all);
-    commit_group!();
-    let _ = client.edit_draft(&msg_id, &full).await;
-    *final_md.lock().unwrap() = full;
+    let out = tx.finish();
+    let _ = client.edit_draft(&msg_id, &out).await;
+    *final_md.lock().unwrap() = out;
 }
 
 #[cfg(test)]

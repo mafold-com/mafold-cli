@@ -56,68 +56,11 @@ impl Drop for ChildGuard {
     }
 }
 
-/// One normalized event from a harness turn. Harness-specific output formats
-/// (Claude Code stream-json, etc.) are parsed down to this common shape.
-/// (`Session` is unused by Claude Code — it returns its session in `TurnOutcome`
-/// — but other harnesses may stream it; kept as common API surface.)
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub enum AgentEvent {
-    /// The harness's resumable session id for this conversation (first seen).
-    Session(String),
-    /// A chunk of streamed assistant text.
-    Text(String),
-    /// A tool / function call the agent made.
-    ToolCall {
-        id: String,
-        name: String,
-        input: Value,
-    },
-    /// The result of a tool call (correlated by `id`).
-    ToolResult { id: String, text: String },
-    /// A thinking / chain-of-thought block (collapsed in the UI).
-    Thinking(String),
-    /// An image the agent PRODUCED this turn, as a path on this machine. The
-    /// render loop uploads it and attaches it to the reply, so it arrives in
-    /// the same bubble as the text — identical to a person sending a photo.
-    ///
-    /// Harness-agnostic on purpose: each harness maps its own native image
-    /// output onto this one event (Codex's `image_gen` writes to
-    /// `$CODEX_HOME/generated_images/…`), exactly as each maps its own
-    /// file-edit shape onto `ToolCall`. Nothing downstream knows which model
-    /// drew the picture.
-    Image { path: std::path::PathBuf },
-    /// Streaming activity that is NOT rendered as content (thinking / tool-arg
-    /// deltas, usage updates): `chars` of raw stream progress plus, when the
-    /// harness knows it, the REAL cumulative output-token count for the turn.
-    /// Drives the `{% generating %}` card's live heartbeat (beat / elapsed /
-    /// tokens) so the indicator reflects actual model progress — never the
-    /// transcript.
-    Pulse { chars: u64, tokens: Option<u64> },
-    /// The harness compacted its OWN context part-way through the turn (Claude
-    /// Code's auto-compact). It takes minutes and produces no stream output
-    /// while it runs, so relaying it is what keeps a long reply from reading as
-    /// a hang. `pre_tokens` is the context size that was compacted, when the
-    /// harness reports it.
-    Compacted { pre_tokens: Option<u64> },
-    /// The harness reported a usage limit that is NOT in the healthy state —
-    /// the quota is exhausted or restricted. Harnesses emit this ONLY for the
-    /// non-healthy states; a limit that's fine is not news and must not be
-    /// relayed into every reply.
-    RateLimited { kind: String, resets_at: Option<i64> },
-    /// End-of-turn summary.
-    Done {
-        duration_ms: Option<f64>,
-        cost_usd: Option<f64>,
-        tokens: Option<u64>,
-    },
-    /// (daemon-internal) The user answered the pending interactive ask — the
-    /// agent loop emits this when it routes a reply into `ask_file`, and the
-    /// renderer stamps the answer into the open `{% ask %}` card so the message
-    /// content itself records "answered" (survives reload, reaches every
-    /// client). Harnesses never emit this.
-    AskAnswered(String),
-}
+/// The normalized event a harness turn speaks. Defined in `mafold-transcript`
+/// and re-exported here, because the vocabulary is not the daemon's: the api's
+/// own brains emit the same events and get the same cards. Harness-specific
+/// output formats (Claude Code stream-json, etc.) are parsed down to it.
+pub use mafold_transcript::AgentEvent;
 
 /// One turn to run against a harness.
 pub struct Turn {

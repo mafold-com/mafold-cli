@@ -22,7 +22,6 @@ mod harness;
 mod install;
 mod langpack;
 mod platform;
-mod render;
 mod room;
 mod session;
 mod supervisor;

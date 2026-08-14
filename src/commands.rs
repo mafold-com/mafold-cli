@@ -2074,44 +2074,13 @@ pub fn strip_ansi(s: &str) -> String {
 /// Scans this crate's own source instead of testing each builder, because the
 /// builders need live machine state (settings.json, `claude -p`) and are all
 /// `#[ignore]`d — a source scan is the only check that actually runs in CI.
+///
+/// The SCANNER lives in `mafold-transcript::lint`, with the card vocabulary it
+/// enforces; the renderer moved there too and is gated by that crate's own copy
+/// of this test. This one covers the emitters that are still the daemon's.
 #[cfg(test)]
 mod card_tag_lint {
-    /// `//`-comments are prose ABOUT tags (`/// the {% bash %} card`), not
-    /// emissions. Rust doc/line comments are line-based, so dropping from `//`
-    /// to end-of-line is exact for them; `format!` placeholders like `{{%` are
-    /// normalized to `{%` first so the emitted shape is what gets checked.
-    fn emitted_tags(src: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        for line in src.lines() {
-            // Checked on the RAW line, before comments are stripped: the escape
-            // hatch has to survive its own stripping. Used only by this module's
-            // self-test fixtures, which are deliberately bare.
-            if line.contains("LINT-IGNORE") {
-                continue;
-            }
-            let code = match line.find("//") {
-                Some(i) => &line[..i],
-                None => line,
-            };
-            let code = code.replace("{{%", "{%");
-            let mut rest = code.as_str();
-            while let Some(i) = rest.find("{%") {
-                rest = &rest[i + 2..];
-                let name: String = rest
-                    .trim_start()
-                    .trim_start_matches('/')
-                    .chars()
-                    .take_while(|c| {
-                        c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '/'
-                    })
-                    .collect();
-                if !name.is_empty() {
-                    out.push(name);
-                }
-            }
-        }
-        out
-    }
+    use mafold_transcript::lint::bare_tags;
 
     #[test]
     fn every_emitted_card_tag_is_fully_qualified() {
@@ -2120,18 +2089,14 @@ mod card_tag_lint {
         const SOURCES: &[(&str, &str)] = &[
             ("commands.rs", include_str!("commands.rs")),
             ("agent.rs", include_str!("agent.rs")),
-            ("render.rs", include_str!("render.rs")),
             ("bash_hook.rs", include_str!("bash_hook.rs")),
             ("ask_hook.rs", include_str!("ask_hook.rs")),
             ("wallet.rs", include_str!("wallet.rs")),
         ];
         let mut bare = Vec::new();
         for (name, src) in SOURCES {
-            for tag in emitted_tags(src) {
-                // `owner/cardname` is the preamble's placeholder for "any card".
-                if !tag.contains('/') {
-                    bare.push(format!("{name}: {{% {tag} %}}"));
-                }
+            for tag in bare_tags(src) {
+                bare.push(format!("{name}: {{% {tag} %}}")); // LINT-IGNORE
             }
         }
         assert!(
@@ -2140,28 +2105,6 @@ mod card_tag_lint {
              see .docs/card-namespace-v1.md §4):\n  {}",
             bare.join("\n  ")
         );
-    }
-
-    #[test]
-    fn the_lint_itself_detects_a_bare_tag() {
-        // Guard the guard: a scanner that silently matches nothing would "pass"
-        // forever. Comments must stay invisible, emissions must not.
-        assert_eq!(emitted_tags("let s = \"{% stats a=1 %}\";"), vec!["stats"]); // LINT-IGNORE
-        assert_eq!(emitted_tags("format!(\"{{% stats %}}\")"), vec!["stats"]); // LINT-IGNORE
-        assert_eq!(
-            emitted_tags("/// the {% bash %} card"),
-            Vec::<String>::new()
-        ); // LINT-IGNORE
-        assert_eq!(
-            emitted_tags("let s = \"{% mafold/stats %}…{% /mafold/stats %}\";"), // LINT-IGNORE
-            vec!["mafold/stats", "mafold/stats"]
-        );
-        // The escape hatch must not be a blanket off-switch for a whole file.
-        assert_eq!(
-            emitted_tags("\"{% stats %}\" // LINT-IGNORE"),
-            Vec::<String>::new()
-        );
-        assert_eq!(emitted_tags("\"{% stats %}\""), vec!["stats"]); // LINT-IGNORE
     }
 }
 
