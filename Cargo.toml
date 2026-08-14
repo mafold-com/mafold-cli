@@ -1,6 +1,6 @@
 [package]
 name = "mafold-cli"
-version = "0.9.93"
+version = "0.9.94"
 edition = "2021"
 description = "Mafold from your terminal — a CLI client (chats / send) + a Claude Code agent daemon."
 license = "MIT"

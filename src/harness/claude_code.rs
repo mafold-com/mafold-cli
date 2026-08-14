@@ -32,7 +32,16 @@ impl Harness for ClaudeCode {
             bail!("working directory does not exist: {workdir} — check --workdir");
         }
         let mut cmd = tokio::process::Command::new(super::program("claude"));
-        cmd.arg("-p").arg(&prompt)
+        // `-p` with NO prompt argument: the prompt goes in on stdin instead (see
+        // the write below). It is the one input here that grows without bound —
+        // it carries the conversation — and Windows hard-caps a command line at
+        // 32,767 UTF-16 units, so on argv a long enough chat makes `CreateProcessW`
+        // refuse the spawn outright (os error 206, ERROR_FILENAME_EXCED_RANGE).
+        // Unconditionally, not past some Windows-only threshold: a size cliff that
+        // only one platform falls off, and only on long conversations, is exactly
+        // the kind of special case that gets shipped untested. `run_claude_stdin`
+        // feeds /usage the same way.
+        cmd.arg("-p")
             .arg("--output-format").arg("stream-json")
             .arg("--verbose")
             .arg("--include-partial-messages")
@@ -120,12 +129,10 @@ impl Harness for ClaudeCode {
             .current_dir(&workdir)
             .env_remove("CLAUDECODE")
             .env_remove("ANTHROPIC_API_KEY")
-            // NULL stdin, like the codex/kimi harnesses — this was the last spawn
-            // still inheriting ours. The prompt rides on `-p`, so the child has no
-            // use for it, and inheriting made the spawn depend on whatever handle
-            // the daemon happens to hold: on Windows that is a duplication
-            // `CreateProcessW` can refuse outright.
-            .stdin(Stdio::null())
+            // Piped, never inherited: this carries the prompt, and inheriting the
+            // daemon's stdin also made the spawn depend on whatever handle it
+            // happens to hold (a duplication Windows can refuse on its own).
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -134,6 +141,18 @@ impl Harness for ClaudeCode {
         // exactly THIS process (see harness::live_children); RAII — deregisters
         // on every exit path.
         let _child_guard = crate::harness::ChildGuard::new(child.id());
+
+        // Feed the prompt in its OWN task: a prompt past the pipe buffer (~64KB —
+        // and this one holds the conversation) would otherwise block us here while
+        // claude is blocked writing stdout that nobody is reading yet. Dropping
+        // the handle closes stdin, which is the EOF `-p` waits for.
+        if let Some(mut si) = child.stdin.take() {
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let _ = si.write_all(prompt.as_bytes()).await;
+                let _ = si.shutdown().await;
+            });
+        }
 
         let stdout = child.stdout.take().context("no stdout")?;
         let mut lines = BufReader::new(stdout).lines();

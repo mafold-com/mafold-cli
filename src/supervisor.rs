@@ -348,6 +348,20 @@ fn autostart_loaded() -> bool {
 // the task FAILING TO START, not the process crashing later (verified on Win11)
 // — so a watchdog TimeTrigger re-fires the task every 30 minutes instead:
 // alive → IgnoreNew makes it a no-op; dead → relaunched within half an hour.
+//
+// The action must NOT exec the console binary directly. Whenever the user's
+// default terminal is Windows Terminal (the Win11 default), Task Scheduler
+// starting a console exe materializes a real WT window that the supervisor
+// cannot hide from the inside: GetConsoleWindow() under defterm returns the
+// pseudoconsole's hidden hwnd, so `supervise --hidden`'s ShowWindow(SW_HIDE)
+// hides the wrong window and a log console squats on the desktop at every
+// sign-in (verified on Win11 26200). The task therefore runs
+// `conhost.exe --headless <mafold …>` — a windowless console host regardless
+// of the default-terminal setting, alive exactly as long as the supervisor,
+// so the task-instance semantics above (IgnoreNew watchdog, RestartOnFailure)
+// are unchanged. A GUI-subsystem shim exe would be the documented equivalent
+// but means shipping a second binary; a wscript/VBS wrapper trips Defender's
+// behavioral ML (which already flagged the bare schtasks registration once).
 #[cfg(windows)]
 const TASK_NAME: &str = "MafoldSupervisor";
 
@@ -413,13 +427,23 @@ fn query_task_xml() -> Option<String> {
     Some(decode_console_bytes(&out.stdout))
 }
 
-/// The exact command line the logon task must run for THIS binary + settings.
-/// `--hidden` makes the supervisor hide the console window Windows hands a
-/// console binary at logon; the flag stays supported forever so a task written
-/// by an older install keeps starting newer binaries.
+/// The exact action the logon task must run for THIS binary + settings.
+/// `--hidden` is belt-and-braces: under `conhost --headless` no window ever
+/// exists, but tasks written by older installs exec the binary directly and
+/// rely on it, so the flag stays supported forever.
 #[cfg(windows)]
-fn task_arguments(base: &str, no_auto_update: bool) -> String {
-    let mut args = format!("--base {base} supervise --hidden");
+fn task_command() -> String {
+    // Absolute path — Task Scheduler actions get no PATH you can trust, and
+    // conhost has lived in System32 since NT.
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    format!(r"{root}\System32\conhost.exe")
+}
+
+#[cfg(windows)]
+fn task_arguments(exe: &str, base: &str, no_auto_update: bool) -> String {
+    // The exe is quoted because conhost re-parses this as a command line and
+    // profile paths ("C:\Users\John Smith\…") contain spaces.
+    let mut args = format!("--headless \"{exe}\" --base {base} supervise --hidden");
     if no_auto_update {
         args.push_str(" --no-auto-update");
     }
@@ -490,15 +514,15 @@ fn ensure_autostart(base: &str, no_auto_update: bool) -> Result<()> {
   </Settings>\n\
   <Actions Context=\"Author\">\n\
     <Exec>\n\
-      <Command>{exe}</Command>\n\
+      <Command>{cmd}</Command>\n\
       <Arguments>{args}</Arguments>\n\
     </Exec>\n\
   </Actions>\n\
 </Task>\n",
         task = TASK_NAME,
         user = xml_escape(&user),
-        exe = xml_escape(&exe.display().to_string()),
-        args = xml_escape(&task_arguments(base, no_auto_update)),
+        cmd = xml_escape(&task_command()),
+        args = xml_escape(&task_arguments(&exe.display().to_string(), base, no_auto_update)),
     );
     let xml_path = task_xml_path();
     write_utf16le(&xml_path, &xml)?;
@@ -567,8 +591,11 @@ fn autostart_loaded() -> bool {
 fn autostart_current(base: &str, no_auto_update: bool) -> bool {
     let Ok(exe) = std::env::current_exe() else { return false };
     let Some(xml) = query_task_xml() else { return false };
-    xml.contains(&xml_escape(&exe.display().to_string()))
-        && xml.contains(&format!("<Arguments>{}</Arguments>", xml_escape(&task_arguments(base, no_auto_update))))
+    // The expected arguments embed the (quoted) exe path, so this one check
+    // also rejects a task pointing at another binary — and a pre-conhost task
+    // (no `--headless`) mismatches too, which is exactly how `up` migrates
+    // old visible-window registrations to the windowless form.
+    xml.contains(&format!("<Arguments>{}</Arguments>", xml_escape(&task_arguments(&exe.display().to_string(), base, no_auto_update))))
 }
 
 /// The registered plist/unit now carries `--no-auto-update`, so "current" must
