@@ -1,6 +1,6 @@
 [package]
 name = "mafold-cli"
-version = "0.9.95"
+version = "0.9.96"
 edition = "2021"
 description = "Mafold from your terminal — a CLI client (chats / send) + a Claude Code agent daemon."
 license = "MIT"
@@ -19,7 +19,7 @@ mafold-core = { path = "crates/mafold-core" }
 # renderer, and the grouping state machine. Shared with mafold-api so a turn
 # driven by a server-side brain renders as the same cards as one driven by a
 # harness here — one transcript pipeline, not one per producer.
-mafold-transcript = { path = "../mafold-transcript" }
+mafold-transcript = { path = "crates/mafold-transcript" }
 uuid = "1"
 # `io-std` is for `mafold mcp serve`: an MCP stdio server reads requests off
 # stdin while awaiting network calls to providers, so stdin has to be async —
