@@ -297,9 +297,29 @@ pub mod figma {
     /// checks the redirect against its own list — an unregistered origin is
     /// refused at the consent screen, which is the correct place to find out.
     pub const REDIRECT_URI: &str = "https://mafold.com/app/link/callback";
-    /// Read-only, and the granular successors of the deprecated `files:read`.
-    pub const SCOPES: &str =
-        "current_user:read file_content:read file_metadata:read file_comments:read";
+    /// Every scope the Figma app is registered for — the granular successors of
+    /// the deprecated `files:read`, plus design-system, dev-resource, project
+    /// and webhook access.
+    ///
+    /// The token's scopes are fixed by what the AUTHORIZE URL asks for, not by
+    /// what the app is allowed to ask for: ticking a box in the developer
+    /// console widens the ceiling and changes nothing about a grant already
+    /// minted. Asking for four of fifteen is why a fully-ticked app still came
+    /// back able to do almost nothing.
+    ///
+    /// NOT here, because Figma does not offer it to a registered app at all:
+    /// `mcp:connect`, which `mcp.figma.com` names in its 401 challenge. That
+    /// scope belongs to Figma's own MCP authorization server, whose clients are
+    /// created by dynamic registration — 403 outside the MCP Catalog waitlist
+    /// (re-probed 2026-08-15). Until Mafold is listed, MCP is unreachable and
+    /// the REST surface below is the whole capability.
+    pub const SCOPES: &str = "current_user:read \
+        file_content:read file_metadata:read file_versions:read \
+        file_comments:read file_comments:write \
+        library_assets:read library_content:read team_library_content:read \
+        file_dev_resources:read file_dev_resources:write \
+        project_metadata:read projects:read \
+        webhooks:read webhooks:write";
     pub const SECRET_ENV: &str = "FIGMA_OAUTH_CLIENT_SECRET";
 }
 
@@ -1483,6 +1503,33 @@ mod tests {
         // 404 an hour after linking, not at link time.
         assert_eq!(b.upstream_refresh, "https://api.figma.com/v1/oauth/refresh");
         assert_ne!(b.upstream_token, b.upstream_refresh);
+
+        // The scopes a grant gets are the ones the AUTHORIZE URL asks for. A
+        // fully-ticked app whose authorize URL asks for four of fifteen mints a
+        // token that can do four things — which is exactly how this shipped, and
+        // is invisible until a call 403s. So the ask is pinned here.
+        let scopes: Vec<&str> = figma::SCOPES.split(' ').collect();
+        for want in [
+            "current_user:read",
+            "file_content:read",
+            "file_metadata:read",
+            "file_versions:read",
+            "file_comments:read",
+            "library_content:read",
+            "team_library_content:read",
+            "file_dev_resources:read",
+            "projects:read",
+        ] {
+            assert!(scopes.contains(&want), "figma scopes must include {want}");
+        }
+        // The `\` line continuations in the literal are load-bearing: a stray
+        // newline or double space rides into the authorize URL verbatim.
+        assert!(
+            !figma::SCOPES.contains("  ") && !figma::SCOPES.contains('\n'),
+            "scope list is a single space-separated line"
+        );
+        // Not requestable by a registered app — see the constant's note.
+        assert!(!figma::SCOPES.contains("mcp:"), "MCP scopes come from Figma's own DCR, not from us");
 
         // The default user has NO mafold-cli. Figma must therefore be linkable
         // by the browser alone: our own app, our own redirect, a page we serve.

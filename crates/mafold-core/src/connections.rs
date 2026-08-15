@@ -624,6 +624,7 @@ mod tests {
     /// It used to be, and that was the bug: a provider added on Tuesday made
     /// every client say "update mafold" until five apps had shipped, including
     /// to the user who had just linked it successfully from their browser.
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn a_provider_missing_from_the_pack_is_not_a_version_problem() {
         with_registry();
@@ -642,6 +643,7 @@ mod tests {
 
     /// With no pack at all the sentence has to be about the registry, not about
     /// the connection — and it must not be silently treated as "no providers".
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn no_registry_yet_says_so_rather_than_blaming_the_connection() {
         crate::providers::forget();

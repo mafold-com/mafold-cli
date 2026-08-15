@@ -1733,6 +1733,7 @@ pub(crate) fn preview_from_head(head: &str) -> String {
         let t = [
             "[END RECENT CONVERSATION — now handle the triggering message below.]",
             "[END AVAILABLE APPS & ROOMS]",
+            "[END REPLY CONTEXT]",
         ]
         .iter()
         .fold(text.trim(), |acc, marker| {
@@ -2242,6 +2243,10 @@ Last 7d · 7983 requests · 30 sessions
         // array-form content still yields its text block.
         let head = r#"{"type":"user","message":{"role":"user","content":"[RECENT CONVERSATION]\nnoise\n[END RECENT CONVERSATION — now handle the triggering message below.]\n\nship the release"}}"#;
         assert_eq!(preview_from_head(head), "ship the release");
+        // A quote-reply turn adds a REPLY CONTEXT block after the history —
+        // the preview must still land on the trigger, not the quote.
+        let head = r#"{"type":"user","message":{"role":"user","content":"[RECENT CONVERSATION]\nnoise\n[END RECENT CONVERSATION — now handle the triggering message below.]\n\n[REPLY CONTEXT — quote-reply to @codex:\nthe old animation\n[END REPLY CONTEXT]\n\n我要这个 你帮我打开"}}"#;
+        assert_eq!(preview_from_head(head), "我要这个 你帮我打开");
         let head = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"array prompt"}]}}"#;
         assert_eq!(preview_from_head(head), "array prompt");
         assert_eq!(preview_from_head("garbage\nlines"), "");
