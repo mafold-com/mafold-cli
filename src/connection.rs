@@ -32,7 +32,13 @@ use mafold_core::mafold_types::connections::{provider_infos, ProviderInfo, Provi
 /// cli can be OLDER than the registry and still link and call a provider it has
 /// never heard of, as long as that provider needs no native driver.
 async fn registry(client: &Client) -> Result<Vec<ProviderInfo>> {
-    mafold_core::providers::ensure(&client.base, &client.token, now_ms())
+    // `/api` is appended here for the same reason `Runtime::new` does it:
+    // `Client::base` is the ORIGIN (`https://api.mafold.com`), while the core's
+    // `net::rpc` takes a base that already includes the prefix. Passing the
+    // origin straight through posts to `/getConnectionProviders` and gets a 404
+    // that reads like "your server is too old" — which is what shipped in
+    // cli@0.9.97 and is exactly the wrong thing to tell a user.
+    mafold_core::providers::ensure(&format!("{}/api", client.base), &client.token, now_ms())
         .await
         .map_err(|e| anyhow!("{e}"))?;
     Ok(mafold_core::providers::all())
