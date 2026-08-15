@@ -23,7 +23,35 @@ use serde_json::{json, Value};
 use crate::client::Client;
 use crate::session;
 use crate::vault::{self, DeviceKey, Key};
-use mafold_core::mafold_types::connections::{provider as provider_spec, ProviderKind, PROVIDERS};
+use mafold_core::mafold_types::connections::{provider_infos, ProviderInfo, ProviderKind};
+
+/// The registry, from the cloud — there is no compiled-in copy to fall back on.
+///
+/// The cli reads the same signed pack every other surface does, which is what
+/// makes "add a provider" a push rather than five releases. It also means the
+/// cli can be OLDER than the registry and still link and call a provider it has
+/// never heard of, as long as that provider needs no native driver.
+async fn registry(client: &Client) -> Result<Vec<ProviderInfo>> {
+    mafold_core::providers::ensure(&client.base, &client.token, now_ms())
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(mafold_core::providers::all())
+}
+
+async fn descriptor(client: &Client, id: &str) -> Result<ProviderInfo> {
+    registry(client)
+        .await?
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| anyhow!("no provider called `{id}` — see `mafold connection providers`"))
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 #[derive(Subcommand)]
 pub enum ConnectionCmd {
@@ -345,10 +373,7 @@ async fn fetch(client: &Client, name: &str) -> Result<Value> {
 pub async fn run(base: &str, cmd: ConnectionCmd) -> Result<()> {
     let (client, sess) = human_client(base)?;
     match cmd {
-        ConnectionCmd::Providers => {
-            providers();
-            Ok(())
-        }
+        ConnectionCmd::Providers => providers(&client).await,
         ConnectionCmd::List => list(&client).await,
         ConnectionCmd::Add { name, provider, import, from_env, oauth, label } => {
             add(&client, &sess, &name, &provider, import, from_env, oauth, label).await
@@ -383,12 +408,17 @@ pub async fn run(base: &str, cmd: ConnectionCmd) -> Result<()> {
     }
 }
 
-fn providers() {
+async fn providers(client: &Client) -> Result<()> {
+    let rows = registry(client).await?;
     println!("{:<20} {:<26} {:<8} {}", "ID", "PROVIDER", "AUTH", "LINK VIA");
-    for p in PROVIDERS {
-        let how = match (p.import_path, p.env_var) {
+    for p in &rows {
+        let how = match (p.import_path.as_deref(), p.env_var.as_deref()) {
             (Some(path), _) => format!("--import  (~/{path})"),
             (None, Some(v)) => format!("--from-env  (${v})"),
+            // A consent screen the browser runs is the modern default, and it
+            // is not "paste" — saying so sent people looking for a token page
+            // that no longer exists for that provider.
+            (None, None) if p.oauth => "sign in (browser)".to_string(),
             (None, None) => "paste".to_string(),
         };
         let kind = match p.kind {
@@ -397,6 +427,7 @@ fn providers() {
         };
         println!("{:<20} {:<26} {:<8} {}", p.id, p.display, kind, how);
     }
+    Ok(())
 }
 
 async fn list(client: &Client) -> Result<()> {
@@ -409,15 +440,16 @@ async fn list(client: &Client) -> Result<()> {
     }
     println!("{:<16} {:<20} {:<10} {}", "NAME", "PROVIDER", "STATUS", "LABEL");
     for c in items {
-        let prov = s(&c, "provider");
-        // An unknown provider is shown, not hidden: it means this cli is older
-        // than the connection, and saying so beats an empty row.
-        let status = if provider_spec(&prov).is_some() { "linked" } else { "unknown" };
+        // The provider is printed VERBATIM and the row always reads `linked`,
+        // because that is exactly what the server asserted by returning it. It
+        // used to say `unknown` whenever this binary's compiled-in table had no
+        // such id — which described the CLI's build, not the connection, and
+        // told a user whose link had just succeeded that it hadn't.
         println!(
             "{:<16} {:<20} {:<10} {}",
             s(&c, "name"),
-            prov,
-            status,
+            s(&c, "provider"),
+            "linked",
             s(&c, "label")
         );
     }
@@ -425,7 +457,7 @@ async fn list(client: &Client) -> Result<()> {
 }
 
 /// Collect a provider's fields, by import, environment, or prompt.
-fn collect(spec: &mafold_core::mafold_types::connections::ProviderSpec, import: bool, from_env: bool)
+fn collect(spec: &ProviderInfo, import: bool, from_env: bool)
     -> Result<serde_json::Map<String, Value>>
 {
     let mut out = serde_json::Map::new();
@@ -433,6 +465,7 @@ fn collect(spec: &mafold_core::mafold_types::connections::ProviderSpec, import: 
     if import {
         let path = spec
             .import_path
+            .as_deref()
             .ok_or_else(|| anyhow!("{} has no local credential file to import", spec.id))?;
         let full = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(path);
         let raw = std::fs::read_to_string(&full)
@@ -441,8 +474,8 @@ fn collect(spec: &mafold_core::mafold_types::connections::ProviderSpec, import: 
             .with_context(|| format!("{} is not JSON", full.display()))?;
         // Vendors nest their bag differently; search rather than hard-code a
         // path per vendor, so a layout change costs nothing here.
-        for f in spec.fields {
-            if let Some(v) = find_key(&parsed, f.key) {
+        for f in &spec.fields {
+            if let Some(v) = find_key(&parsed, &f.key) {
                 out.insert(f.key.to_string(), v);
             }
         }
@@ -452,13 +485,14 @@ fn collect(spec: &mafold_core::mafold_types::connections::ProviderSpec, import: 
     } else if from_env {
         let var = spec
             .env_var
+            .as_deref()
             .ok_or_else(|| anyhow!("{} has no conventional environment variable", spec.id))?;
         let val = std::env::var(var)
             .with_context(|| format!("${var} is not set"))?;
         let first = spec.fields.first().ok_or_else(|| anyhow!("provider has no fields"))?;
         out.insert(first.key.to_string(), Value::String(val));
     } else {
-        for f in spec.fields {
+        for f in &spec.fields {
             let label = if f.required {
                 format!("{}: ", f.label)
             } else {
@@ -471,8 +505,8 @@ fn collect(spec: &mafold_core::mafold_types::connections::ProviderSpec, import: 
         }
     }
 
-    for f in spec.fields {
-        if f.required && !out.contains_key(f.key) {
+    for f in &spec.fields {
+        if f.required && !out.contains_key(&f.key) {
             bail!("{} is required for {}", f.label, spec.id);
         }
     }
@@ -498,7 +532,7 @@ fn find_key(v: &Value, key: &str) -> Option<Value> {
 // ── the vendor-client OAuth dance (`add --oauth`) ──────────────────────────
 //
 // For providers whose OAuth client is a PUBLISHED PUBLIC client of the
-// vendor's own CLI (`ProviderSpec::oauth_client`), we can mint a fresh grant
+// vendor's own CLI (`ProviderInfo::oauth_fixed`), we can mint a fresh grant
 // instead of importing a file: PKCE, a localhost listener on the vendor's
 // registered redirect, and a form-encoded code exchange. The whole dance runs
 // on this machine — the registered redirect URI makes any server-side variant
@@ -546,22 +580,26 @@ fn jwt_claims(token: &str) -> Option<Value> {
 /// Fill the ISSUED fields a link flow can't collect from a human: the
 /// registry's fixed OAuth client (what lets a *different* device refresh this
 /// grant), the account id buried in the id_token, and an expiry read from the
-/// access token itself when nothing recorded one. Import files vary; this
-/// makes every codex-oauth payload renewal-complete regardless of which flow
-/// produced it.
+/// access token itself when nothing recorded one. Import files vary; this makes
+/// an OAuth payload renewal-complete regardless of which flow produced it.
+///
+/// `token_endpoint` is copied from the registry rather than from the vendor's
+/// metadata on purpose: for a brokered provider it is mafold-api, not the
+/// vendor, and a daemon renewing months later must post where the secret is —
+/// which only the registry knows.
 fn enrich_oauth_payload(
-    spec: &mafold_core::mafold_types::connections::ProviderSpec,
+    spec: &ProviderInfo,
     fields: &mut serde_json::Map<String, Value>,
 ) {
     let missing = |m: &serde_json::Map<String, Value>, k: &str| {
         m.get(k).and_then(|v| v.as_str()).map(str::trim).unwrap_or("").is_empty()
     };
-    if let Some(oc) = spec.oauth_client {
+    if let Some(oc) = &spec.oauth_fixed {
         if missing(fields, "client_id") {
-            fields.insert("client_id".into(), Value::String(oc.client_id.into()));
+            fields.insert("client_id".into(), Value::String(oc.client_id.clone()));
         }
         if missing(fields, "token_endpoint") {
-            fields.insert("token_endpoint".into(), Value::String(oc.token_endpoint.into()));
+            fields.insert("token_endpoint".into(), Value::String(oc.token_endpoint.clone()));
         }
     }
     if missing(fields, "account_id") {
@@ -676,10 +714,10 @@ struct OauthLeg {
 
 /// Bind the vendor's registered redirect and build its consent URL.
 async fn oauth_begin(
-    spec: &mafold_core::mafold_types::connections::ProviderSpec,
+    spec: &ProviderInfo,
 ) -> Result<OauthLeg> {
     use sha2::{Digest, Sha256};
-    let oc = spec.oauth_client.ok_or_else(|| {
+    let oc = spec.oauth_fixed.clone().ok_or_else(|| {
         anyhow!(
             "{} has no OAuth client this cli can drive — link it with --import or --from-env",
             spec.id
@@ -699,7 +737,7 @@ async fn oauth_begin(
     // CLI mid-login, an earlier attempt wedged), fail now with a sentence —
     // not after the user has clicked through a consent screen whose redirect
     // will land on the wrong listener.
-    let redirect: url_parts::Parts = url_parts::split(oc.redirect_uri)?;
+    let redirect: url_parts::Parts = url_parts::split(&oc.redirect_uri)?;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", redirect.port))
         .await
         .with_context(|| {
@@ -712,13 +750,13 @@ async fn oauth_begin(
     let mut auth_url = format!(
         "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
         oc.authorize_url,
-        q_encode(oc.client_id),
-        q_encode(oc.redirect_uri),
-        q_encode(oc.scopes),
+        q_encode(&oc.client_id),
+        q_encode(&oc.redirect_uri),
+        q_encode(&oc.scopes),
         state,
         challenge,
     );
-    for (k, v) in oc.extra_params {
+    for (k, v) in &oc.extra_params {
         auth_url.push('&');
         auth_url.push_str(&format!("{}={}", q_encode(k), q_encode(v)));
     }
@@ -738,26 +776,27 @@ async fn oauth_begin(
 /// code for tokens. Returns the token bag plus a suggested cleartext label
 /// (email · plan) read from the id_token.
 async fn oauth_finish(
-    spec: &mafold_core::mafold_types::connections::ProviderSpec,
+    spec: &ProviderInfo,
     leg: OauthLeg,
 ) -> Result<(serde_json::Map<String, Value>, Option<String>)> {
     let oc = spec
-        .oauth_client
+        .oauth_fixed
+        .clone()
         .ok_or_else(|| anyhow!("{} has no OAuth client this cli can drive", spec.id))?;
     let OauthLeg { listener, verifier, state, redirect, .. } = leg;
 
     let code = tokio::time::timeout(
         std::time::Duration::from_secs(300),
-        wait_for_callback(listener, &state, redirect.path),
+        wait_for_callback(listener, &state, &redirect.path),
     )
     .await
     .map_err(|_| anyhow!("no sign-in came back within 5 minutes — start it again to retry"))??;
 
     let form = [
         ("grant_type", "authorization_code"),
-        ("client_id", oc.client_id),
+        ("client_id", oc.client_id.as_str()),
         ("code", code.as_str()),
-        ("redirect_uri", oc.redirect_uri),
+        ("redirect_uri", oc.redirect_uri.as_str()),
         ("code_verifier", verifier.as_str()),
     ];
     let resp = reqwest::Client::new()
@@ -819,9 +858,9 @@ async fn oauth_finish(
 
 /// Both legs, driven from a terminal: bind, open the browser here, wait.
 async fn oauth_dance(
-    spec: &mafold_core::mafold_types::connections::ProviderSpec,
+    spec: &ProviderInfo,
 ) -> Result<(serde_json::Map<String, Value>, Option<String>)> {
-    let leg = oauth_begin(spec).await?;
+    let leg = oauth_begin(&spec).await?;
     println!("Opening {}'s consent screen…", spec.display);
     if !crate::platform::open_browser(&leg.authorize_url) {
         println!(
@@ -841,10 +880,13 @@ mod url_parts {
 
     pub struct Parts {
         pub port: u16,
-        pub path: &'static str,
+        /// Owned. It used to borrow a `&'static str`, which worked only while
+        /// the redirect came from a compiled-in const — the registry is served
+        /// now, so the string outlives nothing on its own.
+        pub path: String,
     }
 
-    pub fn split(uri: &'static str) -> Result<Parts> {
+    pub fn split(uri: &str) -> Result<Parts> {
         let rest = uri
             .strip_prefix("http://")
             .ok_or_else(|| anyhow!("redirect URI must be http://localhost-style: {uri}"))?;
@@ -857,7 +899,7 @@ mod url_parts {
             .next()
             .and_then(|p| p.parse::<u16>().ok())
             .ok_or_else(|| anyhow!("redirect URI has no port: {uri}"))?;
-        Ok(Parts { port, path })
+        Ok(Parts { port, path: path.to_string() })
     }
 }
 
@@ -872,11 +914,7 @@ async fn add(
     oauth: bool,
     label: Option<String>,
 ) -> Result<()> {
-    let spec = provider_spec(provider).ok_or_else(|| {
-        anyhow!(
-            "unknown provider `{provider}` — see `mafold connection providers`"
-        )
-    })?;
+    let spec = &descriptor(client, provider).await?;
     let (mut fields, suggested_label) = if oauth {
         oauth_dance(spec).await?
     } else {
@@ -885,7 +923,7 @@ async fn add(
     // Issued fields the flows above can't know by themselves: the registry's
     // fixed OAuth client (so ANY device can refresh later) and an expiry read
     // out of the token itself when the vendor's file didn't record one.
-    enrich_oauth_payload(spec, &mut fields);
+    enrich_oauth_payload(&spec, &mut fields);
     let fields = fields;
     let label = label.or(suggested_label);
     let (umk, key_id, _) = unlock(client, sess).await?;
@@ -900,7 +938,7 @@ async fn add(
             .and_then(|v| v.as_str())
             .map(str::to_string)
             .unwrap_or_else(|| {
-                let primary = spec.fields.first().map(|f| f.key).unwrap_or("api_key");
+                let primary = spec.fields.first().map(|f| f.key.as_str()).unwrap_or("api_key");
                 fields
                     .get(primary)
                     .and_then(|v| v.as_str())
@@ -962,14 +1000,13 @@ async fn show(client: &Client, sess: &session::Session, name: &str, reveal: bool
 async fn env(client: &Client, sess: &session::Session, name: &str) -> Result<()> {
     let conn = fetch(client, name).await?;
     let provider = s(&conn, "provider");
-    let spec = provider_spec(&provider)
-        .ok_or_else(|| anyhow!("`{provider}` is unknown to this cli — run `mafold update`"))?;
+    let spec = descriptor(client, &provider).await?;
     let (umk, key_id, _) = unlock(client, sess).await?;
     let fields = open_payload(&umk, &key_id, &conn)?;
     let var = spec
         .env_var
         .ok_or_else(|| anyhow!("{} is an OAuth bag, not a single env var — use `show --reveal`", spec.id))?;
-    let primary = spec.fields.first().map(|f| f.key).unwrap_or("api_key");
+    let primary = spec.fields.first().map(|f| f.key.as_str()).unwrap_or("api_key");
     let val = fields
         .get(primary)
         .and_then(|v| v.as_str())
@@ -1082,8 +1119,8 @@ pub async fn handle_link_event(
         client.call("answerConnectionCall", body)
     };
 
-    let spec = match provider_spec(&provider) {
-        Some(sp) if sp.oauth_client.is_some() => sp,
+    let spec = match descriptor(client, &provider).await.ok() {
+        Some(sp) if sp.oauth_fixed.is_some() => sp,
         Some(sp) => {
             let _ = answer(
                 Value::Null,
@@ -1107,7 +1144,7 @@ pub async fn handle_link_event(
         }
     };
 
-    let leg = match oauth_begin(spec).await {
+    let leg = match oauth_begin(&spec).await {
         Ok(leg) => leg,
         Err(e) => {
             let _ = answer(Value::Null, Some(format!("{e:#}"))).await;
@@ -1128,7 +1165,7 @@ pub async fn handle_link_event(
     let umk = umk.clone();
     let key_id = key_id.to_string();
     tokio::spawn(async move {
-        let outcome = finish_linking(&client, spec, leg, &umk, &key_id).await;
+        let outcome = finish_linking(&client, &spec, leg, &umk, &key_id).await;
         let body = match &outcome {
             Ok(name) => json!({ "link_id": link_id, "connection": name }),
             Err(e) => json!({ "link_id": link_id, "error": format!("{e:#}") }),
@@ -1146,15 +1183,15 @@ pub async fn handle_link_event(
 /// name it chose, so the report can name it.
 async fn finish_linking(
     client: &Client,
-    spec: &'static mafold_core::mafold_types::connections::ProviderSpec,
+    spec: &ProviderInfo,
     leg: OauthLeg,
     umk: &Key,
     key_id: &str,
 ) -> Result<String> {
     let (mut fields, suggested) = oauth_finish(spec, leg).await?;
-    enrich_oauth_payload(spec, &mut fields);
+    enrich_oauth_payload(&spec, &mut fields);
     let (blob, wrapped_dek) = seal_payload(umk, &fields)?;
-    let name = free_name(client, spec.id).await;
+    let name = free_name(client, &spec.id).await;
     let label = suggested.unwrap_or_else(|| {
         fields
             .get("account_id")
@@ -1694,6 +1731,12 @@ async fn recover(client: &Client, sess: &session::Session) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// The registry is served now, so a test that links must have one in the
+    /// process — the mock api serves connection calls, not packs.
+    fn seat_registry() {
+        mafold_core::providers::install_unverified_for_tests(1, provider_infos(), now_ms());
+    }
+
     #[test]
     fn masking_keeps_only_the_tail() {
         assert_eq!(mask_tail("sk-ant-api03-abcd3f9a"), "••••••••3f9a");
@@ -1723,8 +1766,8 @@ mod tests {
 
     #[test]
     fn every_registry_provider_is_addable() {
-        for p in PROVIDERS {
-            assert!(provider_spec(p.id).is_some());
+        for p in provider_infos() {
+            assert!(provider_infos().iter().any(|q| q.id == p.id));
         }
     }
 
@@ -1755,7 +1798,7 @@ mod tests {
     #[test]
     fn enrich_fills_client_account_and_expiry_without_clobbering() {
         use mafold_core::mafold_types::connections::codex;
-        let spec = provider_spec("codex-oauth").unwrap();
+        let spec = provider_infos().into_iter().find(|p| p.id == "codex-oauth").unwrap();
         let id_token = fake_jwt(serde_json::json!({
             "email": "ops@example.com",
             "https://api.openai.com/auth": { "chatgpt_account_id": "acc-42", "chatgpt_plan_type": "pro" },
@@ -1765,7 +1808,7 @@ mod tests {
         fields.insert("access_token".into(), Value::String(access));
         fields.insert("id_token".into(), Value::String(id_token));
 
-        enrich_oauth_payload(spec, &mut fields);
+        enrich_oauth_payload(&spec, &mut fields);
         assert_eq!(fields["client_id"], codex::CLIENT_ID);
         assert_eq!(fields["token_endpoint"], codex::TOKEN_ENDPOINT);
         assert_eq!(fields["account_id"], "acc-42");
@@ -1774,7 +1817,7 @@ mod tests {
         // A payload that already knows better keeps its own values.
         fields.insert("account_id".into(), Value::String("acc-original".into()));
         fields.insert("expires_at".into(), Value::String("777".into()));
-        enrich_oauth_payload(spec, &mut fields);
+        enrich_oauth_payload(&spec, &mut fields);
         assert_eq!(fields["account_id"], "acc-original");
         assert_eq!(fields["expires_at"], "777");
     }
@@ -1783,10 +1826,10 @@ mod tests {
     /// enrichment is additive, never a codex branch inside `add`.
     #[test]
     fn enrich_is_a_noop_for_providers_without_an_oauth_client() {
-        let spec = provider_spec("notion").unwrap();
+        let spec = provider_infos().into_iter().find(|p| p.id == "notion").unwrap();
         let mut fields = serde_json::Map::new();
         fields.insert("access_token".into(), Value::String("ntn_x".into()));
-        enrich_oauth_payload(spec, &mut fields);
+        enrich_oauth_payload(&spec, &mut fields);
         assert!(!fields.contains_key("client_id"));
         assert!(!fields.contains_key("token_endpoint"));
     }
@@ -1995,6 +2038,7 @@ mod tests {
     /// sentence about the provider, not about the machine.
     #[tokio::test]
     async fn a_pasted_provider_says_so_rather_than_binding() {
+        seat_registry();
         let api = spawn_api(vec![("claimConnectionCall", json!({ "claimed": true }))]);
         let client = Client::new(api.base.clone(), "s_test".into());
         let umk = Key::random();
@@ -2015,6 +2059,7 @@ mod tests {
     /// handler must then answer with THAT sentence rather than go quiet.
     #[tokio::test]
     async fn a_codex_link_answers_with_a_consent_url_and_the_device_name() {
+        seat_registry();
         let api = spawn_api(vec![
             ("claimConnectionCall", json!({ "claimed": true })),
             ("listConnections", json!({ "items": [] })),

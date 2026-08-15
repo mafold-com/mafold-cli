@@ -17,6 +17,7 @@ mod wire;
 mod i18n;
 pub mod flags;
 pub mod connections;
+pub mod providers;
 mod codex;
 pub mod mcp;
 pub mod methods;
@@ -554,18 +555,34 @@ mod web {
     #[wasm_bindgen(js_name = coreVersion)]
     pub fn core_version() -> String { crate::core_version() }
 
-    /// The connection-provider registry, display-ready JSON.
+    /// The connection-provider registry this process holds, display-ready JSON.
     ///
-    /// Serving it from the core is what keeps there being ONE registry: the cli
-    /// reads `mafold_types::PROVIDERS` natively and the web reads the same const
-    /// through here, so adding a provider is one row in `connections.rs` and no
-    /// client edit at all. A hand-kept `{id → name, icon}` map in the web would
-    /// be a second registry that silently drifts — and the client that drifts is
-    /// the one the user is looking at.
+    /// Reads the CACHE, so it is `[]` until a pack has arrived — check
+    /// [`connection_providers_loaded`] before drawing, exactly as a host checks
+    /// `langpackLoaded`. Painting an empty pane on an empty cache tells a user
+    /// their account has no providers when the truth is that a fetch has not
+    /// finished.
+    ///
+    /// It used to serialise a compiled-in const, which is why adding a provider
+    /// meant shipping five apps before anyone could use it.
     #[wasm_bindgen(js_name = connectionProviders)]
     pub fn connection_providers() -> String {
-        serde_json::to_string(&mafold_types::connections::provider_infos())
-            .unwrap_or_else(|_| "[]".into())
+        serde_json::to_string(&crate::providers::all()).unwrap_or_else(|_| "[]".into())
+    }
+
+    /// Whether a registry has landed. Gate the Connections pane on this.
+    #[wasm_bindgen(js_name = connectionProvidersLoaded)]
+    pub fn connection_providers_loaded() -> bool {
+        crate::providers::loaded()
+    }
+
+    /// Fetch the registry if this process has none or its copy is stale.
+    /// Idempotent and cheap when current — call it on open and on reconnect.
+    #[wasm_bindgen(js_name = refreshConnectionProviders)]
+    pub async fn refresh_connection_providers(base: String, token: String) -> Result<(), JsValue> {
+        crate::providers::ensure(&base, &token, crate::connections::now_ms())
+            .await
+            .map_err(|e| JsValue::from_str(&e))
     }
 
     /// Sync engine, stage 1: the core makes the API call itself (POST

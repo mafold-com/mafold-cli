@@ -20,7 +20,7 @@ use serde_json::{json, Map, Value};
 
 use crate::connections::Runtime;
 use crate::net;
-use mafold_types::connections::{codex, ProviderSpec};
+use mafold_types::connections::{codex, ProviderInfo};
 
 const ORIGINATOR: &str = "codex-tui";
 /// Track the shipping Codex CLI. Falling several releases behind moves every
@@ -90,7 +90,7 @@ pub(crate) async fn run(
     call_id: &str,
     name: &str,
     conn: &Value,
-    spec: &'static ProviderSpec,
+    spec: &ProviderInfo,
     params: &Value,
     stream: bool,
 ) -> Result<Value, String> {
@@ -106,7 +106,7 @@ async fn run_at(
     call_id: &str,
     name: &str,
     conn: &Value,
-    spec: &'static ProviderSpec,
+    spec: &ProviderInfo,
     params: &Value,
     stream: bool,
 ) -> Result<Value, String> {
@@ -341,8 +341,11 @@ mod tests {
             })
         }
 
-        fn spec() -> &'static mafold_types::connections::ProviderSpec {
-            mafold_types::connections::provider("codex-oauth").unwrap()
+        fn spec() -> mafold_types::connections::ProviderInfo {
+            mafold_types::connections::provider_infos()
+                .into_iter()
+                .find(|p| p.id == "codex-oauth")
+                .expect("codex-oauth is in the registry")
         }
 
         fn params() -> Value {
@@ -367,7 +370,7 @@ mod tests {
 
             let out = run_at(
                 &format!("{}/backend", mock.base),
-                &rt, "call-7", "codex", &conn, spec(), &params(), true,
+                &rt, "call-7", "codex", &conn, &spec(), &params(), true,
             )
             .await
             .expect("driver run");
@@ -421,7 +424,7 @@ mod tests {
 
             let out = run_at(
                 &format!("{}/backend", mock.base),
-                &rt, "call-8", "codex", &conn, spec(), &params(), true,
+                &rt, "call-8", "codex", &conn, &spec(), &params(), true,
             )
             .await
             .expect("driver run after refresh");
@@ -448,7 +451,7 @@ mod tests {
             let rt = Runtime::new(&mock.base, "s_tok", umk);
             let err = run_at(
                 &format!("{}/backend", mock.base),
-                &rt, "c", "codex", &conn, spec(), &params(), true,
+                &rt, "c", "codex", &conn, &spec(), &params(), true,
             )
             .await
             .unwrap_err();

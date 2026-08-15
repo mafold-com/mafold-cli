@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::net::{http_post, HttpReply};
-use mafold_types::connections::AuthStyle;
+use mafold_types::connections::AuthInfo;
 
 /// The MCP revision this client implements. Sent on `initialize` and echoed as
 /// a header afterwards; servers negotiate down if they must.
@@ -89,7 +89,7 @@ type Result<T> = std::result::Result<T, McpError>;
 /// One conversation with one MCP server.
 pub struct McpClient {
     url: String,
-    /// Built once from the registry's [`AuthStyle`], so no code path anywhere
+    /// Built once from the registry's [`AuthInfo`], so no code path anywhere
     /// decides where a provider's credential goes.
     auth: (String, String),
     session_id: Option<String>,
@@ -98,7 +98,7 @@ pub struct McpClient {
 
 impl McpClient {
     /// `token` is the plaintext credential, already opened from the vault.
-    pub fn new(url: &str, auth: AuthStyle, token: &str) -> Self {
+    pub fn new(url: &str, auth: &AuthInfo, token: &str) -> Self {
         Self {
             url: url.to_string(),
             auth: (
@@ -362,13 +362,13 @@ mod tests {
         }
     }
 
-    /// The point of `AuthStyle`: two providers, two header shapes, one client.
+    /// The point of `AuthInfo`: two providers, two header shapes, one client.
     #[test]
     fn the_credential_lands_where_the_registry_says() {
-        let notion = McpClient::new("https://mcp.notion.com/mcp", BEARER, "ntn_abc");
+        let notion = McpClient::new("https://mcp.notion.com/mcp", &BEARER.into(), "ntn_abc");
         assert_eq!(notion.auth, ("Authorization".into(), "Bearer ntn_abc".into()));
 
-        let figma = McpClient::new("https://mcp.figma.com/mcp", FIGMA_TOKEN_HEADER, "figd_xyz");
+        let figma = McpClient::new("https://mcp.figma.com/mcp", &FIGMA_TOKEN_HEADER.into(), "figd_xyz");
         assert_eq!(figma.auth, ("X-Figma-Token".into(), "figd_xyz".into()));
         // No prefix means no stray space — a header value of " figd_xyz" is
         // the kind of thing that fails as a plain 401 with nothing to read.
@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn a_session_id_is_sent_once_known_and_omitted_before() {
-        let mut c = McpClient::new("https://example.test/mcp", BEARER, "t");
+        let mut c = McpClient::new("https://example.test/mcp", &BEARER.into(), "t");
         assert!(c.headers().iter().all(|(k, _)| k != "mcp-session-id"));
         c.session_id = Some("sess-1".into());
         assert_eq!(
@@ -410,7 +410,7 @@ mod tests {
                 r#"{"tools":[{"name":"search","description":"Find pages","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]},"annotations":{"readOnlyHint":true}}]}"#,
             ),
         ]);
-        let mut c = McpClient::new(&format!("{}/mcp", mock.base), BEARER, "ntn_live");
+        let mut c = McpClient::new(&format!("{}/mcp", mock.base), &BEARER.into(), "ntn_live");
         c.initialize().await.expect("initialize");
         let tools = c.list_tools().await.expect("tools/list");
 
@@ -444,7 +444,7 @@ mod tests {
         let mock = spawn_mock(vec![rpc_ok("{}")]);
         let mut c = McpClient::new(
             &format!("{}/mcp", mock.base),
-            FIGMA_TOKEN_HEADER,
+            &FIGMA_TOKEN_HEADER.into(),
             "figd_live",
         );
         c.initialize().await.expect("initialize");
@@ -468,7 +468,7 @@ mod tests {
             rpc_ok(r#"{"tools":[{"name":"a"}],"nextCursor":"p2"}"#),
             rpc_ok(r#"{"tools":[{"name":"b"}]}"#),
         ]);
-        let mut c = McpClient::new(&format!("{}/mcp", mock.base), BEARER, "t");
+        let mut c = McpClient::new(&format!("{}/mcp", mock.base), &BEARER.into(), "t");
         c.initialize().await.unwrap();
         let tools = c.list_tools().await.unwrap();
         assert_eq!(
@@ -485,7 +485,7 @@ mod tests {
         let mock = spawn_mock(vec![rpc_ok(
             r#"{"content":[{"type":"text","text":"3 results"}]}"#,
         )]);
-        let mut c = McpClient::new(&format!("{}/mcp", mock.base), BEARER, "t");
+        let mut c = McpClient::new(&format!("{}/mcp", mock.base), &BEARER.into(), "t");
         let out = c
             .call_tool("search", json!({ "query": "roadmap" }))
             .await
@@ -509,7 +509,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_notion_takes_bearer_and_rejects_a_bad_one() {
-        let mut c = McpClient::new("https://mcp.notion.com/mcp", BEARER, "ntn_not_a_real_token");
+        let mut c = McpClient::new("https://mcp.notion.com/mcp", &BEARER.into(), "ntn_not_a_real_token");
         match c.initialize().await {
             Err(McpError::Unauthorized(m)) => println!("notion said: {m}"),
             other => panic!("expected Unauthorized from a junk token, got {other:?}"),
@@ -525,7 +525,7 @@ mod tests {
         // complaint, which would mean we put it in the wrong header.
         let mut c = McpClient::new(
             "https://mcp.figma.com/mcp",
-            FIGMA_TOKEN_HEADER,
+            &FIGMA_TOKEN_HEADER.into(),
             "figd_not_a_real_token",
         );
         match c.initialize().await {
@@ -546,7 +546,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_figma_refuses_bearer() {
-        let mut c = McpClient::new("https://mcp.figma.com/mcp", BEARER, "figd_not_a_real_token");
+        let mut c = McpClient::new("https://mcp.figma.com/mcp", &BEARER.into(), "figd_not_a_real_token");
         match c.initialize().await {
             Err(McpError::Unauthorized(m)) => assert!(
                 m.contains("X-Figma-Token"),

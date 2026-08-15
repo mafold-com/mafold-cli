@@ -39,6 +39,11 @@ uuid = { version = "1", default-features = false, features = ["serde"] }
 # the same key hierarchy would diverge silently and the symptom would be "the
 # credential I added on my laptop won't open in the browser".
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+# Verifying the provider pack (`providers.rs`). The pack decides where a
+# decrypted credential is sent, so it is checked against a key compiled in here
+# rather than trusted because the api served it. Same dalek family as the vault's
+# key agreement above, so no second curve implementation enters the build.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 chacha20poly1305 = "0.10"
 hkdf = "0.12"
 argon2 = "0.5"

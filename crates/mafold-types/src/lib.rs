@@ -866,38 +866,46 @@ pub struct FlagRecord {
 /// value is independent of serde_json's `preserve_order` feature, which any
 /// crate in a build graph could flip on.
 pub fn langpack_checksum(strings: &serde_json::Map<String, serde_json::Value>) -> String {
-    fn canon(v: &serde_json::Value, out: &mut String) {
-        match v {
-            serde_json::Value::Object(o) => {
-                let mut keys: Vec<&String> = o.keys().collect();
-                keys.sort();
-                out.push('{');
-                for (i, k) in keys.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    out.push_str(&serde_json::Value::String((*k).clone()).to_string());
-                    out.push(':');
-                    canon(&o[k.as_str()], out);
-                }
-                out.push('}');
-            }
-            serde_json::Value::Array(a) => {
-                out.push('[');
-                for (i, item) in a.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    canon(item, out);
-                }
-                out.push(']');
-            }
-            other => out.push_str(&other.to_string()),
-        }
-    }
     let mut canonical = String::new();
-    canon(&serde_json::Value::Object(strings.clone()), &mut canonical);
+    canon_json(&serde_json::Value::Object(strings.clone()), &mut canonical);
     fnv1a_hex(canonical.as_bytes())
+}
+
+/// JSON rendered with object keys sorted, so two equal documents always produce
+/// one string.
+///
+/// Shared by every checksum in this crate rather than copied per pack: a second
+/// canonicaliser that drifted by one comma would make one cache think it was
+/// stale forever and another think it was fresh forever, and both failures look
+/// like anything but a whitespace difference.
+pub(crate) fn canon_json(v: &serde_json::Value, out: &mut String) {
+    match v {
+        serde_json::Value::Object(o) => {
+            let mut keys: Vec<&String> = o.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::Value::String((*k).clone()).to_string());
+                out.push(':');
+                canon_json(&o[k.as_str()], out);
+            }
+            out.push('}');
+        }
+        serde_json::Value::Array(a) => {
+            out.push('[');
+            for (i, item) in a.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                canon_json(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
 }
 
 /// FNV-1a as lowercase hex.

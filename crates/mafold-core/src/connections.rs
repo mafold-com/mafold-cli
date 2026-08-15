@@ -23,7 +23,7 @@ use serde_json::{Map, Value};
 use crate::mcp::{McpClient, McpError, MethodSpec};
 use crate::net;
 use crate::vault::{self, Key};
-use mafold_types::connections::{provider, ProviderSpec};
+use mafold_types::connections::ProviderInfo;
 
 /// How long a fetched tool catalog stays fresh in memory.
 ///
@@ -92,15 +92,25 @@ impl Runtime {
             .ok_or_else(|| format!("no connection named `{name}` — see `mafold connection list`"))
     }
 
-    /// The provider spec behind a stored connection.
+    /// The descriptor behind a stored connection, from the served registry.
     ///
-    /// A row can name a provider this build has never heard of (an older client
-    /// reading a newer account), and that must read as a version problem rather
-    /// than as a corrupt connection.
-    fn spec_of(conn: &Value) -> Result<&'static ProviderSpec> {
+    /// Three outcomes, and they are three different sentences on purpose:
+    /// no registry yet (a network problem, and temporary), a registry that has
+    /// no such row (the provider was withdrawn — rare, and not the user's
+    /// doing), or a row naming a native driver this build lacks (the only case
+    /// left where "update the app" is the honest answer).
+    ///
+    /// It used to be a lookup in a compiled-in table, which made "this binary
+    /// is older than your account" the answer to all three — including for a
+    /// connection the user had just successfully linked.
+    async fn descriptor_of(&self, conn: &Value) -> Result<ProviderInfo> {
         let id = conn.get("provider").and_then(Value::as_str).unwrap_or("");
-        provider(id).ok_or_else(|| {
-            format!("`{id}` isn't a provider this version knows — update mafold")
+        crate::providers::ensure(&self.base, &self.token, now_ms()).await?;
+        crate::providers::get(id).ok_or_else(|| {
+            format!(
+                "the provider registry has no `{id}` — it may have been withdrawn; \
+                 `mafold connection providers` lists what is current"
+            )
         })
     }
 
@@ -112,8 +122,8 @@ impl Runtime {
     }
 
     /// The MCP endpoint for a connection, or a sentence about why there is none.
-    fn endpoint(spec: &ProviderSpec) -> Result<&'static str> {
-        spec.mcp_url.ok_or_else(|| {
+    fn endpoint(spec: &ProviderInfo) -> Result<&str> {
+        spec.mcp_url.as_deref().ok_or_else(|| {
             format!(
                 "{} has no MCP server, so it has no methods — it is a credential to hand to a \
                  tool, not a thing to call",
@@ -130,17 +140,17 @@ impl Runtime {
             }
         }
         let conn = self.get(name).await?;
-        let spec = Self::spec_of(&conn)?;
-        let url = Self::endpoint(spec)?;
-        let payload = self.refreshed_payload(name, &conn, spec).await?;
+        let spec = self.descriptor_of(&conn).await?;
+        let url = Self::endpoint(&spec)?;
+        let payload = self.refreshed_payload(name, &conn, &spec).await?;
 
-        let methods = match self.catalog(url, spec, &payload).await {
+        let methods = match self.catalog(url, &spec, &payload).await {
             Ok(m) => m,
             // The credential was refused even after any renewal above, so the
             // grant itself is gone (revoked at the provider, or a refresh token
             // that has been spent). Nothing to retry.
             Err(McpError::Unauthorized(m)) => {
-                return Err(unauthorized_msg(name, spec, &m));
+                return Err(unauthorized_msg(name, &spec, &m));
             }
             Err(e) => return Err(e.to_string()),
         };
@@ -157,10 +167,10 @@ impl Runtime {
     async fn catalog(
         &self,
         url: &str,
-        spec: &ProviderSpec,
+        spec: &ProviderInfo,
         payload: &Map<String, Value>,
     ) -> std::result::Result<Vec<MethodSpec>, McpError> {
-        let mut client = McpClient::new(url, spec.auth, &credential(spec, payload));
+        let mut client = McpClient::new(url, &spec.auth, &credential(spec, payload));
         client.initialize().await?;
         client.list_tools().await
     }
@@ -178,8 +188,8 @@ impl Runtime {
         stream: bool,
     ) -> Result<Value> {
         let conn = self.get(name).await?;
-        let spec = Self::spec_of(&conn)?;
-        match spec.native_api {
+        let spec = self.descriptor_of(&conn).await?;
+        match spec.native_api.as_deref() {
             Some("codex-responses") => {
                 if method != "responses" {
                     return Err(format!(
@@ -187,10 +197,11 @@ impl Runtime {
                         spec.display
                     ));
                 }
-                crate::codex::run(self, call_id, name, &conn, spec, params, stream).await
+                crate::codex::run(self, call_id, name, &conn, &spec, params, stream).await
             }
-            // A row this build has never heard of: a version problem, phrased
-            // as one (the same stance as `spec_of`).
+            // The ONE case where "update the app" is still the honest answer:
+            // the pack can name a driver, but a driver is code. Everything else
+            // a new provider needs now arrives with the pack.
             Some(other) => Err(format!(
                 "`{name}` is driven by `{other}`, which this version doesn't know — update mafold"
             )),
@@ -201,20 +212,20 @@ impl Runtime {
     /// Run one MCP method.
     pub async fn call(&mut self, name: &str, method: &str, params: Value) -> Result<Value> {
         let conn = self.get(name).await?;
-        let spec = Self::spec_of(&conn)?;
-        let url = Self::endpoint(spec)?;
-        let payload = self.refreshed_payload(name, &conn, spec).await?;
+        let spec = self.descriptor_of(&conn).await?;
+        let url = Self::endpoint(&spec)?;
+        let payload = self.refreshed_payload(name, &conn, &spec).await?;
 
-        let mut client = McpClient::new(url, spec.auth, &credential(spec, &payload));
+        let mut client = McpClient::new(url, &spec.auth, &credential(&spec, &payload));
         client.initialize().await.map_err(|e| match e {
-            McpError::Unauthorized(m) => unauthorized_msg(name, spec, &m),
+            McpError::Unauthorized(m) => unauthorized_msg(name, &spec, &m),
             e => e.to_string(),
         })?;
         client
             .call_tool(method, params)
             .await
             .map_err(|e| match e {
-                McpError::Unauthorized(m) => unauthorized_msg(name, spec, &m),
+                McpError::Unauthorized(m) => unauthorized_msg(name, &spec, &m),
                 e => e.to_string(),
             })
     }
@@ -230,7 +241,7 @@ impl Runtime {
         &self,
         name: &str,
         conn: &Value,
-        spec: &ProviderSpec,
+        spec: &ProviderInfo,
     ) -> Result<Map<String, Value>> {
         let payload = self.open(conn)?;
         if !needs_renewal(&payload) {
@@ -257,7 +268,7 @@ impl Runtime {
         &self,
         name: &str,
         conn: &Value,
-        spec: &ProviderSpec,
+        spec: &ProviderInfo,
         payload: &Map<String, Value>,
     ) -> Result<Map<String, Value>> {
         let get = |k: &str| payload.get(k).and_then(Value::as_str).unwrap_or("").to_string();
@@ -320,7 +331,7 @@ impl Runtime {
         &self,
         name: &str,
         conn: &Value,
-        spec: &ProviderSpec,
+        spec: &ProviderInfo,
         payload: &Map<String, Value>,
     ) -> Result<()> {
         let kept = filter_payload(spec, payload);
@@ -400,16 +411,16 @@ pub async fn handle_event(rt: &mut Runtime, envelope: &str) -> bool {
 /// Filtering against the *renderable* fields is what silently dropped
 /// `expires_at` from every Notion grant, turning a refreshable connection into
 /// one that died after an hour with nothing recorded about why.
-pub fn filter_payload(spec: &ProviderSpec, payload: &Map<String, Value>) -> Map<String, Value> {
+pub fn filter_payload(spec: &ProviderInfo, payload: &Map<String, Value>) -> Map<String, Value> {
     let mut out = Map::new();
-    for f in spec.fields {
-        match payload.get(f.key) {
+    for key in &spec.payload_keys {
+        match payload.get(key) {
             Some(Value::String(s)) if !s.is_empty() => {
-                out.insert(f.key.into(), Value::String(s.clone()));
+                out.insert(key.clone(), Value::String(s.clone()));
             }
             // Providers are inconsistent about number-vs-string for expiry.
             Some(Value::Number(n)) => {
-                out.insert(f.key.into(), Value::String(n.to_string()));
+                out.insert(key.clone(), Value::String(n.to_string()));
             }
             _ => {}
         }
@@ -418,9 +429,9 @@ pub fn filter_payload(spec: &ProviderSpec, payload: &Map<String, Value>) -> Map<
 }
 
 /// The credential itself, from wherever the registry says it lives.
-fn credential(spec: &ProviderSpec, payload: &Map<String, Value>) -> String {
+fn credential(spec: &ProviderInfo, payload: &Map<String, Value>) -> String {
     payload
-        .get(spec.auth.field)
+        .get(&spec.auth.field)
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string()
@@ -453,7 +464,7 @@ pub fn needs_renewal(payload: &Map<String, Value>) -> bool {
 /// Keeps the provider's own sentence — it is usually the specific one — and
 /// adds the only thing the provider cannot know: which Mafold connection this
 /// was, and how to fix it here.
-fn unauthorized_msg(name: &str, spec: &ProviderSpec, detail: &str) -> String {
+fn unauthorized_msg(name: &str, spec: &ProviderInfo, detail: &str) -> String {
     format!(
         "{} refused this credential: {detail}\n  \
          re-link it:  mafold connection add {name} --provider {}",
@@ -480,12 +491,12 @@ fn form_encode(s: &str) -> String {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     js_sys::Date::now() as i64
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -495,8 +506,23 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mafold_types::connections::provider;
+    use mafold_types::connections::provider_infos;
     use serde_json::json;
+
+    /// One descriptor, in the SERVED shape.
+    ///
+    /// Tests read the same `provider_infos()` a publish serialises, so they
+    /// exercise what a client actually receives rather than the authoring const
+    /// it is derived from.
+    fn info(id: &str) -> ProviderInfo {
+        provider_infos().into_iter().find(|p| p.id == id).expect("no such provider")
+    }
+
+    /// Put a registry in this process, as a fetch would. `now_ms()` keeps it
+    /// inside the freshness window, so nothing here touches the network.
+    fn with_registry() {
+        crate::providers::install_unverified_for_tests(1, provider_infos(), now_ms());
+    }
 
     fn map(v: Value) -> Map<String, Value> {
         v.as_object().unwrap().clone()
@@ -534,9 +560,9 @@ mod tests {
     /// The regression this whole field split exists for.
     #[test]
     fn filtering_keeps_the_fields_a_form_never_draws() {
-        let notion = provider("notion").unwrap();
+        let notion = info("notion");
         let kept = filter_payload(
-            notion,
+            &notion,
             &map(json!({
                 "access_token": "ntn_a",
                 "refresh_token": "ntn_r",
@@ -557,7 +583,7 @@ mod tests {
     #[test]
     fn a_numeric_expiry_is_normalised_to_a_string() {
         let kept = filter_payload(
-            provider("notion").unwrap(),
+            &info("notion"),
             &map(json!({ "access_token": "t", "expires_at": 1760000000000i64 })),
         );
         assert_eq!(kept.get("expires_at").unwrap(), "1760000000000");
@@ -569,14 +595,14 @@ mod tests {
     fn the_credential_comes_from_the_registrys_field() {
         assert_eq!(
             credential(
-                provider("notion").unwrap(),
+                &info("notion"),
                 &map(json!({ "access_token": "ntn_a" }))
             ),
             "ntn_a"
         );
         assert_eq!(
             credential(
-                provider("anthropic-api").unwrap(),
+                &info("anthropic-api"),
                 &map(json!({ "api_key": "sk-ant-1" }))
             ),
             "sk-ant-1"
@@ -587,16 +613,42 @@ mod tests {
     /// message has to say which it is.
     #[test]
     fn a_provider_without_mcp_explains_itself() {
-        let err = Runtime::endpoint(provider("anthropic-api").unwrap()).unwrap_err();
+        let err = Runtime::endpoint(&info("anthropic-api")).unwrap_err();
         assert!(err.contains("no MCP server"), "{err}");
-        assert!(Runtime::endpoint(provider("notion").unwrap()).is_ok());
-        assert!(Runtime::endpoint(provider("figma").unwrap()).is_ok());
+        assert!(Runtime::endpoint(&info("notion")).is_ok());
+        assert!(Runtime::endpoint(&info("figma")).is_ok());
     }
 
-    #[test]
-    fn an_unknown_provider_reads_as_a_version_problem() {
-        let err = Runtime::spec_of(&json!({ "provider": "dropbox" })).unwrap_err();
-        assert!(err.contains("update mafold"), "{err}");
+    /// A row the registry doesn't have is no longer "your binary is old".
+    ///
+    /// It used to be, and that was the bug: a provider added on Tuesday made
+    /// every client say "update mafold" until five apps had shipped, including
+    /// to the user who had just linked it successfully from their browser.
+    #[tokio::test]
+    async fn a_provider_missing_from_the_pack_is_not_a_version_problem() {
+        with_registry();
+        // `base` is never reached: the pack was installed at `now_ms()`, so
+        // `ensure` is inside its freshness window and does no I/O. That is the
+        // property that keeps a cached registry working offline.
+        let rt = Runtime::new("http://127.0.0.1:1", "s_tok", Key::random());
+        let err = rt.descriptor_of(&json!({ "provider": "dropbox" })).await.unwrap_err();
+        assert!(err.contains("no `dropbox`"), "{err}");
+        assert!(!err.contains("update mafold"), "not a version problem: {err}");
+
+        // And one the pack DOES carry resolves, with the routing a call needs.
+        let figma = rt.descriptor_of(&json!({ "provider": "figma" })).await.unwrap();
+        assert_eq!(figma.auth.header, "X-Figma-Token");
+    }
+
+    /// With no pack at all the sentence has to be about the registry, not about
+    /// the connection — and it must not be silently treated as "no providers".
+    #[tokio::test]
+    async fn no_registry_yet_says_so_rather_than_blaming_the_connection() {
+        crate::providers::forget();
+        let rt = Runtime::new("http://127.0.0.1:1", "s_tok", Key::random());
+        let err = rt.descriptor_of(&json!({ "provider": "notion" })).await.unwrap_err();
+        assert!(err.contains("no provider registry yet"), "{err}");
+        with_registry();
     }
 
     #[test]
@@ -686,7 +738,7 @@ mod tests {
     fn the_unauthorized_message_keeps_the_providers_own_words() {
         let m = unauthorized_msg(
             "design",
-            provider("figma").unwrap(),
+            &info("figma"),
             "figd_ tokens must be passed via X-Figma-Token header",
         );
         assert!(m.contains("X-Figma-Token"), "{m}");
