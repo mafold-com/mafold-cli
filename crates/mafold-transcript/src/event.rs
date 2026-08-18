@@ -21,6 +21,18 @@ pub enum AgentEvent {
     Session(String),
     /// A chunk of streamed assistant text.
     Text(String),
+    /// The producer ABANDONED the assistant message it was streaming and is
+    /// starting that message over — an API connection dropped mid-response and
+    /// the SDK retries by re-streaming from the first token, not by resuming.
+    /// Carries the text of the abandoned attempt so the transcript can un-say
+    /// exactly that and nothing else.
+    ///
+    /// Without it the reply grows one duplicate copy of the opening line per
+    /// retry. On 2026-08-15 three attempts spliced into
+    /// `Now theNow the RN twin — first `TNow the RN twin — first `TextArea`…`,
+    /// which left an ODD number of backticks and swallowed the 19.5k of tool
+    /// cards behind it into the bubble as raw text.
+    TextRewind(String),
     /// A tool / function call the agent made.
     ToolCall {
         id: String,

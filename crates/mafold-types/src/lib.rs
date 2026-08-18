@@ -185,8 +185,8 @@ pub enum InlinePick {
 ///
 /// `content` is the message body that gets sent or inserted — everything else is
 /// presentation for the row. Whatever is picked is sent AS THE USER; the queried
-/// bot never appears in the conversation, which is what lets a connector answer
-/// `@notion …` in a group it isn't a member of.
+/// bot never appears in the conversation, which is what lets a bot answer an
+/// inline query from a group it isn't a member of.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct InlineResult {
     /// Stable, content-derived id. Clients de-duplicate on it and use it to keep

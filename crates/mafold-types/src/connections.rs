@@ -1,10 +1,10 @@
 //! Connections — the user's own credentials at third-party platforms, synced
 //! through Mafold as **ciphertext the server cannot open**.
 //!
-//! This is a different layer from `connectors/` (the `@github` / `@notion` bot
-//! accounts). A connector is an account that acts *server-side* on your behalf,
-//! so the server necessarily holds a key it can use. A connection is the
-//! opposite arrangement: the plaintext is only ever assembled on **your own
+//! This is a different layer from the deleted `connectors/` (the `@github` /
+//! `@notion` bot accounts, removed 2026-08-13). A connector was an account that
+//! acted *server-side* on your behalf, so the server necessarily held a key it
+//! could use. A connection is the opposite arrangement: the plaintext is only ever assembled on **your own
 //! machines**, because the things that read it — a Claude Code harness, a Codex
 //! harness, a local MCP server — run there. The server's whole job is to be a
 //! synchronizing box of opaque bytes, so that linking an account once makes it
@@ -111,8 +111,7 @@ pub struct SecretField {
 
 /// A provider is **data**, not a branch. Adding one is a row here plus, if it
 /// can be imported, a path — no changes to the store, the routes, or the CLI's
-/// command surface. (Same discipline as `ConnectorManifest`; see
-/// `.docs/connectors-v1.md` §6.)
+/// command surface.
 #[derive(Debug, Clone, Copy)]
 pub struct ProviderSpec {
     pub id: &'static str,
@@ -120,8 +119,8 @@ pub struct ProviderSpec {
     /// One line on what linking this gets you — the row's second line in a UI.
     pub blurb: &'static str,
     /// Brand mark slug, served by the api as `/assets/bot/<badge>.png`. It names
-    /// art that ALREADY exists for bots and connectors, so a Notion connection
-    /// and the @notion connector wear one face and re-cutting a logo is one file.
+    /// art that ALREADY exists for bots, so every surface that shows a provider
+    /// wears the same face and re-cutting a logo is one file.
     /// Empty = no mark; a client draws its own generic placeholder.
     pub badge: &'static str,
     pub kind: ProviderKind,
@@ -248,6 +247,44 @@ pub struct BrokerSpec {
 // copy `client_id` + `token_endpoint` into the sealed payload so the core's
 // ONE generic renewal path drives Codex like every other OAuth bag.
 pub mod codex {
+    /// One model id embedded in the shipping Codex CLI.
+    ///
+    /// This roster lives beside the rest of the Codex protocol constants so
+    /// the daemon's Customize sheet and the server-side @chatgpt market cannot
+    /// drift into disagreeing about what the same subscription can run.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SubscriptionModel {
+        pub id: &'static str,
+        pub label: &'static str,
+        /// Whether models.dev has an official price for this id, making it
+        /// eligible for wallet-metered resale. Self-use does not need a price.
+        pub wallet_metered: bool,
+    }
+
+    pub const DEFAULT_MODEL: &str = "gpt-5.6-sol";
+    pub const SUBSCRIPTION_MODELS: &[SubscriptionModel] = &[
+        SubscriptionModel {
+            id: "gpt-5.6-sol",
+            label: "GPT-5.6 Sol",
+            wallet_metered: true,
+        },
+        SubscriptionModel {
+            id: "gpt-5.6-luna",
+            label: "GPT-5.6 Luna",
+            wallet_metered: true,
+        },
+        SubscriptionModel {
+            id: "gpt-5.6-terra",
+            label: "GPT-5.6 Terra",
+            wallet_metered: true,
+        },
+        SubscriptionModel {
+            id: "gpt-5.6-pro",
+            label: "GPT-5.6 Pro",
+            wallet_metered: false,
+        },
+    ];
+
     /// Codex CLI's official OAuth client id (a public client — no secret exists).
     pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
     pub const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
@@ -257,6 +294,10 @@ pub mod codex {
     pub const SCOPES: &str = "openid profile email offline_access";
     /// The ChatGPT-internal endpoint the `codex-responses` native driver calls.
     pub const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+    /// The images sibling — same backend base, the path the Codex CLI's own
+    /// `ImagesClient` posts to (`images/generations` relative to the codex
+    /// provider base; gpt-image on the subscription credential).
+    pub const IMAGES_URL: &str = "https://chatgpt.com/backend-api/codex/images/generations";
 }
 
 // MARK: - Figma OAuth constants

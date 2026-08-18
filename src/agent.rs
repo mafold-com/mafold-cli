@@ -1538,31 +1538,37 @@ fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
         // binary actually accepts; `/model <name>` still takes anything newer.
         // Reasoning effort IS its thinking depth, so it gets the effort select
         // and NO extended-thinking budget field.
-        "codex" => (
-            serde_json::json!([
-                { "key": "model", "label": "Model", "label_key": "botField.model.label", "kind": "select", "default": "",
-                  "options": [
-                    { "label": "Agent default", "label_key": "botField.optionAgentDefault", "value": "" },
-                    { "label": "gpt-5.6-sol",   "value": "gpt-5.6-sol" },
-                    { "label": "gpt-5.6-luna",  "value": "gpt-5.6-luna" },
-                    { "label": "gpt-5.6-terra", "value": "gpt-5.6-terra" },
-                    { "label": "gpt-5.6-pro",   "value": "gpt-5.6-pro" }
-                  ] },
-                { "key": "effort", "label": "Reasoning effort", "label_key": "botField.effort.label", "kind": "select", "default": "",
-                  "options": [
-                    { "label": "Agent default", "label_key": "botField.optionAgentDefault", "value": "" },
-                    { "label": "Minimal", "label_key": "botField.effort.minimal", "value": "minimal" },
-                    { "label": "Low",     "label_key": "botField.effort.low",     "value": "low" },
-                    { "label": "Medium",  "label_key": "botField.effort.medium",  "value": "medium" },
-                    { "label": "High",    "label_key": "botField.effort.high",    "value": "high" }
-                  ] },
-                { "key": "system_prompt", "label": "System prompt", "label_key": "botField.systemPrompt.label", "kind": "string",
-                  "placeholder": "Extra instructions appended for every reply", "placeholder_key": "botField.systemPrompt.placeholder" },
-                { "key": "cwd", "label": "Working directory", "label_key": "botField.cwd.label", "kind": "string",
-                  "placeholder": "~/project — per-chat here = that chat only; All chats = the default", "placeholder_key": "botField.cwd.placeholder" }
-            ]),
-            "model / effort / system prompt / cwd",
-        ),
+        "codex" => {
+            let mut models = vec![serde_json::json!({
+                "label": "Agent default",
+                "label_key": "botField.optionAgentDefault",
+                "value": "",
+            })];
+            models.extend(
+                mafold_core::mafold_types::connections::codex::SUBSCRIPTION_MODELS
+                    .iter()
+                    .map(|m| serde_json::json!({ "label": m.id, "value": m.id })),
+            );
+            (
+                serde_json::json!([
+                    { "key": "model", "label": "Model", "label_key": "botField.model.label", "kind": "select", "default": "",
+                      "options": models },
+                    { "key": "effort", "label": "Reasoning effort", "label_key": "botField.effort.label", "kind": "select", "default": "",
+                      "options": [
+                        { "label": "Agent default", "label_key": "botField.optionAgentDefault", "value": "" },
+                        { "label": "Minimal", "label_key": "botField.effort.minimal", "value": "minimal" },
+                        { "label": "Low",     "label_key": "botField.effort.low",     "value": "low" },
+                        { "label": "Medium",  "label_key": "botField.effort.medium",  "value": "medium" },
+                        { "label": "High",    "label_key": "botField.effort.high",    "value": "high" }
+                      ] },
+                    { "key": "system_prompt", "label": "System prompt", "label_key": "botField.systemPrompt.label", "kind": "string",
+                      "placeholder": "Extra instructions appended for every reply", "placeholder_key": "botField.systemPrompt.placeholder" },
+                    { "key": "cwd", "label": "Working directory", "label_key": "botField.cwd.label", "kind": "string",
+                      "placeholder": "~/project — per-chat here = that chat only; All chats = the default", "placeholder_key": "botField.cwd.placeholder" }
+                ]),
+                "model / effort / system prompt / cwd",
+            )
+        }
         // Kimi Code: a model menu of the ids the installed `kimi` CLI ships (the
         // k3 / K2.7 line), so every option is one the binary accepts; `/model
         // <name>` still takes anything newer. Thinking is a boolean toggle (Kimi
@@ -3175,23 +3181,11 @@ Only variables the schema marks `write` are editable; a `key:*` schema entry is 
 back. When the user asks to view or change an installed app's data, use this — a per-turn \
 block below lists exactly which apps + rooms are available right now.",
     );
-    // Connectors. The static half teaches the SHAPE (you never hold the token);
-    // a per-turn block says which ones exist here and who authorized you.
-    s.push_str(
-        "\n\nCONNECTORS (third-party services): a conversation may include a connector account \
-— @notion, @github — that holds a person's own access token for that service. You do not hold \
-those tokens and cannot be given them. Instead you name an operation and the connector performs \
-it on the credential of the person who authorized you:\n\
-  • `mafold connector list` — which connectors are here, and whose credential I may use\n\
-  • `mafold connector run <name> \"<command>\"` — e.g. `mafold connector run notion \"search 周报\"`\n\
-Write the command WITHOUT a leading slash: some shells rewrite a leading `/` into a path, and \
-the connector then answers with its menu instead. The reply is exactly what that connector would \
-have printed in chat. `run <name> help` lists its own commands — read that instead of guessing. \
-Authorization is a grant the credential's OWNER \
-mints by sending `/allow @<your handle>` to the connector (append `write` to include changes); \
-if a call is refused, the error text names what they should send — relay it rather than saying \
-you can't. A per-turn block lists exactly what is reachable right now.",
-    );
+    // (The static CONNECTORS teaching block lived here until 2026-08-17. Its
+    // `mafold connector list/run` subcommands were deleted with the connector
+    // layer on 2026-08-13, so it was teaching a command that no longer exists.
+    // Connections need no narration: a granted agent calls
+    // `mafold connection call` and the grant check answers server-side.)
     s
 }
 
@@ -5153,6 +5147,21 @@ mod customize_seed_tests {
         let s = stock("codex");
         assert_eq!(opts(&s, "effort"), ["minimal", "low", "medium", "high"]);
         assert!(!s.iter().any(|f| f["key"] == "thinking"), "{s:#?}");
+    }
+
+    /// The daemon and @chatgpt read the same Codex capability roster. Terra
+    /// once existed only in this sheet while the market kept a stale second
+    /// list, making the signup gift impossible to spend.
+    #[test]
+    fn codex_sheet_uses_the_shared_subscription_roster() {
+        let s = stock("codex");
+        let expected: Vec<String> =
+            mafold_core::mafold_types::connections::codex::SUBSCRIPTION_MODELS
+                .iter()
+                .map(|m| m.id.to_string())
+                .collect();
+        assert_eq!(opts(&s, "model"), expected);
+        assert!(expected.iter().any(|m| m == "gpt-5.6-terra"));
     }
 
     /// A sheet seeded before effort existed is still OURS, so the next daemon

@@ -45,6 +45,9 @@ pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<St
         }
         AgentEvent::Done { duration_ms, cost_usd, tokens } => result_tag(*duration_ms, *cost_usd, *tokens),
         AgentEvent::Session(_) => None,
+        // Removal, not content — the transcript un-says it in place
+        // (`Transcript::rewind_text`); there is nothing to render.
+        AgentEvent::TextRewind(_) => None,
         // Not text: the render loop uploads it and attaches it to the message,
         // so it renders as message MEDIA — the same bubble path a person's
         // photo takes — instead of as a card in the transcript.
@@ -567,6 +570,125 @@ fn reset_hint(resets_at: Option<i64>, now: i64) -> String {
     }
 }
 
+/// Close inline-code spans and fences the model left OPEN in its own prose.
+///
+/// Card tags live at the markdown level, so an unclosed `` ` `` or ``` ``` ```
+/// in narration swallows everything after it into a code span — and every
+/// `{% mafold/… %}` that follows renders as literal markup instead of a card.
+/// On 2026-08-15 one odd backtick in a 66-character sentence dumped the 19.5k
+/// of tool cards behind it into the bubble as raw text: 95% of the message.
+/// A malformed character in one sentence must not be able to un-render
+/// everything after it.
+///
+/// Only the model's OWN prose is healed — the segments at card-nesting depth 0.
+/// Card bodies belong to the renderer (already neutralised by [`block_esc`]),
+/// and a diff that legitimately contains one backtick is not a defect.
+///
+/// Parity is judged per PARAGRAPH, because a markdown code span cannot contain
+/// a blank line: the repair is a single backtick appended to the paragraph that
+/// left one open, which costs one stray character and saves every card below it.
+pub fn heal_open_code(md: &str) -> String {
+    // Fast path: nothing to balance, and the overwhelming majority of replies.
+    if !md.contains('`') {
+        return md.to_string();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut depth: usize = 0;
+    let mut fence: Option<String> = None;
+    // Backticks in the paragraph being read, and where its last line landed.
+    let mut ticks = 0usize;
+    let mut last_line: Option<usize> = None;
+
+    // Close the paragraph just ended: an odd count means a span is still open.
+    macro_rules! close_para {
+        () => {
+            if ticks % 2 == 1 {
+                if let Some(i) = last_line {
+                    out[i].push('`');
+                }
+            }
+            ticks = 0;
+            last_line = None;
+        };
+    }
+
+    for line in md.lines() {
+        let t = line.trim_start();
+        // The renderer always emits its tags at column 0 on a line of their own,
+        // so a tag line is recognisable without parsing markdoc.
+        let opens = t.starts_with("{% mafold/") && !t.trim_end().ends_with("/%}"); // LINT-IGNORE
+        let closes = t.starts_with("{% /mafold/"); // LINT-IGNORE
+        let self_closing = t.starts_with("{% mafold/") && t.trim_end().ends_with("/%}"); // LINT-IGNORE
+        let tag_line = opens || closes || self_closing;
+
+        if let Some(marker) = fence.clone() {
+            // A fence the model opened and never closed would eat the cards
+            // below it whole — close it at the boundary instead.
+            if t.starts_with(&marker) {
+                fence = None;
+                out.push(line.to_string());
+            } else if tag_line {
+                out.push(marker);
+                fence = None;
+                out.push(line.to_string());
+                if opens {
+                    depth += 1;
+                } else if closes {
+                    depth = depth.saturating_sub(1);
+                }
+            } else {
+                out.push(line.to_string());
+            }
+            continue;
+        }
+
+        if tag_line {
+            close_para!();
+            if opens {
+                depth += 1;
+            } else if closes {
+                depth = depth.saturating_sub(1);
+            }
+            out.push(line.to_string());
+            continue;
+        }
+        if depth > 0 {
+            out.push(line.to_string()); // a card body — the renderer's, not ours
+            continue;
+        }
+        if t.starts_with("```") || t.starts_with("~~~") {
+            close_para!();
+            fence = Some(t.chars().take_while(|c| *c == '`' || *c == '~').collect());
+            out.push(line.to_string());
+            continue;
+        }
+        if t.is_empty() {
+            close_para!();
+            out.push(line.to_string());
+            continue;
+        }
+        ticks += line.matches('`').count();
+        out.push(line.to_string());
+        last_line = Some(out.len() - 1);
+    }
+    // The trailing paragraph, which no tag line or blank line ended. Spelled out
+    // rather than `close_para!()` so the macro's resets don't read as dead
+    // stores at the end of the function.
+    if ticks % 2 == 1 {
+        if let Some(i) = last_line {
+            out[i].push('`');
+        }
+    }
+    if let Some(marker) = fence {
+        out.push(marker);
+    }
+    let mut healed = out.join("\n");
+    if md.ends_with('\n') {
+        healed.push('\n');
+    }
+    healed
+}
+
 fn cap_lines(s: &str, max: usize) -> String {
     let lines: Vec<&str> = s.lines().collect();
     if lines.len() <= max {
@@ -899,5 +1021,70 @@ mod notice_tests {
         .unwrap();
         assert!(out.contains("five_hour"), "{out}");
         assert!(out.contains("Usage limit"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod heal_tests {
+    use super::heal_open_code;
+
+    /// The 2026-08-15 message: three spliced attempts left five backticks, and
+    /// the `{% mafold/run %}` under them rendered as literal text.
+    #[test]
+    fn an_odd_backtick_is_closed_before_the_cards_below_it() {
+        let md = "Now theNow the RN twin — first `TNow the RN twin — first `TextArea` gains the same `grow` contract:\n\
+                  \n{% mafold/run summary=\"Ran 1 shell command\" %}\n\
+                  {% mafold/tool name=\"Bash\" detail=\"pnpm test\" /%}\n\
+                  {% /mafold/run %}\n";
+        let out = heal_open_code(md);
+        let head = out.split("{% mafold/run").next().unwrap();
+        assert_eq!(head.matches('`').count() % 2, 0, "span still open: {out}");
+        assert!(out.contains("{% mafold/run summary="), "the cards must survive: {out}");
+    }
+
+    /// Balanced prose is returned byte-for-byte — the repair must be invisible
+    /// on every healthy reply, which is nearly all of them.
+    #[test]
+    fn balanced_prose_is_untouched() {
+        for md in [
+            "plain prose, no code at all\n",
+            "call `foo()` then `bar()` and stop\n",
+            "```\nfn main() {}\n```\n\ndone\n",
+            "a `span` here\n\nand `another` there\n",
+        ] {
+            assert_eq!(heal_open_code(md), md, "rewrote a healthy message: {md}");
+        }
+    }
+
+    /// A card BODY is the renderer's own escaped output. A diff line that
+    /// happens to carry one backtick is not a defect and must not be edited.
+    #[test]
+    fn card_bodies_are_left_alone() {
+        let md = "{% mafold/tool name=\"Bash\" detail=\"echo\" %}\n\
+                  let s = `unterminated in a shell heredoc\n\
+                  {% /mafold/tool %}\n";
+        assert_eq!(heal_open_code(md), md);
+    }
+
+    /// An unclosed fence eats even more than a stray backtick — close it at the
+    /// first card tag rather than letting the rest of the reply vanish into it.
+    #[test]
+    fn an_unclosed_fence_is_closed_before_a_card() {
+        let md = "here:\n```rust\nfn main() {}\n\n{% mafold/run summary=\"Ran 1 shell command\" %}\n{% /mafold/run %}\n";
+        let out = heal_open_code(md);
+        assert_eq!(out.matches("```").count(), 2, "fence not closed: {out}");
+        let fence_close = out.find("```").unwrap() + 3;
+        assert!(
+            out[fence_close..].find("```").unwrap() + fence_close < out.find("{% mafold/run").unwrap(),
+            "the fence must close ABOVE the card: {out}"
+        );
+    }
+
+    /// Parity is per paragraph: an odd count in one paragraph must not be
+    /// "balanced" by an odd count in the next.
+    #[test]
+    fn parity_does_not_leak_across_paragraphs() {
+        let out = heal_open_code("one `open\n\ntwo `also open\n");
+        assert_eq!(out, "one `open`\n\ntwo `also open`\n", "{out}");
     }
 }

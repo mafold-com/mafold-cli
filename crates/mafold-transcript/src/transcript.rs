@@ -148,6 +148,43 @@ impl Transcript {
         self.full = (self.qualify)(&self.full);
     }
 
+    /// Un-say narration the producer abandoned (see [`AgentEvent::TextRewind`]).
+    ///
+    /// Removed only as an exact SUFFIX of what has been said — the pending
+    /// buffer first, then across the commit boundary into committed content —
+    /// so a rewind that doesn't match the tail is a no-op rather than a
+    /// corruption. That is the whole safety argument: a producer that resumed
+    /// instead of restarting, or text a `qualify` pass already rewrote, simply
+    /// fails to match and nothing is lost. It never reaches back past a
+    /// committed card, because a card can only follow text that this rewind
+    /// would then fail to match.
+    pub fn rewind_text(&mut self, text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        // Still wholly pending — the common case, since an aborted message is
+        // usually shorter than one commit batch.
+        if let Some(keep) = self.buf.len().checked_sub(text.len()) {
+            if self.buf.ends_with(text) {
+                self.buf.truncate(keep);
+                return true;
+            }
+        }
+        // Split across the boundary: the head landed in `full`, the tail is
+        // still buffered.
+        let head_len = match text.len().checked_sub(self.buf.len()) {
+            Some(n) if text.ends_with(&self.buf) => n,
+            _ => return false,
+        };
+        if !self.full.ends_with(&text[..head_len]) {
+            return false;
+        }
+        self.full.truncate(self.full.len() - head_len);
+        self.buf.clear();
+        self.emitted = self.emitted.min(self.full.len());
+        true
+    }
+
     fn close_group(&mut self) {
         if self.group.is_empty() {
             return;
@@ -211,6 +248,15 @@ impl Transcript {
                     self.flush_text();
                 }
                 Advance::Streamed
+            }
+            // The retry is about to re-say it; drop the abandoned attempt so the
+            // reply carries one copy, not one per dropped connection.
+            AgentEvent::TextRewind(t) => {
+                if self.rewind_text(t) {
+                    Advance::Streamed
+                } else {
+                    Advance::Quiet
+                }
             }
             // Liveness and out-of-band payloads: no content of their own.
             AgentEvent::Pulse { .. } | AgentEvent::Session(_) | AgentEvent::Image { .. } => {
@@ -288,18 +334,23 @@ impl Transcript {
     /// Re-rendering the open group on every push is free — the group is a pure
     /// function of its items, and committing it later produces byte-identical
     /// text, so the transition is invisible.
+    /// Healed on the way out ([`render::heal_open_code`]), never in `full`: the
+    /// repair is a property of the message as RENDERED, and a backtick the next
+    /// delta is about to close must not be paired off behind its back. A
+    /// snapshot is a full rewrite, so recomputing it every push is correct by
+    /// construction.
     pub fn snapshot(&self) -> String {
         if self.group.is_empty() {
-            return self.full.clone();
+            return render::heal_open_code(&self.full);
         }
-        format!(
+        render::heal_open_code(&format!(
             "{}{}",
             self.full,
             render::run_card(
                 &render::run_summary(&self.counts),
                 &render::render_group(&self.group),
             )
-        )
+        ))
     }
 
     /// Content committed since the last call — the append-only view, for a
@@ -335,7 +386,7 @@ impl Transcript {
     /// half-built group are still the best record of what happened.
     pub fn finish(&mut self) -> String {
         self.seal();
-        self.full.clone()
+        render::heal_open_code(&self.full)
     }
 }
 
@@ -538,6 +589,73 @@ mod tests {
         assert!(live2.contains("summary=\"Read 2 files\""), "summary must tick: {live2}");
         let committed = t.finish();
         assert_eq!(committed, live2, "committing an open group is visually seamless");
+    }
+
+    /// The 2026-08-15 regression, end to end: the API drops mid-response twice,
+    /// claude re-streams the same sentence from its first token each time, and
+    /// the reply must still carry ONE copy of it.
+    #[test]
+    fn a_retried_message_is_not_said_twice() {
+        let mut t = Transcript::new();
+        // Attempt 1, cut off.
+        t.push(&AgentEvent::Text("Now the".into()));
+        t.push(&AgentEvent::TextRewind("Now the".into()));
+        // Attempt 2, cut off further along.
+        t.push(&AgentEvent::Text("Now the RN twin — first `T".into()));
+        t.push(&AgentEvent::TextRewind("Now the RN twin — first `T".into()));
+        // Attempt 3 lands.
+        t.push(&AgentEvent::Text("Now the RN twin — first `TextArea` grows.".into()));
+        let md = t.finish();
+        assert_eq!(md, "Now the RN twin — first `TextArea` grows.", "{md}");
+        assert_eq!(md.matches("Now the").count(), 1, "one copy, not one per retry: {md}");
+    }
+
+    /// A rewind survives the commit boundary: half the abandoned attempt may
+    /// already be committed when the retry starts.
+    #[test]
+    fn a_rewind_reaches_across_the_commit_boundary() {
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("hello ".into()));
+        t.flush_text(); // "hello " is committed; the rest will be buffered
+        t.push(&AgentEvent::Text("world".into()));
+        assert!(t.rewind_text("hello world"), "must match across full+buf");
+        assert_eq!(t.finish(), "");
+    }
+
+    /// The safety property: a rewind that is NOT the exact tail changes nothing.
+    /// Un-saying the wrong bytes is worse than leaving a duplicate.
+    #[test]
+    fn a_rewind_that_does_not_match_the_tail_is_a_no_op() {
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("kept".into()));
+        assert_eq!(t.push(&AgentEvent::TextRewind("something else".into())), Advance::Quiet);
+        assert!(!t.rewind_text(""), "an empty rewind is not a removal");
+        assert_eq!(t.finish(), "kept");
+    }
+
+    /// One odd backtick in narration must not un-render the cards below it —
+    /// the other half of the same incident, where 95% of a 20k message spilled
+    /// into the bubble as raw text.
+    #[test]
+    fn an_unbalanced_backtick_does_not_swallow_the_cards_below_it() {
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("Now theNow the RN twin — first `TNow the RN twin — first `TextArea` gains the same `grow` contract:".into()));
+        t.push(&call("a", "Bash", json!({ "command": "pnpm test" })));
+        t.push(&result("a", "ok"));
+        let md = t.finish();
+        let head = md.split("{% mafold/run").next().expect("narration");
+        assert_eq!(head.matches('`').count() % 2, 0, "code span left open: {md}");
+        assert!(md.contains("{% mafold/run"), "{md}");
+        // The live snapshot is healed the same way — the user reads THAT first.
+        let mut t2 = Transcript::new();
+        t2.push(&AgentEvent::Text("Now theNow the RN twin — first `TNow the RN twin — first `TextArea` gains the same `grow` contract:".into()));
+        t2.push(&call("a", "Bash", json!({ "command": "pnpm test" })));
+        let live = t2.snapshot();
+        assert_eq!(
+            live.split("{% mafold/run").next().unwrap().matches('`').count() % 2,
+            0,
+            "{live}"
+        );
     }
 
     /// Liveness events carry no content — they must not disturb the transcript.

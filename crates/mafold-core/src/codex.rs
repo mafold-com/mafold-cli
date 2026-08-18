@@ -158,6 +158,125 @@ async fn run_at(
     unreachable!("the 401 arm either returned or retried");
 }
 
+/// A generated image travelling back through the relay as base64 — bounded so
+/// a runaway answer can't balloon the device or the rendezvous.
+const MAX_IMAGE_ANSWER: usize = 32 * 1024 * 1024;
+
+/// The images sibling of [`run`]: one non-streaming POST to the Codex images
+/// backend on the same credential (`gpt-image-2`, the model the CLI's own
+/// imagegen pins). The tool call that asks for this is parsed server-side;
+/// this driver only signs, posts, and hands the bytes back.
+pub(crate) async fn images(
+    rt: &Runtime,
+    name: &str,
+    conn: &Value,
+    spec: &ProviderInfo,
+    params: &Value,
+) -> Result<Value, String> {
+    images_at(codex::IMAGES_URL, rt, name, conn, spec, params).await
+}
+
+async fn images_at(
+    url: &str,
+    rt: &Runtime,
+    name: &str,
+    conn: &Value,
+    spec: &ProviderInfo,
+    params: &Value,
+) -> Result<Value, String> {
+    let prompt = params
+        .get("prompt")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("images.generate needs a prompt")?;
+    let mut body = json!({ "prompt": prompt, "model": "gpt-image-2", "n": 1 });
+    for k in ["size", "quality", "background"] {
+        if let Some(v) = params.get(k).and_then(Value::as_str) {
+            body[k] = json!(v);
+        }
+    }
+    let body = body.to_string();
+
+    let mut payload = rt.refreshed_payload(name, conn, spec).await?;
+    for attempt in 0..2u8 {
+        let hs = image_headers(&payload)?;
+        let mut reply = net::http_post_streaming(url, &hs, &body)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if reply.status == 401 && attempt == 0 {
+            payload = rt.renew(name, conn, spec, &payload).await.map_err(|e| {
+                format!(
+                    "Codex refused this credential and it couldn't be refreshed here ({e}) — \
+                     re-link it: mafold connection add {name} --provider codex-oauth --oauth"
+                )
+            })?;
+            continue;
+        }
+
+        let mut all: Vec<u8> = Vec::new();
+        loop {
+            match reply.next().await {
+                Ok(Some(b)) => {
+                    all.extend_from_slice(&b);
+                    if all.len() > MAX_IMAGE_ANSWER {
+                        return Err("the images backend answered more than 32MB".into());
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        if reply.status >= 400 {
+            let snippet: String = String::from_utf8_lossy(&all).chars().take(400).collect();
+            return Err(format!(
+                "codex images backend answered HTTP {}: {snippet}",
+                reply.status
+            ));
+        }
+        let v: Value =
+            serde_json::from_slice(&all).map_err(|e| format!("images decode: {e}"))?;
+        let b64 = v
+            .get("data")
+            .and_then(|d| d.get(0))
+            .and_then(|d| d.get("b64_json"))
+            .and_then(Value::as_str)
+            .ok_or("the images answer carried no b64_json")?;
+        // gpt-image answers PNG; the mime rides along so the server never
+        // guesses at bytes it can't see the header of… it can, but one source.
+        return Ok(json!({ "b64": b64, "mime": "image/png" }));
+    }
+    unreachable!("the 401 arm either returned or retried");
+}
+
+/// The identity set for the images endpoint: same credential family as
+/// [`headers`], JSON accept instead of SSE, no session pinning (images calls
+/// carry no prompt cache to key).
+fn image_headers(payload: &Map<String, Value>) -> Result<Vec<(String, String)>, String> {
+    let get = |k: &str| payload.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let access = get("access_token");
+    if access.is_empty() {
+        return Err("connection has no access token".into());
+    }
+    let account = get("account_id");
+    if account.is_empty() {
+        return Err(
+            "connection has no ChatGPT account id — re-link it: \
+             mafold connection add codex --provider codex-oauth --oauth"
+                .into(),
+        );
+    }
+    Ok(vec![
+        ("authorization".into(), format!("Bearer {access}")),
+        ("chatgpt-account-id".into(), account),
+        ("content-type".into(), "application/json".into()),
+        ("accept".into(), "application/json".into()),
+        ("originator".into(), ORIGINATOR.into()),
+        ("version".into(), CLIENT_VERSION.into()),
+        ("user-agent".into(), ua()),
+    ])
+}
+
 /// Forward the reply body. Only COMPLETE lines travel — a UTF-8 char or an SSE
 /// `data:` line split across TCP frames must never reach the parser halved, so
 /// the unterminated tail carries over between chunks (same discipline as the
@@ -456,6 +575,42 @@ mod tests {
             .await
             .unwrap_err();
             assert!(err.contains("403") && err.contains("not your plan"), "{err}");
+        }
+
+        /// The images sibling: one signed JSON POST (same credential family,
+        /// JSON accept), the pinned model, and the b64 handed back verbatim.
+        #[tokio::test]
+        async fn images_posts_signed_json_and_hands_back_the_b64() {
+            let mock = spawn_mock(vec![(
+                200,
+                r#"{"created":1,"data":[{"b64_json":"aGk="}]}"#.into(),
+            )]);
+            let umk = Key::random();
+            let conn = sealed_conn(&umk, json!({ "access_token": "at-9", "account_id": "acc-9" }));
+            let rt = Runtime::new(&mock.base, "s_tok", umk);
+
+            let out = images_at(
+                &format!("{}/images", mock.base),
+                &rt,
+                "codex",
+                &conn,
+                &spec(),
+                &json!({ "prompt": "a fox", "size": "1024x1024" }),
+            )
+            .await
+            .expect("images run");
+            assert_eq!(out["b64"], "aGk=");
+            assert_eq!(out["mime"], "image/png");
+
+            let post = mock.request(0);
+            assert_eq!(post.path, "/images");
+            assert_eq!(post.header("authorization"), Some("Bearer at-9"));
+            assert_eq!(post.header("chatgpt-account-id"), Some("acc-9"));
+            assert_eq!(post.header("accept"), Some("application/json"));
+            assert_eq!(post.header("originator"), Some(ORIGINATOR));
+            assert!(post.body.contains("\"model\":\"gpt-image-2\""));
+            assert!(post.body.contains("\"prompt\":\"a fox\""));
+            assert!(post.body.contains("\"size\":\"1024x1024\""));
         }
     }
 }

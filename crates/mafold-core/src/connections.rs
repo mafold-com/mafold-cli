@@ -189,16 +189,44 @@ impl Runtime {
     ) -> Result<Value> {
         let conn = self.get(name).await?;
         let spec = self.descriptor_of(&conn).await?;
-        match spec.native_api.as_deref() {
-            Some("codex-responses") => {
-                if method != "responses" {
-                    return Err(format!(
-                        "{} offers exactly one method, `responses` — `{method}` is not it",
-                        spec.display
-                    ));
-                }
-                crate::codex::run(self, call_id, name, &conn, &spec, params, stream).await
+        // Reserved method: the tool CATALOG. The api's harness asks it (once
+        // per connection, cached on both ends) to learn which tools a granted
+        // connection offers. `tools/list` is MCP's own listing verb — a tool
+        // name cannot contain `/`, so no provider can shadow it. Native-driver
+        // providers (codex) expose no MCP tools; an empty list is the honest
+        // answer, not an error.
+        if method == "tools/list" {
+            if spec.native_api.is_some() {
+                return Ok(serde_json::json!({ "tools": [] }));
             }
+            let methods = self.methods(name).await?;
+            return Ok(serde_json::json!({
+                "tools": methods
+                    .iter()
+                    .map(|m| serde_json::json!({
+                        "name": m.name,
+                        "title": m.title,
+                        "description": m.description,
+                        "inputSchema": m.input_schema,
+                        "readOnly": m.read_only,
+                    }))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        match spec.native_api.as_deref() {
+            Some("codex-responses") => match method {
+                "responses" => {
+                    crate::codex::run(self, call_id, name, &conn, &spec, params, stream).await
+                }
+                // One non-streaming POST to the images backend on the same
+                // credential — the tool-call that asks for it is parsed
+                // server-side, same split of knowledge as `responses`.
+                "images.generate" => crate::codex::images(self, name, &conn, &spec, params).await,
+                other => Err(format!(
+                    "{} offers `responses` and `images.generate` — `{other}` is not one of them",
+                    spec.display
+                )),
+            },
             // The ONE case where "update the app" is still the honest answer:
             // the pack can name a driver, but a driver is code. Everything else
             // a new provider needs now arrives with the pack.

@@ -180,6 +180,13 @@ impl Harness for ClaudeCode {
         // completed message is the only copy we get. Streaming stays the primary
         // path; this flag is what keeps the fallbacks below from double-posting it.
         let mut streamed_text = false;
+        // The text of the assistant message CURRENTLY streaming, cleared the
+        // moment that message lands as a completed `assistant` event. A
+        // `message_start` arriving while this is non-empty means the message it
+        // belongs to never landed: the API connection dropped mid-response and
+        // claude is retrying it by re-streaming from the first token, so the
+        // partial attempt has to be un-said before the retry re-says it.
+        let mut msg_text = String::new();
         let mut session_id: Option<String> = None;
         // Set when an API / execution error ends the turn — surfaced to the user.
         let mut error: Option<String> = None;
@@ -283,6 +290,7 @@ impl Harness for ClaudeCode {
                     if d["type"] == "text_delta" {
                         if let Some(t) = d["text"].as_str() {
                             let _ = sink.send(AgentEvent::Text(t.to_string()));
+                            msg_text.push_str(t);
                             produced = true;
                             streamed_text = true;
                         }
@@ -290,6 +298,15 @@ impl Harness for ClaudeCode {
                         let _ = sink.send(AgentEvent::Pulse { chars: t.len() as u64, tokens: None });
                     }
                 } else if ev_type == "message_start" {
+                    // Text still pending from the LAST message_start means that
+                    // message never completed — this is a retry of it, not the
+                    // next message, and it will re-stream from the first token.
+                    // Take back the abandoned attempt (the transcript removes it
+                    // only if it is still the exact tail, so a producer that
+                    // resumed instead of restarting is left alone).
+                    if !msg_text.is_empty() {
+                        let _ = sink.send(AgentEvent::TextRewind(std::mem::take(&mut msg_text)));
+                    }
                     // A new assistant message: bank the previous one's usage.
                     tokens_done += std::mem::take(&mut tokens_cur);
                     streamed_text = false;
@@ -341,6 +358,9 @@ impl Harness for ClaudeCode {
                         }
                     }
                 }
+                // This message LANDED — whatever it streamed is final, and the
+                // next `message_start` is a genuinely new message, not a retry.
+                msg_text.clear();
             }
             // Tool results (e.g. bash output).
             if v["type"] == "user" {
