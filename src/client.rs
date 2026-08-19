@@ -10,6 +10,11 @@ use serde_json::{json, Value};
 /// reaper (`mafold-api`'s presence sweep) is the backstop instead.
 const RETRY_ATTEMPTS: u32 = 5;
 
+/// Tries for fetching a media attachment (600ms → 1.2s of cover). Small on
+/// purpose: the user is waiting on the reply this attachment belongs to, so a
+/// long backoff here would trade a missing image for a late answer.
+const MEDIA_ATTEMPTS: u32 = 3;
+
 /// Outcome of `me_probed`: the identity, or a definitive auth rejection.
 pub enum MeProbe {
     Me(Value),
@@ -383,6 +388,13 @@ impl Client {
     /// onto our own `base`) or an absolute URL on an ALLOWED media origin is
     /// fetched. Anything else (a foreign `http(s)://` host) is rejected so a
     /// crafted attachment URL can't make the daemon do an SSRF request.
+    ///
+    /// RETRIED: a GET is idempotent, so re-issuing one costs nothing — and NOT
+    /// re-issuing costs the user's attachment. A single 500 from the media
+    /// redirect (2026-08-18, the api blinking under a deploy) was enough to drop
+    /// a screenshot out of the prompt, leaving the model to answer a message it
+    /// could not see, with one log line as the only trace. A 4xx is the server
+    /// saying the thing is really gone — that one is not worth repeating.
     pub async fn download(&self, path: &str) -> Result<Vec<u8>> {
         let url = if path.starts_with("http://") || path.starts_with("https://") {
             if !self.media_origin_allowed(path) {
@@ -397,15 +409,31 @@ impl Client {
                 "refusing to fetch attachment from a non-relative, non-Mafold URL: {path}"
             );
         };
-        let bytes = self
-            .http
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
-        Ok(bytes.to_vec())
+        let mut delay = std::time::Duration::from_millis(600);
+        let mut attempt = 1;
+        loop {
+            let got = async {
+                let resp = self.http.get(&url).send().await?.error_for_status()?;
+                Ok::<_, reqwest::Error>(resp.bytes().await?)
+            }
+            .await;
+            match got {
+                Ok(bytes) => return Ok(bytes.to_vec()),
+                Err(e)
+                    if attempt < MEDIA_ATTEMPTS
+                        && !e.status().is_some_and(|s| s.is_client_error()) =>
+                {
+                    eprintln!(
+                        "attachment fetch failed ({e}) — retry {attempt}/{} in {delay:?}…",
+                        MEDIA_ATTEMPTS - 1
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                    attempt += 1;
+                }
+                Err(e) => return Err(anyhow::Error::new(e)),
+            }
+        }
     }
 
     /// Resolve a chat argument: a conversation UUID is used as-is; anything else
@@ -431,6 +459,33 @@ impl Client {
     fn is_connect_error(e: &anyhow::Error) -> bool {
         e.downcast_ref::<mafold_core::RpcError>()
             .is_some_and(|re| matches!(re, mafold_core::RpcError::Connect(_)))
+    }
+
+    /// Did the far end FALL OVER, as opposed to deliberately saying no? A 5xx
+    /// envelope, a gateway's non-JSON error page, a torn socket or a timeout all
+    /// mean "the same request could work a second from now"; a 4xx or an unknown
+    /// method mean "this will never work".
+    ///
+    /// Note the deliberate split from `is_api_error`, which treats EVERY
+    /// `{ok:false}` as a verdict: that is the right rule for a call being
+    /// retried freely, but a 5xx envelope is the server admitting it broke, not
+    /// answering. This one is only consulted where a single extra attempt buys
+    /// something that matters (see `create_draft`).
+    fn is_server_blip(e: &mafold_core::RpcError) -> bool {
+        use mafold_core::RpcError as R;
+        match e {
+            // Timeout, dropped response, or a non-JSON body — which the core
+            // formats as "<method>: HTTP <status> …", so a deliberate 4xx is
+            // still recognizable in here and stays excluded.
+            R::Transport(s) => !s.contains("HTTP 4"),
+            R::Api(env) => serde_json::from_str::<Value>(env)
+                .ok()
+                .and_then(|v| v.get("error_code").and_then(Value::as_u64))
+                .is_some_and(|c| (500..600).contains(&c)),
+            // Connect has its own (freely repeatable) retry in `create_draft`;
+            // an unknown method is a client/server version gap, never a blip.
+            R::Connect(_) | R::UnknownMethod(_) => false,
+        }
     }
 
     // ── bot streaming write API (used by the agent daemon) ──
@@ -462,22 +517,67 @@ impl Client {
             .context("botCreateDraft: bad channel_id")?;
         let api = self.api();
         let mut delay = std::time::Duration::from_millis(500);
-        let mut attempt = 0;
+        let mut connect_tries = 0;
+        let mut blip_retried = false;
         let draft = loop {
-            match api.bot_create_draft(chat, root, channel).await {
+            let err = match api.bot_create_draft(chat, root, channel).await {
                 Ok(m) => break m,
-                Err(e @ mafold_core::RpcError::Connect(_)) if attempt < 2 => {
-                    let _ = e;
-                    attempt += 1;
-                    eprintln!("botCreateDraft connect failed (attempt {attempt}/3) — retrying in {delay:?}…");
-                    tokio::time::sleep(delay).await;
-                    delay *= 2;
-                }
-                Err(e) => return Err(anyhow::Error::new(e).context("botCreateDraft failed")),
+                Err(e) => e,
+            };
+            // Never left this machine → a retry cannot duplicate anything.
+            if matches!(err, mafold_core::RpcError::Connect(_)) && connect_tries < 2 {
+                connect_tries += 1;
+                eprintln!(
+                    "botCreateDraft connect failed (attempt {connect_tries}/3: {err}) — retrying in {delay:?}…"
+                );
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+                continue;
             }
+            // The far end fell over rather than said no. This is NOT provably
+            // duplicate-free — the draft may have been created and only the
+            // answer lost — so it gets exactly ONE more attempt, and the worst
+            // case is a single empty bubble left behind. The failure it exists
+            // for is strictly worse: on 2026-08-18 one 500 here ate the user's
+            // message whole, and because the WS cursor is pinned before
+            // `handle()` runs, nothing ever replayed it.
+            if !blip_retried && Self::is_server_blip(&err) {
+                blip_retried = true;
+                eprintln!("botCreateDraft failed ({err}) — server-side blip, one more try in 2s…");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
+            return Err(anyhow::Error::new(err).context("botCreateDraft failed"));
         };
         Ok(draft.id.to_string())
     }
+
+    /// A turn died BEFORE it had a bubble to die in — say so where it was asked.
+    ///
+    /// Every other failure inside a turn is surfaced in the draft itself (see
+    /// `handle`'s "ALWAYS finalize"). A `create_draft` failure has no draft to
+    /// be surfaced in, so it used to leave exactly nothing: an online bot that
+    /// read the message and never spoke, while the log kept the reason to
+    /// itself. Nothing replays the message either (the cursor is pinned before
+    /// the turn runs), so the ONLY recovery is the user sending it again — which
+    /// they can't know to do unless we say it.
+    ///
+    /// Best-effort by design: one plain send, no retry. If the API is down hard
+    /// this fails too, and the caller's log line is the last word.
+    pub async fn announce_lost_turn(&self, dest: Dest<'_>, why: &str) -> Result<()> {
+        // Trimmed: the point of the bubble is "send it again", not a stack trace.
+        let why: String = why.chars().take(200).collect();
+        self.send_to(
+            dest,
+            &format!(
+                "⚠️ I couldn't open a reply draft for your last message, so it was never processed \
+                 — and it won't be retried automatically. Please send it again.\n\n`{why}`"
+            ),
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn append_delta(&self, message_id: &str, delta: &str) -> Result<()> {
         self.post(
             "botAppendDelta",
@@ -1244,5 +1344,135 @@ mod media_origin_tests {
         // accident far more often than an intent, and here that accident would
         // silently stop every attachment from loading.
         assert_eq!(parse_media_origins(Some("   ")), vec!["https://cdn.mafold.com"]);
+    }
+}
+
+/// The "a turn must never vanish" contract: what a failing `botCreateDraft`
+/// does, and what the user is told when it fails for good.
+#[cfg(test)]
+mod lost_turn_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// A single-file HTTP stub: answers every request with `status`/`reply` and
+    /// records each (path, body) it saw. Enough server for the real transport —
+    /// retries and all — to be exercised without a network or a mock crate.
+    async fn stub(status: u16, reply: &'static str) -> (String, Arc<Mutex<Vec<(String, String)>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    // Read headers, then exactly Content-Length bytes of body.
+                    let (path, body) = loop {
+                        match sock.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        }
+                        let text = String::from_utf8_lossy(&buf).into_owned();
+                        let Some(end) = text.find("\r\n\r\n") else { continue };
+                        let head = text[..end].to_string();
+                        let want: usize = head
+                            .lines()
+                            .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                            .and_then(|l| l.split(':').nth(1))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        let body = text[end + 4..].to_string();
+                        if body.len() < want {
+                            continue;
+                        }
+                        let path = head
+                            .lines()
+                            .next()
+                            .and_then(|l| l.split(' ').nth(1))
+                            .unwrap_or("")
+                            .to_string();
+                        break (path, body);
+                    };
+                    log.lock().unwrap().push((path, body));
+                    let out = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                    let _ = sock.write_all(out.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    #[test]
+    fn a_blip_is_the_far_end_falling_over_not_the_far_end_saying_no() {
+        use mafold_core::RpcError as R;
+        // It broke inside the handler → the same request may well work now.
+        assert!(Client::is_server_blip(&R::Api(
+            r#"{"ok":false,"error_code":500,"description":"boom"}"#.into()
+        )));
+        assert!(Client::is_server_blip(&R::Transport(
+            "botCreateDraft: HTTP 502 — <html>bad gateway</html>".into()
+        )));
+        assert!(Client::is_server_blip(&R::Transport(
+            "error decoding response body".into()
+        )));
+        // A verdict, a version gap, and connect (retried on its own terms).
+        assert!(!Client::is_server_blip(&R::Api(
+            r#"{"ok":false,"error_code":403,"description":"not authorized"}"#.into()
+        )));
+        assert!(!Client::is_server_blip(&R::Transport(
+            "getUser: HTTP 404 — this server has no such method".into()
+        )));
+        assert!(!Client::is_server_blip(&R::UnknownMethod("nope".into())));
+        assert!(!Client::is_server_blip(&R::Connect("refused".into())));
+    }
+
+    /// A 5xx gets one more shot — the blip that ate a message on 2026-08-18 —
+    /// but only one: the call is not idempotent, so hammering it would trade a
+    /// lost message for a row of empty bubbles.
+    #[tokio::test]
+    async fn a_5xx_create_draft_is_retried_exactly_once() {
+        let (base, seen) = stub(500, r#"{"ok":false,"error_code":500,"description":"boom"}"#).await;
+        let c = Client::new(base, "t".into());
+        let err = c
+            .create_draft("11111111-2222-3333-4444-555555555555", None, None)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("botCreateDraft failed"), "{err:#}");
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 2, "expected one retry, got {calls:?}");
+        assert!(calls[0].0.ends_with("/api/botCreateDraft"), "{:?}", calls[0].0);
+    }
+
+    /// …and when it does fail for good, the user hears about it ON the surface
+    /// they asked from — channel and thread included, because a notice that
+    /// lands in `#all` is a notice they never see.
+    #[tokio::test]
+    async fn the_notice_lands_where_the_message_was_asked() {
+        let (base, seen) = stub(200, r#"{"ok":true,"result":{}}"#).await;
+        let c = Client::new(base, "t".into());
+        c.announce_lost_turn(
+            Dest::chat("conv-1").channel(Some("chan-2")).thread(Some("root-3")),
+            "botCreateDraft failed: HTTP 500 — boom",
+        )
+        .await
+        .unwrap();
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].0.ends_with("/api/sendMessage"), "{:?}", calls[0].0);
+        let body: Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(body["chat_id"], "conv-1");
+        assert_eq!(body["channel_id"], "chan-2");
+        assert_eq!(body["thread_root_id"], "root-3");
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("send it again"), "must say what to do: {text}");
+        assert!(text.contains("HTTP 500"), "must keep the reason: {text}");
     }
 }

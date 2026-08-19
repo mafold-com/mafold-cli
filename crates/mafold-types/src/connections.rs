@@ -1,10 +1,7 @@
 //! Connections — the user's own credentials at third-party platforms, synced
 //! through Mafold as **ciphertext the server cannot open**.
 //!
-//! This is a different layer from the deleted `connectors/` (the `@github` /
-//! `@notion` bot accounts, removed 2026-08-13). A connector was an account that
-//! acted *server-side* on your behalf, so the server necessarily held a key it
-//! could use. A connection is the opposite arrangement: the plaintext is only ever assembled on **your own
+//! The plaintext is only ever assembled on **your own
 //! machines**, because the things that read it — a Claude Code harness, a Codex
 //! harness, a local MCP server — run there. The server's whole job is to be a
 //! synchronizing box of opaque bytes, so that linking an account once makes it

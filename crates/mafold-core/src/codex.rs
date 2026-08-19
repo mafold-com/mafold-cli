@@ -243,8 +243,27 @@ async fn images_at(
             .and_then(Value::as_str)
             .ok_or("the images answer carried no b64_json")?;
         // gpt-image answers PNG; the mime rides along so the server never
-        // guesses at bytes it can't see the header of… it can, but one source.
-        return Ok(json!({ "b64": b64, "mime": "image/png" }));
+        // guesses at bytes it can't see the header of.
+        //
+        // `usage` rides along for the SAME reason the responses stream's does:
+        // it is what the turn gets billed on. The images backend reports it in
+        // the same shape as a text turn — verified against the real endpoint,
+        // e.g. `{"input_tokens":18,"output_tokens":229,"total_tokens":247}` —
+        // so an image on somebody else's subscription is meterable, and the
+        // market path does not have to choose between guessing and refusing.
+        // Forwarded verbatim and NOT trusted: the server clamps it exactly the
+        // way it clamps a text turn's (`plausible_input`).
+        //
+        // `size` is the backend's own answer, not the request's — it honours
+        // the ask loosely (a 1024x1024 request came back 1254x1254), so the
+        // memo has to name what was actually produced.
+        return Ok(json!({
+            "b64": b64,
+            "mime": "image/png",
+            "usage": v.get("usage").cloned().unwrap_or(Value::Null),
+            "size": v.get("size").cloned().unwrap_or(Value::Null),
+            "quality": v.get("quality").cloned().unwrap_or(Value::Null),
+        }));
     }
     unreachable!("the 401 arm either returned or retried");
 }
@@ -578,12 +597,18 @@ mod tests {
         }
 
         /// The images sibling: one signed JSON POST (same credential family,
-        /// JSON accept), the pinned model, and the b64 handed back verbatim.
+        /// JSON accept), the pinned model, and the b64 handed back verbatim —
+        /// along with the `usage` the turn gets BILLED on. The body below is
+        /// the real endpoint's shape, trimmed: an image reports tokens exactly
+        /// like a text turn does.
         #[tokio::test]
         async fn images_posts_signed_json_and_hands_back_the_b64() {
             let mock = spawn_mock(vec![(
                 200,
-                r#"{"created":1,"data":[{"b64_json":"aGk="}]}"#.into(),
+                r#"{"created":1,"data":[{"b64_json":"aGk="}],"size":"1254x1254",
+                    "quality":"low","usage":{"input_tokens":18,"output_tokens":229,
+                    "total_tokens":247}}"#
+                    .into(),
             )]);
             let umk = Key::random();
             let conn = sealed_conn(&umk, json!({ "access_token": "at-9", "account_id": "acc-9" }));
@@ -601,6 +626,11 @@ mod tests {
             .expect("images run");
             assert_eq!(out["b64"], "aGk=");
             assert_eq!(out["mime"], "image/png");
+            // The meter's raw material. Dropping this is what kept imagegen
+            // off other people's subscriptions.
+            assert_eq!(out["usage"]["input_tokens"], 18);
+            assert_eq!(out["usage"]["output_tokens"], 229);
+            assert_eq!(out["size"], "1254x1254");
 
             let post = mock.request(0);
             assert_eq!(post.path, "/images");
