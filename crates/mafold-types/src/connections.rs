@@ -361,6 +361,57 @@ pub mod figma {
     pub const SECRET_ENV: &str = "FIGMA_OAUTH_CLIENT_SECRET";
 }
 
+// MARK: - GitHub OAuth constants
+//
+// Mafold's own registered OAuth App, and — like Figma — a brokered one, because
+// GitHub leaves a browser no other door. Probed 2026-08-19, both halves:
+//
+//   GET https://github.com/.well-known/oauth-authorization-server/login/oauth
+//     → PKCE S256, authorization_code + refresh_token, and **no
+//       `registration_endpoint`** (so no dynamic registration, so no
+//       self-registered public client)
+//   POST https://github.com/login/oauth/access_token, real client id, no secret
+//     → `incorrect_client_credentials` (the same request with the secret
+//       answers `bad_verification_code`, i.e. it got past client authentication)
+//
+// So the exchange cannot finish on the device, and the secret can only live on
+// the api host. That is the §9.1 last resort, taken here for the same measured
+// reason as Figma and not as a shortcut past dynamic registration.
+//
+// Everything below except the secret is public by construction — the client id
+// rides in an authorize URL the user can read off their own address bar.
+pub mod github {
+    pub const CLIENT_ID: &str = "Ov23livKmEdbWSlxxz2B";
+    pub const AUTHORIZE_URL: &str = "https://github.com/login/oauth/authorize";
+    /// Mafold's broker, NOT GitHub — see [`super::BrokerSpec`].
+    pub const TOKEN_ENDPOINT: &str = "https://api.mafold.com/api/exchangeConnectionToken";
+    /// GitHub mints and renews at the SAME path, unlike Figma. Both fields
+    /// carry it rather than making the broker branch on an `Option`.
+    pub const UPSTREAM_TOKEN: &str = "https://github.com/login/oauth/access_token";
+    pub const UPSTREAM_REFRESH: &str = "https://github.com/login/oauth/access_token";
+    /// The page we serve — the browser finishes the link alone, no daemon.
+    ///
+    /// ⚠️ Unlike Figma, a GitHub **OAuth App holds exactly ONE callback URL**.
+    /// There is no list to add a dev origin to, so `localhost:8788` cannot be
+    /// registered alongside this one; testing the consent screen against a dev
+    /// server needs a second throwaway app. Worth knowing before someone
+    /// concludes the flow is broken locally.
+    pub const REDIRECT_URI: &str = "https://mafold.com/app/link/callback";
+    /// Exactly the scopes GitHub's own MCP server declares it uses, read off
+    /// `https://api.githubcopilot.com/.well-known/oauth-protected-resource/mcp/`
+    /// (2026-08-19), minus `write:packages` — publishing packages is not
+    /// something an agent should acquire just by being connected.
+    ///
+    /// Taken from the resource's declaration rather than guessed, because the
+    /// scopes a grant HAS are the ones the authorize URL asked for; widening
+    /// later does nothing for tokens already minted. Under-asking is how the
+    /// Figma row shipped able to do almost nothing, and it 403s at call time,
+    /// far from this line.
+    pub const SCOPES: &str = "repo read:org read:user user:email \
+        read:packages read:project project gist notifications workflow codespace";
+    pub const SECRET_ENV: &str = "GITHUB_OAUTH_CLIENT_SECRET";
+}
+
 const OAUTH_BAG: &[SecretField] = &[
     SecretField {
         key: "access_token",
@@ -678,6 +729,53 @@ pub const PROVIDERS: &[ProviderSpec] = &[
                 upstream_token: figma::UPSTREAM_TOKEN,
                 upstream_refresh: figma::UPSTREAM_REFRESH,
                 secret_env: figma::SECRET_ENV,
+            }),
+        }),
+    },
+    // GitHub — ONE row, and deliberately not two.
+    //
+    // The obvious second row (paste a PAT, which `api.githubcopilot.com/mcp/`
+    // accepts perfectly well) is forbidden by §3.6 of the constitution: a
+    // provider's first round gets exactly one way in, and it is a click in the
+    // web panel. Sending the user to github.com to mint a token first is not a
+    // click, however well it works. The PAT row was written and reverted on
+    // 2026-08-19 for precisely this reason — don't re-add it as a convenience.
+    ProviderSpec {
+        id: "github",
+        display: "GitHub",
+        blurb: "Read and write repos, issues, and PRs",
+        badge: "github",
+        kind: ProviderKind::OAuth,
+        // Renewable: the grant is minted by whichever surface ran the consent
+        // screen, and any OTHER device must be able to renew it later knowing
+        // only what the sealed payload says. GitHub OAuth App tokens do not
+        // currently expire — but `expires_at` / `refresh_token` simply stay
+        // absent in that case, whereas having no PLACE for them would strand
+        // every existing connection the day GitHub turns expiry on.
+        fields: OAUTH_RENEWABLE_BAG,
+        import_path: None,
+        env_var: None,
+        auth: BEARER,
+        // False, and it must stay false: brokered linking means the server
+        // briefly holds the token, which is exactly what `oauth_capable`
+        // promises it does not. Same as `figma-oauth`.
+        oauth_capable: false,
+        // Where the user reviews or revokes what they just granted. Nothing is
+        // minted by hand on this row.
+        help_url: Some("https://github.com/settings/applications"),
+        mcp_url: Some("https://api.githubcopilot.com/mcp/"),
+        native_api: None,
+        oauth_client: Some(OAuthClientSpec {
+            client_id: github::CLIENT_ID,
+            authorize_url: github::AUTHORIZE_URL,
+            token_endpoint: github::TOKEN_ENDPOINT,
+            redirect_uri: github::REDIRECT_URI,
+            scopes: github::SCOPES,
+            extra_params: &[],
+            broker: Some(BrokerSpec {
+                upstream_token: github::UPSTREAM_TOKEN,
+                upstream_refresh: github::UPSTREAM_REFRESH,
+                secret_env: github::SECRET_ENV,
             }),
         }),
     },
@@ -1096,6 +1194,7 @@ mod tests {
                 "notion",
                 "figma",
                 "figma-oauth",
+                "github",
             ]
         );
     }
@@ -1579,5 +1678,60 @@ mod tests {
         assert!(fixed.token_endpoint.contains("exchangeConnectionToken"), "exchange goes through the broker");
         assert!(!fixed.client_id.is_empty() && fixed.authorize_url.starts_with("https://"));
         assert!(!is_loopback_redirect(oauth.oauth_client.unwrap().redirect_uri));
+    }
+
+    /// GitHub is ONE row, linkable by the browser alone — constitution §3.6.
+    ///
+    /// Two regressions this pins, both of which have already happened once:
+    /// a second `github-*` row that takes a pasted PAT (written and reverted
+    /// 2026-08-19 — it works, and it is still forbidden, because it sends the
+    /// user to github.com to mint a credential before they can click anything),
+    /// and a redirect pointed at loopback, which would route the default user —
+    /// who has no mafold-cli — to a daemon they do not run.
+    #[test]
+    fn github_is_one_row_the_browser_can_finish_alone() {
+        let ids: Vec<&str> = PROVIDERS.iter().filter(|p| p.id.starts_with("github")).map(|p| p.id).collect();
+        assert_eq!(ids, vec!["github"], "§3.6: one provider, one way in");
+
+        let info = provider_infos().into_iter().find(|i| i.id == "github").unwrap();
+        assert!(info.oauth, "the panel must draw a Connect button, not a text box");
+        assert!(info.browser_linkable, "nothing to lift off disk");
+        assert!(!info.device_link, "a web redirect must not ask for a local daemon");
+        let fixed = info.oauth_fixed.expect("the browser needs the fixed client parameters");
+        assert!(
+            fixed.token_endpoint.contains("exchangeConnectionToken"),
+            "the exchange goes through the broker — GitHub has no public client"
+        );
+
+        // The credential is never typed, so no form field may be rendered for
+        // it. `fields` minus the issued ones is what a UI draws; for a consented
+        // row the only drawable one is the token itself, which the flow writes.
+        assert!(
+            !info.fields.iter().any(|f| f.key == "client_id" || f.key == "token_endpoint"),
+            "issued fields must not become form inputs"
+        );
+
+        // Constants a typo in would strand every link at the token endpoint —
+        // and GitHub, unlike Figma, mints and renews at the SAME url.
+        let b = provider("github").unwrap().oauth_client.unwrap().broker.unwrap();
+        assert_eq!(b.upstream_token, "https://github.com/login/oauth/access_token");
+        assert_eq!(b.upstream_refresh, b.upstream_token);
+        assert_eq!(b.secret_env, "GITHUB_OAUTH_CLIENT_SECRET");
+        assert!(github::REDIRECT_URI.starts_with("https://mafold.com/"));
+
+        // Same trap as the figma scopes: what the authorize URL asks for IS what
+        // the grant can do, and a shortfall only shows up as a 403 much later.
+        let scopes: Vec<&str> = github::SCOPES.split(' ').collect();
+        for want in ["repo", "read:org", "read:user", "read:project", "gist", "workflow"] {
+            assert!(scopes.contains(&want), "github scopes must include {want}");
+        }
+        assert!(
+            !github::SCOPES.contains("  ") && !github::SCOPES.contains('\n'),
+            "the `\\` continuations must leave a single space-separated line"
+        );
+        assert!(
+            !scopes.contains(&"write:packages"),
+            "publishing packages is not something connecting should grant"
+        );
     }
 }

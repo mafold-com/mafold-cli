@@ -25,6 +25,16 @@ you close the shell), in the current folder (add `--workdir /path` for another),
 `mafold status` and `mafold stop`. Drop `--detach` to run in the
 foreground. Or build from source: `cargo build --release`.
 
+**Windows:**
+
+```powershell
+winget install Mafold.CLI
+```
+
+Then `mafold agent --token mb_xxxx` from the folder the agent should work in.
+(`mafold update` keeps the binary current on its own, so `winget list` may
+report the version you first installed rather than the one you are running.)
+
 ## `agent`
 
 Drives the local **Claude Code** (`claude` must be installed + on PATH) in

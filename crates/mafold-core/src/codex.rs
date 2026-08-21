@@ -393,8 +393,11 @@ async fn relay_body(
 }
 
 /// wasm arm: `StreamingReply` already degraded to whole-body-at-once, so relay
-/// it as one chunk. A browser is not a good streaming device; it is merely a
-/// CORRECT one.
+/// it as one chunk. In practice this arm is UNREACHABLE for codex — the
+/// upstream speaks no CORS, so a browser's fetch dies before the first byte
+/// ("TypeError: Failed to fetch"), which is why `connections::handle_event`
+/// now declines to CLAIM native-driver calls on wasm at all. Kept compiling
+/// because the type is shared and a future native_api may be browser-viable.
 #[cfg(target_arch = "wasm32")]
 async fn relay_body(
     rt: &Runtime,

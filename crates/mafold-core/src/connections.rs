@@ -408,6 +408,39 @@ pub async fn handle_event(rt: &mut Runtime, envelope: &str) -> bool {
         return true;
     }
 
+    // CAN this runtime actually execute the call? Answered BEFORE the claim,
+    // because a claim is a promise: the server stops offering the call to
+    // anybody else. A browser tab with an unlocked vault receives the same
+    // fan-out a daemon does and used to win this race — and then discover that
+    // a native driver's cross-origin POST (chatgpt.com) is structurally
+    // blocked by CORS, answering the caller with
+    // "transport failed: TypeError: Failed to fetch" while the daemon that
+    // could have served it sat one claim behind (owner hit exactly this on a
+    // resale turn, 2026-08-19). MCP calls stay claimable everywhere: their
+    // endpoints speak CORS, which is why the browser is on this bus at all.
+    // Declining is SILENT — the device that can run it claims instead, and if
+    // none exists the server's claim timeout names the real situation.
+    if cfg!(target_arch = "wasm32") {
+        // FAIL CLOSED. The first cut resolved the spec and claimed on
+        // `native_api == None` — but `descriptor_of` needs the served provider
+        // registry, and a freshly opened tab hasn't cached it yet: the resolve
+        // errored, `.ok()` read as "not native", and the browser claimed a
+        // codex call through the very hole this gate exists to close (owner
+        // reproduced it on a live resale turn within minutes of the fix
+        // shipping). A device that cannot PROVE it can run the call must not
+        // promise to — declining is free, the daemon is one claim behind.
+        let can = match rt.get(&name).await {
+            Ok(conn) => match rt.descriptor_of(&conn).await {
+                Ok(spec) => spec.native_api.is_none(),
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+        if !can {
+            return true;
+        }
+    }
+
     // Ask before working. A device that loses the claim is done — silently, and
     // without having touched the provider.
     let claimed = rt
