@@ -175,8 +175,19 @@ jobs:
             mafold-x86_64-apple-darwin mafold-x86_64-apple-darwin.sha256 \
             --repo "$GITHUB_REPOSITORY" --clobber
 
-  # The Windows binary is mafold.exe; the asset keeps the extension-less
-  # `mafold-<target>` name so the updater's lookup (mafold-{triple}) matches.
+  # The Windows binary ships TWICE, same bytes, two names:
+  #
+  #   mafold-x86_64-pc-windows-msvc       — extension-less, because the
+  #     updater looks assets up as `mafold-{triple}` on every platform.
+  #   mafold-x86_64-pc-windows-msvc.exe   — for winget (`Mafold.CLI`), whose
+  #     portable installer downloads the url as-is; a file with no `.exe`
+  #     is not executable on Windows, so the manifest needs this one.
+  #
+  # Two names rather than renaming the old one: the updater in every already
+  # installed copy asks for the extension-less name, and a release that stops
+  # answering that would strand them. The `.sha256` is of the shared bytes, so
+  # it verifies either file (winget carries its own hash in the manifest).
+  #
   # bash (Git Bash) so cp/sha256sum/awk/gh work — default pwsh lacks them.
   build-win:
     needs: draft
@@ -196,6 +207,7 @@ jobs:
           key: release-x86_64-pc-windows-msvc
       - run: cargo build --release --target x86_64-pc-windows-msvc
       - run: cp "target/x86_64-pc-windows-msvc/release/mafold.exe" "mafold-x86_64-pc-windows-msvc"
+      - run: cp "target/x86_64-pc-windows-msvc/release/mafold.exe" "mafold-x86_64-pc-windows-msvc.exe"
       - run: sha256sum "mafold-x86_64-pc-windows-msvc" | awk '{print $1}' > "mafold-x86_64-pc-windows-msvc.sha256"
       - name: Upload release assets
         env:
@@ -203,6 +215,7 @@ jobs:
         run: |
           gh release upload "$TAG" \
             "mafold-x86_64-pc-windows-msvc" \
+            "mafold-x86_64-pc-windows-msvc.exe" \
             "mafold-x86_64-pc-windows-msvc.sha256" \
             --repo "$GITHUB_REPOSITORY" --clobber
 
