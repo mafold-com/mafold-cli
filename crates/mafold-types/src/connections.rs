@@ -176,6 +176,21 @@ pub struct ProviderSpec {
     /// inside the transport is exactly the shape §9 forbids. `None` for the
     /// majority, whose callable surface is MCP or nothing.
     pub native_api: Option<&'static str>,
+    /// This provider IS one of the user's own machines, not an account
+    /// somewhere else.
+    ///
+    /// Compiled-only — deliberately absent from [`ProviderInfo`], because the
+    /// served pack's digest is computed by RE-SERIALIZING parsed rows
+    /// ([`providers_canonical`]): a field an older client drops on the way in
+    /// changes the string it hashes, so its signature check fails and it loses
+    /// the whole registry, not just the new row. Every client that needs this
+    /// fact can derive it from something already on the wire — `device_link`
+    /// for a UI, `native_api` for a caller.
+    ///
+    /// What it changes: there is nothing to paste, import, or consent to. The
+    /// "credential" is a binding to a device id, written by the machine itself,
+    /// and the only surface that can ever open it is that same machine.
+    pub device_bound: bool,
     /// A FIXED public OAuth client the cli can drive end-to-end (`add --oauth`),
     /// for vendors whose client id is a published constant of their own CLI
     /// rather than dynamically registered. The registered redirect is a
@@ -412,6 +427,47 @@ pub mod github {
     pub const SECRET_ENV: &str = "GITHUB_OAUTH_CLIENT_SECRET";
 }
 
+/// What a `computer` connection holds. Nothing here is a secret in the sense
+/// the rest of this file means — a device id is not a password, and holding it
+/// grants nothing. It is sealed anyway, and that is the point: **the binding is
+/// the routing**. `events.connectionCall` fans out to every device the account
+/// has online, so the only thing that can decide "this call is for me" is a
+/// fact each machine can check locally and the server cannot read. Put the
+/// device id in cleartext and the server would be choosing which of your
+/// machines runs a shell command.
+const COMPUTER_BINDING: &[SecretField] = &[
+    SecretField {
+        key: "device_id",
+        label: "Device id",
+        required: true,
+        // Written by the machine binding itself. A human typing a device id
+        // here would be aiming a shell at a machine by guesswork.
+        issued: true,
+    },
+    SecretField {
+        key: "machine",
+        label: "Machine name",
+        required: false,
+        issued: true,
+    },
+    SecretField {
+        key: "os",
+        label: "Operating system",
+        required: false,
+        issued: true,
+    },
+    // When the binding was made, epoch ms as a string. Not decoration: a
+    // re-bound machine (fresh install, new device id) leaves a stale row that
+    // nothing will ever answer, and the date is what tells a human which of
+    // two same-named rows is the live one.
+    SecretField {
+        key: "bound_at",
+        label: "Bound at",
+        required: false,
+        issued: true,
+    },
+];
+
 const OAUTH_BAG: &[SecretField] = &[
     SecretField {
         key: "access_token",
@@ -587,6 +643,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         help_url: None,
         mcp_url: None,
         native_api: None,
+        device_bound: false,
         oauth_client: None,
     },
     ProviderSpec {
@@ -603,6 +660,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         help_url: Some("https://console.anthropic.com/settings/keys"),
         mcp_url: None,
         native_api: None,
+        device_bound: false,
         oauth_client: None,
     },
     ProviderSpec {
@@ -619,6 +677,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         help_url: Some("https://platform.openai.com/api-keys"),
         mcp_url: None,
         native_api: None,
+        device_bound: false,
         oauth_client: None,
     },
     ProviderSpec {
@@ -635,6 +694,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         help_url: None,
         mcp_url: None,
         native_api: Some("codex-responses"),
+        device_bound: false,
         oauth_client: Some(OAuthClientSpec {
             client_id: codex::CLIENT_ID,
             authorize_url: codex::AUTHORIZE_URL,
@@ -666,6 +726,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         help_url: Some("https://www.notion.so/my-integrations"),
         mcp_url: Some("https://mcp.notion.com/mcp"),
         native_api: None,
+        device_bound: false,
         oauth_client: None,
     },
     ProviderSpec {
@@ -687,6 +748,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         help_url: Some("https://www.figma.com/developers/api#access-tokens"),
         mcp_url: Some("https://mcp.figma.com/mcp"),
         native_api: None,
+        device_bound: false,
         oauth_client: None,
     },
     // Figma twice, and NOT a duplicate: the two rows hold different
@@ -715,6 +777,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         help_url: Some("https://www.figma.com/developers/apps"),
         mcp_url: Some("https://mcp.figma.com/mcp"),
         native_api: None,
+        device_bound: false,
         oauth_client: Some(OAuthClientSpec {
             client_id: figma::CLIENT_ID,
             authorize_url: figma::AUTHORIZE_URL,
@@ -765,6 +828,7 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         help_url: Some("https://github.com/settings/applications"),
         mcp_url: Some("https://api.githubcopilot.com/mcp/"),
         native_api: None,
+        device_bound: false,
         oauth_client: Some(OAuthClientSpec {
             client_id: github::CLIENT_ID,
             authorize_url: github::AUTHORIZE_URL,
@@ -778,6 +842,49 @@ pub const PROVIDERS: &[ProviderSpec] = &[
                 secret_env: github::SECRET_ENV,
             }),
         }),
+    },
+    // A machine of your own — the first provider that is not an account
+    // somewhere else.
+    //
+    // Everything above holds a credential so that some third party will answer
+    // us. This one holds a BINDING so that exactly one of your own machines
+    // answers, and the shape of the layer turns out to fit unchanged: a call
+    // still reaches a device over the same relay, the device still opens the
+    // same sealed payload, and the server still cannot read what it carried.
+    // The only thing that had to be added is a driver (`native_api`) — which is
+    // the one part of a provider that has always been code.
+    //
+    // `kind: ApiKey` is a WIRE COMPATIBILITY choice, not a description. A
+    // `Device` variant is what this deserves, and adding one would make every
+    // already-installed client fail to parse the pack that carries it (unknown
+    // enum variant ⇒ the whole `providers` array errors ⇒ that client loses the
+    // registry it was happily using). `device_bound` carries the truth in the
+    // compiled table, and every surface derives its label from that.
+    ProviderSpec {
+        id: "computer",
+        display: "This computer",
+        blurb: "Run shell commands on a machine you own",
+        // The one row with no vendor, so there is no vendor mark to wear. Every
+        // surface already draws its own placeholder for this case (web:
+        // `ProviderMark`), which is better than inventing a logo for "a
+        // computer" that then has to be cut for four clients.
+        badge: "",
+        kind: ProviderKind::ApiKey,
+        fields: COMPUTER_BINDING,
+        // There is nothing to import and no environment variable: a machine
+        // knows its own name and id, and asking a human for either would let
+        // them aim a shell at the wrong box.
+        import_path: None,
+        env_var: None,
+        // Inert. Nothing is ever sent to a third party on this connection's
+        // behalf — the driver runs a process, it does not build a request.
+        auth: BEARER,
+        oauth_capable: false,
+        help_url: None,
+        mcp_url: None,
+        native_api: Some("computer"),
+        device_bound: true,
+        oauth_client: None,
     },
 ];
 
@@ -1054,9 +1161,14 @@ pub fn provider_infos() -> Vec<ProviderInfo> {
                 .collect(),
             payload_keys: p.fields.iter().map(|f| f.key.to_string()).collect(),
             browser_linkable: p.import_path.is_none(),
-            device_link: p
-                .oauth_client
-                .is_some_and(|oc| is_loopback_redirect(oc.redirect_uri)),
+            // Two ways only a machine can finish a link: the vendor pinned the
+            // redirect to a loopback port, or the provider IS a machine. The
+            // second is the stronger case — there is no URL at all, the device
+            // simply writes its own binding — and it reaches every client
+            // through this same boolean, so no UI has to learn a second shape.
+            device_link: p.device_bound
+                || p.oauth_client
+                    .is_some_and(|oc| is_loopback_redirect(oc.redirect_uri)),
             // Two ways a browser finishes a link by itself: dynamic
             // registration (no setup at all — prefer it), or a fixed client
             // whose redirect is a page we serve. Both end with the grant sealed
@@ -1195,7 +1307,37 @@ mod tests {
                 "figma",
                 "figma-oauth",
                 "github",
+                "computer",
             ]
+        );
+    }
+
+    /// The `computer` row is the first provider that is a MACHINE, and three of
+    /// its properties are load-bearing enough that changing one silently would
+    /// break something far away:
+    ///
+    ///  * `kind` stays `ApiKey` — see the row's comment. A `Device` variant
+    ///    breaks pack parsing on every already-installed client.
+    ///  * nothing is drawn. A form with a `device_id` input is a shell aimed by
+    ///    guesswork.
+    ///  * `device_link` is on, which is the ONLY thing that puts a one-tap
+    ///    button in the web panel (§3.6: a provider a browser cannot link is a
+    ///    provider most users cannot link).
+    #[test]
+    fn computer_is_bound_by_a_device_not_typed_by_a_human() {
+        let spec = provider("computer").expect("the computer row");
+        assert!(spec.device_bound);
+        assert_eq!(spec.native_api, Some("computer"));
+        assert!(spec.fields.iter().all(|f| f.issued), "nothing is typed here");
+        assert!(spec.import_path.is_none() && spec.env_var.is_none());
+
+        let info = provider_infos().into_iter().find(|p| p.id == "computer").unwrap();
+        assert!(info.fields.is_empty(), "a form would draw inputs for a binding");
+        assert!(info.device_link, "the web panel's one tap hangs off this");
+        assert!(!info.oauth);
+        assert!(
+            info.payload_keys.contains(&"device_id".to_string()),
+            "the binding must survive `filter_payload`, or the row answers nothing"
         );
     }
 
@@ -1215,7 +1357,11 @@ mod tests {
                     // and the best one: nothing is pasted, imported, or read out
                     // of the environment. Omitting it from this list would make
                     // the healthiest shape of provider the only illegal one.
-                    || p.oauth_client.is_some(),
+                    || p.oauth_client.is_some()
+                    // A machine writes its own binding. There is no third party
+                    // to consent to and nothing to collect, which is the least
+                    // work a "way in" has ever been.
+                    || p.device_bound,
                 "{}: nothing to import, no env var, not pasteable, no consent screen",
                 p.id
             );
@@ -1243,7 +1389,15 @@ mod tests {
         for p in PROVIDERS {
             assert!(!p.display.is_empty(), "{}: no display name", p.id);
             assert!(!p.blurb.is_empty(), "{}: no blurb", p.id);
-            assert!(!p.badge.is_empty(), "{}: no badge slug", p.id);
+            // A vendor row must wear its vendor's mark. A `device_bound` row has
+            // no vendor at all — every surface draws a placeholder for it — and
+            // inventing a logo for "a computer" would be four cuts of art for a
+            // row that isn't a brand.
+            assert!(
+                !p.badge.is_empty() || p.device_bound,
+                "{}: no badge slug",
+                p.id
+            );
             assert!(
                 p.badge
                     .chars()
@@ -1323,8 +1477,10 @@ mod tests {
             // client be routed to a daemon the default user does not run.
             assert_eq!(
                 info.device_link,
-                spec.oauth_client
-                    .is_some_and(|oc| is_loopback_redirect(oc.redirect_uri)),
+                spec.device_bound
+                    || spec
+                        .oauth_client
+                        .is_some_and(|oc| is_loopback_redirect(oc.redirect_uri)),
                 "{} disagrees with its redirect",
                 info.id
             );
@@ -1355,6 +1511,14 @@ mod tests {
     #[test]
     fn every_provider_exposes_its_fields() {
         for info in provider_infos() {
+            // Unless there is no form: a `device_bound` row is linked by a tap,
+            // and every field it holds is written by the machine. Requiring an
+            // input here would mean shipping a box that asks a human to type a
+            // device id — the one value they cannot know and must not guess.
+            if provider(&info.id).unwrap().device_bound {
+                assert!(info.fields.is_empty(), "{}: a binding drew a form", info.id);
+                continue;
+            }
             assert!(!info.fields.is_empty(), "{}: no fields to render", info.id);
             for f in &info.fields {
                 assert!(
@@ -1403,6 +1567,14 @@ mod tests {
     #[test]
     fn auth_reads_a_field_the_provider_really_has() {
         for p in PROVIDERS {
+            // A `device_bound` row never builds a request — its driver spawns a
+            // process — so it carries the inert `BEARER` default that
+            // `ProviderSpec::auth` documents, and there is no credential for it
+            // to name. Asserting otherwise would force a fake payload key whose
+            // only job is to satisfy a test.
+            if p.device_bound {
+                continue;
+            }
             assert!(
                 p.fields.iter().any(|f| f.key == p.auth.field),
                 "{}: auth reads `{}`, which is not one of its fields",
@@ -1481,7 +1653,12 @@ mod tests {
     #[test]
     fn a_pasted_provider_says_where_to_get_the_credential() {
         for p in PROVIDERS {
-            let pasted = p.import_path.is_none() && !p.oauth_capable;
+            // "Pasted" means a form really draws an input. A row whose every
+            // field is `issued` draws none — the machine writes them — so there
+            // is nothing for a help link to help with.
+            let pasted = p.import_path.is_none()
+                && !p.oauth_capable
+                && p.fields.iter().any(|f| !f.issued);
             if pasted {
                 assert!(
                     p.help_url.is_some(),
@@ -1558,6 +1735,11 @@ mod tests {
     #[test]
     fn provider_infos_carry_what_a_call_needs() {
         for info in provider_infos() {
+            // See `auth_reads_a_field_the_provider_really_has`: a machine is
+            // not a request.
+            if provider(&info.id).unwrap().device_bound {
+                continue;
+            }
             assert!(!info.auth.header.is_empty(), "{}: no auth header", info.id);
             assert!(!info.auth.field.is_empty(), "{}: no credential field", info.id);
             // The field names where the credential sits IN THE SEALED PAYLOAD.

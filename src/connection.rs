@@ -419,6 +419,8 @@ async fn providers(client: &Client) -> Result<()> {
     println!("{:<20} {:<26} {:<8} {}", "ID", "PROVIDER", "AUTH", "LINK VIA");
     for p in &rows {
         let how = match (p.import_path.as_deref(), p.env_var.as_deref()) {
+            // Nothing to collect: `add` writes this machine's own binding.
+            _ if is_device_binding(p) => "run it on that machine".to_string(),
             (Some(path), _) => format!("--import  (~/{path})"),
             (None, Some(v)) => format!("--from-env  (${v})"),
             // A consent screen the browser runs is the modern default, and it
@@ -427,9 +429,16 @@ async fn providers(client: &Client) -> Result<()> {
             (None, None) if p.oauth => "sign in (browser)".to_string(),
             (None, None) => "paste".to_string(),
         };
-        let kind = match p.kind {
-            ProviderKind::OAuth => "oauth",
-            ProviderKind::ApiKey => "key",
+        // Printed from what the row IS, not from `kind`: a machine binding
+        // carries `ApiKey` for wire-compatibility reasons that have nothing to
+        // do with the human reading this table (see the `computer` row).
+        let kind = if is_device_binding(p) {
+            "device"
+        } else {
+            match p.kind {
+                ProviderKind::OAuth => "oauth",
+                ProviderKind::ApiKey => "key",
+            }
         };
         println!("{:<20} {:<26} {:<8} {}", p.id, p.display, kind, how);
     }
@@ -921,6 +930,9 @@ async fn add(
     label: Option<String>,
 ) -> Result<()> {
     let spec = &descriptor(client, provider).await?;
+    if is_device_binding(spec) {
+        return bind_machine(client, sess, name, spec, label).await;
+    }
     let (mut fields, suggested_label) = if oauth {
         oauth_dance(spec).await?
     } else {
@@ -973,6 +985,88 @@ async fn add(
         println!("  its methods:  mafold connection methods {name}");
     }
     Ok(())
+}
+
+/// Hand the call to the server, which fans it out to the caller's own devices
+/// so the one that can run it does.
+///
+/// The same route a granted bot uses (`callConnection`) — a person calling
+/// their own laptop from their desktop is not a different feature, and giving
+/// it a second path is how the two would drift on exactly the details (claim,
+/// timeout, error wording) that make it work.
+async fn relay(client: &Client, name: &str, method: &str, params: &Value) -> Result<Value> {
+    let v = client
+        .call(
+            "callConnection",
+            json!({ "connection": name, "method": method, "params": params }),
+        )
+        .await
+        .with_context(|| format!("`{name}` did not answer"))?;
+    Ok(v.get("result").cloned().unwrap_or(Value::Null))
+}
+
+/// Is this provider a MACHINE rather than an account somewhere else?
+///
+/// Read off the served registry, not off the provider's name: a row with
+/// nothing for a human to type (`fields` empty — every field is issued) that
+/// still needs a device to finish (`device_link`) can only be a binding. The
+/// day a second such provider ships, this keeps working; a `== "computer"`
+/// here would not, and would be the §9 shape the whole registry exists to
+/// avoid.
+fn is_device_binding(spec: &ProviderInfo) -> bool {
+    spec.fields.is_empty() && spec.device_link && spec.oauth_fixed.is_none()
+}
+
+/// Point a connection at THIS machine.
+///
+/// There is no credential to collect, no consent screen, and nothing to paste
+/// — the whole act is writing down which device answers, and sealing it so the
+/// server cannot read (or choose) that. Which is why it can only be run on the
+/// machine itself: a laptop cannot bind a desktop, because it does not hold the
+/// desktop's shell.
+async fn bind_machine(
+    client: &Client,
+    sess: &session::Session,
+    name: &str,
+    spec: &ProviderInfo,
+    label: Option<String>,
+) -> Result<()> {
+    let (umk, key_id, _) = unlock(client, sess).await?;
+    let fields = machine_binding(sess);
+    let (blob, wrapped_dek) = seal_payload(&umk, &fields)?;
+    let label = label.unwrap_or_else(|| sess.device_name.clone());
+    client
+        .call(
+            "putConnection",
+            json!({
+                "name": name,
+                "provider": spec.id,
+                "label": label,
+                "blob": blob,
+                "wrapped_dek": wrapped_dek,
+                "key_id": key_id,
+            }),
+        )
+        .await
+        .context("putConnection failed")?;
+    println!("✓ {name} → {} ({label})", spec.display);
+    println!("  calls to it run HERE, and only here — the binding is sealed, so nothing");
+    println!("  server-side chooses which of your machines answers.");
+    println!("  keep it answering:  mafold up   (or `mafold connection listen`)");
+    println!("  what it can do:     mafold connection methods {name}");
+    Ok(())
+}
+
+/// The sealed payload of a `computer` row. Keys match the registry's
+/// `COMPUTER_BINDING`, or `filter_payload` would drop them the first time
+/// anything rewrote the row.
+fn machine_binding(sess: &session::Session) -> serde_json::Map<String, Value> {
+    let mut fields = serde_json::Map::new();
+    fields.insert("device_id".into(), json!(sess.device_id));
+    fields.insert("machine".into(), json!(sess.device_name));
+    fields.insert("os".into(), json!(std::env::consts::OS));
+    fields.insert("bound_at".into(), json!(now_ms().to_string()));
+    fields
 }
 
 async fn show(client: &Client, sess: &session::Session, name: &str, reveal: bool) -> Result<()> {
@@ -1032,15 +1126,31 @@ async fn runtime(
     sess: &session::Session,
 ) -> Result<mafold_core::connections::Runtime> {
     let (umk, _, _) = unlock(client, sess).await?;
-    // `base` here is the ORIGIN — `Client` appends `/api` itself, and the core's
-    // rpc does not. Passing it through unchanged makes every core call a 404
-    // that reads as "this server is older than this client", which is a very
-    // convincing wrong answer.
-    Ok(mafold_core::connections::Runtime::new(
-        &format!("{base}/api"),
-        &sess.token,
-        umk,
-    ))
+    Ok(core_runtime(base, sess, umk))
+}
+
+/// Every runtime this cli builds, with the one capability that makes this
+/// process a MACHINE the user can call.
+///
+/// One constructor, because the failure mode of forgetting it is invisible:
+/// a daemon without an executor attached receives shell calls addressed to
+/// this very machine and silently declines them (`Runtime::can_serve`), so the
+/// caller times out and no log anywhere says why. There are three places that
+/// build a runtime — `mafold connection call`, `listen`, and `mafold up`'s
+/// resident listener — and all three are the same machine.
+fn core_runtime(
+    base: &str,
+    sess: &session::Session,
+    umk: Key,
+) -> mafold_core::connections::Runtime {
+    // `base` here is the ORIGIN — `Client` appends `/api` itself, and the
+    // core's rpc does not. Passing it through unchanged makes every core call
+    // a 404 that reads as "this server is older than this client", which is a
+    // very convincing wrong answer.
+    let mut rt =
+        mafold_core::connections::Runtime::new(&format!("{base}/api"), &sess.token, umk);
+    rt.attach_computer(&sess.device_id, crate::computer::executor());
+    rt
 }
 
 // ── linking on behalf of another surface (`events.connectionLink`) ─────────
@@ -1126,6 +1236,39 @@ pub async fn handle_link_event(
     };
 
     let spec = match descriptor(client, &provider).await.ok() {
+        // A machine binding finishes right here: no port to bind, no consent
+        // screen, nothing for the asking surface to open. It answers with the
+        // connection instead of a URL, and `startConnectionLink` reads that as
+        // "already linked".
+        Some(sp) if is_device_binding(&sp) => {
+            let outcome = bind_for_link(client, sess, umk, key_id, &sp).await;
+            match &outcome {
+                Ok(name) => {
+                    let _ = answer(
+                        json!({
+                            "authorize_url": "",
+                            "device": sess.device_name,
+                            "connection": name,
+                        }),
+                        None,
+                    )
+                    .await;
+                    println!("· connections: bound {name} → this machine ({})", sess.device_name);
+                }
+                Err(e) => {
+                    let _ = answer(Value::Null, Some(format!("{e:#}"))).await;
+                    println!("· connections: could not bind this machine — {e:#}");
+                }
+            }
+            // Report as well, so a caller that polls rather than reading the
+            // start response lands on the same ending.
+            let body = match &outcome {
+                Ok(name) => json!({ "link_id": link_id, "connection": name }),
+                Err(e) => json!({ "link_id": link_id, "error": format!("{e:#}") }),
+            };
+            let _ = client.call("reportConnectionLink", body).await;
+            return true;
+        }
         Some(sp) if sp.oauth_fixed.is_some() => sp,
         Some(sp) => {
             let _ = answer(
@@ -1185,6 +1328,40 @@ pub async fn handle_link_event(
     true
 }
 
+/// Bind this machine for a link someone started elsewhere (the web's Connect
+/// button). Same sealing as `bind_machine`, minus the terminal.
+///
+/// The name is chosen here, by `free_name`, for the same reason the OAuth path
+/// chooses it here: the asking surface never sees the payload, and two laptops
+/// bound from the same browser must become two rows rather than one machine
+/// overwriting the other.
+async fn bind_for_link(
+    client: &Client,
+    sess: &session::Session,
+    umk: &Key,
+    key_id: &str,
+    spec: &ProviderInfo,
+) -> Result<String> {
+    let fields = machine_binding(sess);
+    let (blob, wrapped_dek) = seal_payload(umk, &fields)?;
+    let name = free_name(client, &spec.id).await;
+    client
+        .call(
+            "putConnection",
+            json!({
+                "name": name,
+                "provider": spec.id,
+                "label": sess.device_name,
+                "blob": blob,
+                "wrapped_dek": wrapped_dek,
+                "key_id": key_id,
+            }),
+        )
+        .await
+        .context("putConnection failed")?;
+    Ok(name)
+}
+
 /// Wait out the consent screen, seal what comes back, store it. The connection
 /// name it chose, so the report can name it.
 async fn finish_linking(
@@ -1236,8 +1413,7 @@ async fn listen(base: &str, client: &Client, sess: &session::Session) -> Result<
     // Unlocked once, used twice: the core answers calls with the key, and a
     // link started from another surface seals its new grant with the same one.
     let (umk, key_id, _) = unlock(client, sess).await?;
-    let mut rt =
-        mafold_core::connections::Runtime::new(&format!("{base}/api"), &sess.token, umk.clone());
+    let mut rt = core_runtime(base, sess, umk.clone());
     println!(
         "✓ listening as @{} on {} — connection calls granted to your bots run here.\n  ctrl-c to stop.",
         sess.username, sess.device_name
@@ -1361,11 +1537,7 @@ async fn quiet_runtime(
     if key_id.is_empty() || s(&reg["device"], "key_id") != key_id {
         return None;
     }
-    let rt = mafold_core::connections::Runtime::new(
-        &format!("{base}/api"),
-        &sess.token,
-        umk.clone(),
-    );
+    let rt = core_runtime(base, sess, umk.clone());
     Some((rt, umk, key_id))
 }
 
@@ -1448,7 +1620,19 @@ async fn call(
         bail!("--params must be a JSON object, e.g. --params '{{\"query\":\"roadmap\"}}'");
     }
     let mut rt = runtime(base, client, sess).await?;
-    let out = rt.call(name, method, args).await.map_err(|e| anyhow!("{e}"))?;
+    // Two places this can run, and the runtime already knows which: a
+    // credential opens HERE (that is the whole vault), but a machine of yours
+    // answers on ITSELF. Asking the relay for something this process could have
+    // done would be a round trip to reach your own shell; running locally
+    // something bound to another laptop would be worse than a round trip.
+    let out = if rt.can_serve(name, method).await {
+        rt.call_any("cli", name, method, &args, false)
+            .await
+            .map_err(|e| anyhow!("{e}"))?
+    } else {
+        eprintln!("· {name} lives on another machine of yours — relaying");
+        relay(client, name, method, &args).await?
+    };
 
     // MCP wraps results in `content: [{type, text}]`. Unwrap the common
     // all-text case so a shell pipeline gets the payload rather than the

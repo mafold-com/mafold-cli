@@ -15,6 +15,7 @@ mod cardtags;
 mod channels;
 mod client;
 mod commands;
+mod computer;
 mod connection;
 mod daemon;
 mod discover;

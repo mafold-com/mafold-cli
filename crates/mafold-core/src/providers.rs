@@ -150,6 +150,20 @@ fn verify(version: u32, providers: &[ProviderInfo], signature_b64: &str) -> Resu
         })
 }
 
+/// ONE lock over the process-global pack, for every test in this crate that
+/// seats or empties it.
+///
+/// Two locks is not a lock: `connections::tests` kept its own, and its computer
+/// tests failed intermittently — a `providers::tests` case a thread away had
+/// installed a deliberately stale pack, so `ensure()` decided to refetch and
+/// ate a canned mock response meant for `listConnections`. The symptom was an
+/// assertion about a shell job, three modules from the cause.
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    M.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Drop the pack. Tests only — a running client has no reason to forget one.
 #[cfg(test)]
 pub fn forget() {
@@ -231,8 +245,7 @@ mod tests {
     /// The registry is process-global, so these run under one lock rather than
     /// racing each other through `cache()`.
     fn guard() -> std::sync::MutexGuard<'static, ()> {
-        static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let g = M.lock().unwrap_or_else(|e| e.into_inner());
+        let g = super::test_lock();
         // Stand in the test keypair for every test that holds the lock, so
         // `install` runs its real signature check rather than a bypass.
         *TEST_KEY.write().unwrap_or_else(|e| e.into_inner()) =

@@ -1,0 +1,18 @@
+# Windows: link the C runtime STATICALLY.
+#
+# Rust's msvc target dynamically links `VCRUNTIME140.dll` by default, which
+# ships with the Visual C++ Redistributable — NOT with Windows. On a machine
+# that has never had it installed (a fresh install, a CI sandbox, most
+# non-developer PCs) the binary does not fail gracefully: it does not start at
+# all, with a system dialog about a missing DLL. We ship a single downloadable
+# executable and tell people to run it, so it has to be self-contained.
+#
+# Found the expensive way: winget's package validation failed with
+# `Validation-Executable-Error` on the very first submission of `Mafold.CLI`,
+# and the exe's import table named VCRUNTIME140.dll. Every Windows user without
+# the redistributable had the same experience, silently, before that.
+#
+# The UCRT imports (`api-ms-win-crt-*`) are fine either way — those are part of
+# Windows 10+. Cost of the switch is a few hundred KB of binary.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

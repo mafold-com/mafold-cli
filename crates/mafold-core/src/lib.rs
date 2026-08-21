@@ -19,6 +19,7 @@ pub mod flags;
 pub mod connections;
 pub mod providers;
 mod codex;
+pub mod computer;
 pub mod mcp;
 pub mod methods;
 pub mod vault;

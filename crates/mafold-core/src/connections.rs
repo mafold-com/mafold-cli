@@ -48,6 +48,30 @@ struct Cached {
     at: i64,
 }
 
+/// What a host installs to prove it can run a `computer` connection.
+///
+/// Two halves, and both are needed before this device may claim a call:
+/// **who it is** (the device id it registered with the vault — the same string
+/// the connection's sealed payload names) and **how it runs things**. A host
+/// that knows its id but cannot spawn a process, or one that can spawn but is
+/// not the machine the connection points at, must decline — see
+/// [`Runtime::can_serve`].
+pub struct ComputerHost {
+    /// This machine's vault device id.
+    pub device_id: String,
+    /// Runs one already-validated [`Job`](crate::computer::Job). Installed by
+    /// the host rather than implemented here because four of the five surfaces
+    /// that link this core have no business spawning a shell.
+    pub run: Executor,
+}
+
+/// See [`ComputerHost::run`].
+pub type Executor = std::sync::Arc<
+    dyn Fn(crate::computer::Job) -> futures::future::BoxFuture<'static, Result<Value>>
+        + Send
+        + Sync,
+>;
+
 /// A device's view of its owner's connections.
 pub struct Runtime {
     base: String,
@@ -58,6 +82,8 @@ pub struct Runtime {
     token: String,
     umk: Key,
     catalogs: HashMap<String, Cached>,
+    /// Set only on a host that can actually run a shell — see [`ComputerHost`].
+    computer: Option<ComputerHost>,
 }
 
 impl Runtime {
@@ -67,7 +93,22 @@ impl Runtime {
             token: token.to_string(),
             umk,
             catalogs: HashMap::new(),
+            computer: None,
         }
+    }
+
+    /// Declare that this process IS a machine the user can call, and how to run
+    /// things on it.
+    ///
+    /// Opt-in, and never a default: a `Runtime` built by the web's wasm or by
+    /// an iOS app leaves this `None` and therefore answers no computer call —
+    /// which is the correct answer, not a limitation. The daemon calls it once
+    /// at startup with its own vault device id.
+    pub fn attach_computer(&mut self, device_id: impl Into<String>, run: Executor) {
+        self.computer = Some(ComputerHost {
+            device_id: device_id.into(),
+            run,
+        });
     }
 
     pub(crate) async fn rpc(&self, method: &str, body: Value) -> Result<Value> {
@@ -141,6 +182,13 @@ impl Runtime {
         }
         let conn = self.get(name).await?;
         let spec = self.descriptor_of(&conn).await?;
+        // A machine's verbs are ours, not a server's — no endpoint to ask and
+        // nothing to cache. Falling through would reach `endpoint()` and answer
+        // "it has no MCP server, so it has no methods", which is precisely
+        // wrong for the one provider whose methods this build implements.
+        if spec.native_api.as_deref() == Some(crate::computer::DRIVER) {
+            return Ok(crate::computer::method_specs());
+        }
         let url = Self::endpoint(&spec)?;
         let payload = self.refreshed_payload(name, &conn, &spec).await?;
 
@@ -196,8 +244,18 @@ impl Runtime {
         // providers (codex) expose no MCP tools; an empty list is the honest
         // answer, not an error.
         if method == "tools/list" {
-            if spec.native_api.is_some() {
-                return Ok(serde_json::json!({ "tools": [] }));
+            // A native driver's catalog is the DRIVER's business, not a blanket
+            // empty list. Codex has no tools — `responses` is a model call, and
+            // showing it to an agent as one would be inviting it to nest a
+            // model inside a turn. A computer's shell verbs, by contrast, are
+            // exactly tools, and an agent granted a machine has to be able to
+            // discover them the same way it discovers Notion's.
+            if let Some(driver) = spec.native_api.as_deref() {
+                return Ok(if driver == crate::computer::DRIVER {
+                    crate::computer::catalog()
+                } else {
+                    serde_json::json!({ "tools": [] })
+                });
             }
             let methods = self.methods(name).await?;
             return Ok(serde_json::json!({
@@ -227,6 +285,9 @@ impl Runtime {
                     spec.display
                 )),
             },
+            Some(d) if d == crate::computer::DRIVER => {
+                self.run_computer(name, &conn, method, params).await
+            }
             // The ONE case where "update the app" is still the honest answer:
             // the pack can name a driver, but a driver is code. Everything else
             // a new provider needs now arrives with the pack.
@@ -234,6 +295,117 @@ impl Runtime {
                 "`{name}` is driven by `{other}`, which this version doesn't know — update mafold"
             )),
             None => self.call(name, method, params.clone()).await,
+        }
+    }
+
+    /// Run one method on a machine — if this process IS that machine.
+    ///
+    /// The binding lives in the sealed payload, so this check is the one thing
+    /// in the whole path the server cannot influence: it relays a call to an
+    /// ACCOUNT, and the ciphertext decides which of that account's machines was
+    /// meant. Getting it wrong is not a permission bug, it is running someone's
+    /// build command on their other laptop.
+    async fn run_computer(
+        &self,
+        name: &str,
+        conn: &Value,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value> {
+        let payload = self.open(conn)?;
+        let str_at = |k: &str| {
+            payload
+                .get(k)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let (bound, machine) = (str_at("device_id"), str_at("machine"));
+        if bound.is_empty() {
+            return Err(format!(
+                "`{name}` names no machine — it was written by something that didn't finish \
+                 binding. Re-add it on the computer it should point at"
+            ));
+        }
+        let machine = if machine.is_empty() {
+            "another machine".to_string()
+        } else {
+            machine
+        };
+        let host = self.computer.as_ref().ok_or_else(|| {
+            format!("`{name}` runs on {machine}; this surface cannot run shell commands")
+        })?;
+        if host.device_id != bound {
+            return Err(format!(
+                "`{name}` is {machine}, and this isn't it. That machine answers when it's \
+                 online — `mafold up` there"
+            ));
+        }
+        let job = crate::computer::parse(method, params)?;
+        // Cloned so the executor's future borrows nothing of `self`: a shell
+        // command outlives this frame by design.
+        let run = host.run.clone();
+        run(job).await
+    }
+
+    /// CAN this runtime execute a call for `name`? Asked BEFORE the claim,
+    /// because a claim is a promise: the server stops offering the call to
+    /// anybody else, so a device that answers "I'll take it" and then discovers
+    /// it cannot is worse than one that never spoke.
+    ///
+    /// Two ways to be unable, and both were learned the hard way:
+    ///
+    ///  * a **browser** cannot POST a native driver's endpoint (chatgpt.com is
+    ///    structurally CORS-blocked), and used to win this race against the
+    ///    daemon that could have served it — owner hit exactly that on a live
+    ///    resale turn, 2026-08-19;
+    ///  * a device that is **not the machine** a computer connection names can
+    ///    open the payload perfectly well and still must not run the command.
+    ///
+    /// Declining is SILENT. The device that can run it claims instead, and if
+    /// none exists the caller's timeout names the real situation.
+    ///
+    /// Public because a CALLER wants the same answer for the opposite reason:
+    /// `mafold connection call` asks it to decide between running the thing
+    /// here and asking the server to carry the request to the machine that can.
+    pub async fn can_serve(&mut self, name: &str, method: &str) -> bool {
+        // Resolving costs a round trip, and paying it before every claim would
+        // slow the path that three online devices are already racing on. A
+        // device that can run processes only needs to look when the method is
+        // one a MACHINE answers; the browser looks always, because for it the
+        // question is about the transport rather than the machine.
+        if !cfg!(target_arch = "wasm32") && !crate::computer::owns_method(method) {
+            return true;
+        }
+        let resolved = match self.get(name).await {
+            Ok(conn) => self.descriptor_of(&conn).await.ok().map(|spec| (conn, spec)),
+            Err(_) => None,
+        };
+        let Some((conn, spec)) = resolved else {
+            // FAIL CLOSED in the browser. The first cut of this gate resolved
+            // the spec and claimed on `native_api == None` — but a freshly
+            // opened tab has no provider registry cached yet, the resolve
+            // errored, `.ok()` read as "not native", and the browser claimed a
+            // codex call through the very hole the gate exists to close. A
+            // device holding the vault claims anyway: it can report the real
+            // error, which a caller needs more than a silent timeout.
+            return !cfg!(target_arch = "wasm32");
+        };
+        match spec.native_api.as_deref() {
+            Some(d) if d == crate::computer::DRIVER => {
+                let bound = self
+                    .open(&conn)
+                    .ok()
+                    .and_then(|p| p.get("device_id").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or_default();
+                !bound.is_empty()
+                    && self
+                        .computer
+                        .as_ref()
+                        .is_some_and(|host| host.device_id == bound)
+            }
+            Some(_) => !cfg!(target_arch = "wasm32"),
+            None => true,
         }
     }
 
@@ -408,37 +580,12 @@ pub async fn handle_event(rt: &mut Runtime, envelope: &str) -> bool {
         return true;
     }
 
-    // CAN this runtime actually execute the call? Answered BEFORE the claim,
-    // because a claim is a promise: the server stops offering the call to
-    // anybody else. A browser tab with an unlocked vault receives the same
-    // fan-out a daemon does and used to win this race — and then discover that
-    // a native driver's cross-origin POST (chatgpt.com) is structurally
-    // blocked by CORS, answering the caller with
-    // "transport failed: TypeError: Failed to fetch" while the daemon that
-    // could have served it sat one claim behind (owner hit exactly this on a
-    // resale turn, 2026-08-19). MCP calls stay claimable everywhere: their
-    // endpoints speak CORS, which is why the browser is on this bus at all.
-    // Declining is SILENT — the device that can run it claims instead, and if
-    // none exists the server's claim timeout names the real situation.
-    if cfg!(target_arch = "wasm32") {
-        // FAIL CLOSED. The first cut resolved the spec and claimed on
-        // `native_api == None` — but `descriptor_of` needs the served provider
-        // registry, and a freshly opened tab hasn't cached it yet: the resolve
-        // errored, `.ok()` read as "not native", and the browser claimed a
-        // codex call through the very hole this gate exists to close (owner
-        // reproduced it on a live resale turn within minutes of the fix
-        // shipping). A device that cannot PROVE it can run the call must not
-        // promise to — declining is free, the daemon is one claim behind.
-        let can = match rt.get(&name).await {
-            Ok(conn) => match rt.descriptor_of(&conn).await {
-                Ok(spec) => spec.native_api.is_none(),
-                Err(_) => false,
-            },
-            Err(_) => false,
-        };
-        if !can {
-            return true;
-        }
+    // CAN this runtime actually execute the call? Answered BEFORE the claim —
+    // see `Runtime::can_serve`, which is where the two ways to be unable (a
+    // browser facing CORS, a machine that isn't the one named) are spelled out.
+    // A device that cannot PROVE it can run the call must not promise to.
+    if !rt.can_serve(&name, &method).await {
+        return true;
     }
 
     // Ask before working. A device that loses the claim is done — silently, and
@@ -579,10 +726,15 @@ mod tests {
         provider_infos().into_iter().find(|p| p.id == id).expect("no such provider")
     }
 
-    /// Put a registry in this process, as a fetch would. `now_ms()` keeps it
-    /// inside the freshness window, so nothing here touches the network.
-    fn with_registry() {
+    /// Put a registry in this process, as a fetch would, and HOLD it there for
+    /// the rest of the test. `now_ms()` keeps it inside the freshness window,
+    /// so nothing here touches the network.
+    #[must_use = "bind the guard (`let _reg = with_registry();`) — dropped immediately, \
+                  another test can empty the registry mid-call"]
+    fn with_registry() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::providers::test_lock();
         crate::providers::install_unverified_for_tests(1, provider_infos(), now_ms());
+        guard
     }
 
     fn map(v: Value) -> Map<String, Value> {
@@ -688,7 +840,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn a_provider_missing_from_the_pack_is_not_a_version_problem() {
-        with_registry();
+        let _reg = with_registry();
         // `base` is never reached: the pack was installed at `now_ms()`, so
         // `ensure` is inside its freshness window and does no I/O. That is the
         // property that keeps a cached registry working offline.
@@ -707,11 +859,16 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn no_registry_yet_says_so_rather_than_blaming_the_connection() {
+        // Held for the whole test: emptying a process-global out from under a
+        // sibling test is how this file got a failure that pointed at Notion.
+        let _reg = crate::providers::test_lock();
         crate::providers::forget();
         let rt = Runtime::new("http://127.0.0.1:1", "s_tok", Key::random());
         let err = rt.descriptor_of(&json!({ "provider": "notion" })).await.unwrap_err();
         assert!(err.contains("no provider registry yet"), "{err}");
-        with_registry();
+        // Put it back before releasing the lock — NOT via `with_registry()`,
+        // which would try to take a lock this thread already holds.
+        crate::providers::install_unverified_for_tests(1, provider_infos(), now_ms());
     }
 
     #[test]
@@ -788,6 +945,197 @@ mod tests {
             .await
         );
         assert!(mock.requests.lock().unwrap().is_empty());
+    }
+
+    // ── a computer of your own ──
+
+    /// A stored `computer` row, sealed to `device_id` under this runtime's key.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn computer_row(umk: &Key, device_id: &str) -> String {
+        let sealed = vault::seal_payload(
+            umk,
+            &json!({ "device_id": device_id, "machine": "ops-mbp" }).to_string(),
+        );
+        json!({ "items": [{
+            "name": "laptop",
+            "provider": "computer",
+            "label": "ops-mbp",
+            "blob": sealed.blob,
+            "wrapped_dek": sealed.wrapped_dek,
+            "key_id": "k1",
+        }]})
+        .to_string()
+    }
+
+    /// An executor that records what it was asked to do and answers a fixed
+    /// result — the host half, without a real process.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn recording_executor() -> (Executor, std::sync::Arc<std::sync::Mutex<Vec<crate::computer::Job>>>)
+    {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let exec: Executor = std::sync::Arc::new(move |job| {
+            let sink = sink.clone();
+            Box::pin(async move {
+                sink.lock().unwrap().push(job);
+                Ok(json!({ "exit_code": 0, "stdout": "hi\n" }))
+            })
+        });
+        (exec, seen)
+    }
+
+    /// **The** invariant of this provider. The relay addresses an ACCOUNT, so
+    /// every machine the person owns is offered every shell command they run —
+    /// and a machine that is not the one named must not so much as claim it,
+    /// let alone execute it. Losing this check does not read as a permission
+    /// error; it reads as a build running in the wrong tree.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn a_shell_call_is_declined_by_every_machine_but_the_one_it_names() {
+        use crate::testutil::{ok, spawn_mock};
+        let _reg = with_registry();
+        let umk = Key::random();
+        let mock = spawn_mock(vec![ok(&computer_row(&umk, "device-B"))]);
+        let mut rt = Runtime::new(&mock.base, "s_token", umk.clone());
+        let (exec, seen) = recording_executor();
+        rt.attach_computer("device-A", exec);
+
+        let handled = handle_event(
+            &mut rt,
+            r#"{"method":"events.connectionCall","params":{"call_id":"c-1","connection":"laptop","method":"shell.exec","params":{"cmd":"rm -rf build"}}}"#,
+        )
+        .await;
+
+        assert!(handled, "it was ours — we just aren't the machine");
+        assert!(seen.lock().unwrap().is_empty(), "nothing may run here");
+        let reqs = mock.requests.lock().unwrap();
+        assert_eq!(
+            reqs.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            vec!["/listConnections"],
+            "declining happens BEFORE the claim — claiming would strand the call \
+             on a machine that cannot run it"
+        );
+    }
+
+    /// A daemon with no executor attached (an iOS app, a mac client — anything
+    /// that links this core without being a shell host) is in exactly the same
+    /// position as the wrong machine: silent, and out of the way.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn a_host_that_cannot_run_a_shell_never_claims_one() {
+        use crate::testutil::{ok, spawn_mock};
+        let _reg = with_registry();
+        let umk = Key::random();
+        let mock = spawn_mock(vec![ok(&computer_row(&umk, "device-B"))]);
+        let mut rt = Runtime::new(&mock.base, "s_token", umk.clone());
+
+        handle_event(
+            &mut rt,
+            r#"{"method":"events.connectionCall","params":{"call_id":"c-2","connection":"laptop","method":"shell.exec","params":{"cmd":"ls"}}}"#,
+        )
+        .await;
+
+        let reqs = mock.requests.lock().unwrap();
+        assert!(
+            !reqs.iter().any(|r| r.path == "/claimConnectionCall"),
+            "a host with no way to run the job must not promise to"
+        );
+    }
+
+    /// The machine that IS named claims, runs it, and answers — and the job it
+    /// runs is the one that was asked for, parsed once in the core so every
+    /// host cannot disagree about what the arguments meant.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn the_named_machine_claims_runs_and_answers() {
+        use crate::testutil::{ok, spawn_mock};
+        let _reg = with_registry();
+        let umk = Key::random();
+        let row = computer_row(&umk, "device-A");
+        let mock = spawn_mock(vec![
+            ok(&row),                    // the pre-claim gate resolves the binding
+            ok(r#"{"claimed":true}"#),   // ours
+            ok(&row),                    // call_any re-reads the row it will open
+            ok("null"),                  // answerConnectionCall
+        ]);
+        let mut rt = Runtime::new(&mock.base, "s_token", umk.clone());
+        let (exec, seen) = recording_executor();
+        rt.attach_computer("device-A", exec);
+
+        handle_event(
+            &mut rt,
+            r#"{"method":"events.connectionCall","params":{"call_id":"c-3","connection":"laptop","method":"shell.exec","params":{"cmd":"echo hi","cwd":"/tmp"}}}"#,
+        )
+        .await;
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[crate::computer::Job::Exec {
+                cmd: "echo hi".into(),
+                cwd: Some("/tmp".into()),
+                timeout_ms: crate::computer::DEFAULT_EXEC_MS,
+            }]
+        );
+        let reqs = mock.requests.lock().unwrap();
+        let answer = reqs.last().expect("an answer");
+        assert_eq!(answer.path, "/answerConnectionCall");
+        assert!(answer.body.contains("\"stdout\""), "{}", answer.body);
+        assert!(!answer.body.contains("\"error\""), "{}", answer.body);
+    }
+
+    /// `tools/list` is how an agent discovers what a granted connection can do.
+    /// Codex answers empty by construction; a computer answers its shell verbs,
+    /// or a bot granted a machine would be told the machine offers nothing.
+    ///
+    /// Synchronous, and that is not incidental: this file's async tests all
+    /// carry `#[cfg(not(target_arch = "wasm32"))]` because `tokio` is a
+    /// native-only dependency, and a `#[tokio::test]` without that gate breaks
+    /// the WASM test build — which no amount of `cargo check --lib` will show
+    /// you (it doesn't compile tests). Nothing here needs a runtime anyway: the
+    /// catalog is a constant, and the point is that answering it depends on
+    /// neither a socket nor a vault.
+    #[test]
+    fn a_computer_reports_its_shell_verbs_where_codex_reports_none() {
+        let _reg = with_registry();
+        assert_eq!(
+            info("computer").native_api.as_deref(),
+            Some(crate::computer::DRIVER)
+        );
+        assert!(
+            info("codex-oauth").native_api.is_some(),
+            "the contrast only means something while codex is native too"
+        );
+
+        let cat = crate::computer::catalog();
+        let names: Vec<&str> = cat["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"shell.exec") && names.contains(&"shell.status"));
+    }
+
+    /// The sentence a caller gets when the machine is off. It has to name the
+    /// machine: "no device answered" sends people looking at the network, and
+    /// the fix is to open a laptop.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn calling_a_machine_that_isnt_this_one_says_which_machine() {
+        use crate::testutil::{ok, spawn_mock};
+        let _reg = with_registry();
+        let umk = Key::random();
+        let mock = spawn_mock(vec![ok(&computer_row(&umk, "device-B"))]);
+        let mut rt = Runtime::new(&mock.base, "s_token", umk.clone());
+        let (exec, _) = recording_executor();
+        rt.attach_computer("device-A", exec);
+
+        let err = rt
+            .call_any("c-4", "laptop", "shell.exec", &json!({ "cmd": "ls" }), false)
+            .await
+            .unwrap_err();
+        assert!(err.contains("ops-mbp"), "{err}");
+        assert!(err.contains("mafold up"), "{err}");
     }
 
     #[cfg(not(target_arch = "wasm32"))]
