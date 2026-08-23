@@ -133,6 +133,24 @@ struct IncomingMessage {
     /// bot on an unfixed server from answering such a message twice.
     #[serde(default)]
     client_msg_id: Option<String>,
+    /// Present when this "message" is a SERVICE NOTICE — "X joined", "bot Y was
+    /// added", "the group was renamed" — rather than something a person wrote.
+    /// Its `content` is empty (the rendered line lives server-side in
+    /// `service.text`), so every notice used to die anonymously in the
+    /// empty-content skip below. It is still never a prompt, but the one naming
+    /// US is how the daemon learns it was just dropped into a group.
+    #[serde(default)]
+    service: Option<ServiceNotice>,
+}
+
+/// A service notice's server-stamped shape (`chat_api::post_service_notice`).
+/// Only `kind` is read: the notice's rendered text is the clients' business,
+/// and keying on the machine-readable kind is what keeps this from breaking the
+/// day someone rewords "机器人 X 已加入".
+#[derive(Deserialize)]
+struct ServiceNotice {
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 /// Bounded seen-recently set behind the duplicate-delivery guard: `insert`
@@ -730,6 +748,9 @@ struct OwnerConfig {
     thinking: Option<u32>,
     /// Extra system prompt the owner set, appended to the mafold preamble.
     system_prompt: Option<String>,
+    /// The owner's introduction setting — off switch, or a brief for the
+    /// unprompted first-contact turns. See [`greeting_mode`].
+    greeting: Option<String>,
     /// Default working directory when `--workdir` wasn't passed on the CLI.
     cwd: Option<String>,
     /// Owner-authored allow-list: only these users (+ the owner) may drive the
@@ -783,6 +804,7 @@ impl OwnerConfig {
             effort: get("effort"),
             thinking: get("thinking").and_then(|s| s.parse().ok()),
             system_prompt: get("system_prompt"),
+            greeting: get("greeting"),
             // `cwd` is the documented key; accept `workdir` as an alias.
             cwd: get("cwd").or_else(|| get("workdir")),
             whitelist: parse_user_list(get("whitelist")),
@@ -962,6 +984,86 @@ fn save_cursor(my_username: &str, seq: u64) {
     if std::fs::write(&tmp, seq.to_string()).is_ok() {
         let _ = std::fs::rename(&tmp, &path);
     }
+}
+
+// ── first-contact introductions (persisted) ──
+/// Where this bot has already introduced itself: `~/.mafold/intros/<bot>.json`,
+/// a flat list of marks — `boot` for the once-ever "I'm online, and here is the
+/// machine you just pointed at me" report to the owner, plus one conversation id
+/// per group it was dropped into.
+///
+/// On disk, not in memory, because an introduction is a FIRE-ONCE event with no
+/// user to re-trigger it and no user to make it stop: a daemon restart must not
+/// re-introduce the bot to every group it already lives in, and being removed
+/// and re-added is a person changing their mind, not a first meeting.
+fn intros_path(my_username: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let tag: String = my_username
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .collect();
+    PathBuf::from(home).join(".mafold").join("intros").join(format!("{tag}.json"))
+}
+
+fn load_intros(my_username: &str) -> HashSet<String> {
+    std::fs::read_to_string(intros_path(my_username))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Has this bot already introduced itself for `key` (`boot` / a conversation id)?
+fn intro_done(my_username: &str, key: &str) -> bool {
+    load_intros(my_username).contains(key)
+}
+
+/// Record an introduction as delivered. Read-modify-write against the current
+/// file (not a cached set) so two group adds landing at once can't have the
+/// second one's save erase the first one's mark.
+fn mark_intro(my_username: &str, key: &str) {
+    let mut marks = load_intros(my_username);
+    if !marks.insert(key.to_string()) {
+        return;
+    }
+    let Ok(s) = serde_json::to_string(&marks) else { return };
+    let path = intros_path(my_username);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, s).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// What the owner's `greeting` field says about introducing yourself.
+enum Greeting {
+    /// Unset — introduce yourself the standard way.
+    Default,
+    /// Explicitly switched off: never speak unprompted.
+    Off,
+    /// The owner wrote a brief; it rides along in the introduction prompt.
+    Brief(String),
+}
+
+/// Read the `greeting` config value as the intro switch.
+///
+/// A bot that speaks the moment it is added needs an off switch that is one tap
+/// away, or the only way to silence it is to downgrade the daemon. `greeting`
+/// is the field that already existed for this (whitelisted server-side since
+/// the Customize sheet shipped) and had never been wired to anything.
+fn greeting_mode(v: Option<&str>) -> Greeting {
+    let Some(raw) = v.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Greeting::Default;
+    };
+    const OFF: &[&str] = &[
+        "off", "no", "none", "false", "0", "disable", "disabled", "silent", "mute",
+        "关", "关闭", "禁用", "别说话", "不介绍",
+    ];
+    if OFF.iter().any(|o| raw.eq_ignore_ascii_case(o)) {
+        return Greeting::Off;
+    }
+    Greeting::Brief(raw.to_string())
 }
 
 /// When this daemon process started serving — `/status` uptime.
@@ -1504,7 +1606,16 @@ async fn ensure_customize_fields(client: &Client, my_username: &str, owner_usern
 /// again; matching a stock shape only makes it *eligible* for a re-seed when
 /// it differs from the current stock for the daemon's harness.
 fn is_our_stock_seed(schema: &[serde_json::Value]) -> bool {
-    let keys: Vec<&str> = schema.iter().filter_map(|f| f["key"].as_str()).collect();
+    let mut keys: Vec<&str> = schema.iter().filter_map(|f| f["key"].as_str()).collect();
+    // Later revisions append tail fields to every stock shape (whitelist /
+    // blacklist — the sheet must declare them now that the server refuses
+    // card-sets of undeclared fields — and greeting, the introduction switch).
+    // Strip them off the tail so ONE fingerprint per harness covers sheets
+    // seeded before and after those revisions — otherwise a newly-seeded schema
+    // stops looking like ours and the next revision could never re-seed it.
+    while matches!(keys.last(), Some(&"whitelist") | Some(&"blacklist") | Some(&"greeting")) {
+        keys.pop();
+    }
     // claude-code stock (with the stock Claude model menu): v1 had no effort
     // select — the daemon consumed `effort` all along, so v1 stays listed here
     // and existing v1 sheets re-seed into v2 on the next daemon start.
@@ -1564,9 +1675,15 @@ fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
                     { "key": "system_prompt", "label": "System prompt", "label_key": "botField.systemPrompt.label", "kind": "string",
                       "placeholder": "Extra instructions appended for every reply", "placeholder_key": "botField.systemPrompt.placeholder" },
                     { "key": "cwd", "label": "Working directory", "label_key": "botField.cwd.label", "kind": "string",
-                      "placeholder": "~/project — per-chat here = that chat only; All chats = the default", "placeholder_key": "botField.cwd.placeholder" }
+                      "placeholder": "~/project — per-chat here = that chat only; All chats = the default", "placeholder_key": "botField.cwd.placeholder" },
+                    { "key": "whitelist", "label": "Whitelist", "label_key": "botField.whitelist.label", "kind": "string",
+                      "placeholder": "Who may drive the bot (usernames, comma/space separated) — empty = owner only, `*` = anyone", "placeholder_key": "botField.whitelist.placeholder" },
+                    { "key": "blacklist", "label": "Blacklist", "label_key": "botField.blacklist.label", "kind": "string",
+                      "placeholder": "Never these users — deny wins over the whitelist", "placeholder_key": "botField.blacklist.placeholder" },
+                    { "key": "greeting", "label": "Introduction", "label_key": "botField.greeting.label", "kind": "string",
+                      "placeholder": "How to introduce yourself when first added — `off` to never speak first", "placeholder_key": "botField.greeting.placeholder" }
                 ]),
-                "model / effort / system prompt / cwd",
+                "model / effort / system prompt / cwd / whitelist / blacklist / greeting",
             )
         }
         // Kimi Code: a model menu of the ids the installed `kimi` CLI ships (the
@@ -1588,9 +1705,15 @@ fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
                 { "key": "thinking", "label": "Thinking (0 = off, any number = on)", "label_key": "botField.thinkingToggle.label", "kind": "number",
                   "placeholder": "on" },
                 { "key": "cwd", "label": "Working directory", "label_key": "botField.cwd.label", "kind": "string",
-                  "placeholder": "~/project — per-chat here = that chat only; All chats = the default", "placeholder_key": "botField.cwd.placeholder" }
+                  "placeholder": "~/project — per-chat here = that chat only; All chats = the default", "placeholder_key": "botField.cwd.placeholder" },
+                { "key": "whitelist", "label": "Whitelist", "label_key": "botField.whitelist.label", "kind": "string",
+                  "placeholder": "Who may drive the bot (usernames, comma/space separated) — empty = owner only, `*` = anyone", "placeholder_key": "botField.whitelist.placeholder" },
+                { "key": "blacklist", "label": "Blacklist", "label_key": "botField.blacklist.label", "kind": "string",
+                  "placeholder": "Never these users — deny wins over the whitelist", "placeholder_key": "botField.blacklist.placeholder" },
+                { "key": "greeting", "label": "Introduction", "label_key": "botField.greeting.label", "kind": "string",
+                  "placeholder": "How to introduce yourself when first added — `off` to never speak first", "placeholder_key": "botField.greeting.placeholder" }
             ]),
-            "model / system prompt / thinking / cwd",
+            "model / system prompt / thinking / cwd / whitelist / blacklist / greeting",
         ),
         // Claude Code (also the fallback): effort AND a thinking budget are two
         // different dials here — `--effort` picks how hard the agent works a
@@ -1621,11 +1744,174 @@ fn customize_fields(harness_id: &str) -> (serde_json::Value, &'static str) {
                 { "key": "thinking", "label": "Thinking budget (tokens)", "label_key": "botField.thinking.label", "kind": "number",
                   "placeholder": "10000" },
                 { "key": "cwd", "label": "Working directory", "label_key": "botField.cwd.label", "kind": "string",
-                  "placeholder": "~/project — per-chat here = that chat only; All chats = the default", "placeholder_key": "botField.cwd.placeholder" }
+                  "placeholder": "~/project — per-chat here = that chat only; All chats = the default", "placeholder_key": "botField.cwd.placeholder" },
+                { "key": "whitelist", "label": "Whitelist", "label_key": "botField.whitelist.label", "kind": "string",
+                  "placeholder": "Who may drive the bot (usernames, comma/space separated) — empty = owner only, `*` = anyone", "placeholder_key": "botField.whitelist.placeholder" },
+                { "key": "blacklist", "label": "Blacklist", "label_key": "botField.blacklist.label", "kind": "string",
+                  "placeholder": "Never these users — deny wins over the whitelist", "placeholder_key": "botField.blacklist.placeholder" },
+                { "key": "greeting", "label": "Introduction", "label_key": "botField.greeting.label", "kind": "string",
+                  "placeholder": "How to introduce yourself when first added — `off` to never speak first", "placeholder_key": "botField.greeting.placeholder" }
             ]),
-            "model / effort / system prompt / thinking / cwd",
+            "model / effort / system prompt / thinking / cwd / whitelist / blacklist / greeting",
         ),
     }
+}
+
+/// The name-card requirement appended to an introduction brief (owner decision
+/// 2026-08-23: an introduction MUST end on a card, not trail off in prose — the
+/// card is the tappable "this is me" anchor, and in a group its Message button
+/// is the door from the room into a DM with the bot).
+///
+/// Conditional on the registry on purpose: the tag is demanded only when
+/// `mafold/contact` is actually published for this bot. On a server with no
+/// cards (local dev api), demanding it would make the model emit a tag the
+/// renderer doesn't know — an "Unsupported card" brick as the closing line of
+/// every first impression.
+fn intro_card_line(card_tags: &[String], me: &str) -> String {
+    if card_tags.iter().any(|t| t == "mafold/contact") {
+        format!(
+            "\n收尾必须是你自己的名片卡，单独占一行、不许包进代码块：\
+             {{% mafold/contact user=\"{me}\" /%}} —— 这张卡不能省。"
+        )
+    } else {
+        String::new()
+    }
+}
+
+/// Run one INTRODUCTION turn — the bot speaking with nobody having spoken to it.
+///
+/// Deliberately NOT a separate "send the greeting string" path. An introduction
+/// worth reading has to know things a template cannot: which project this daemon
+/// is actually pointed at, what the group was just talking about, which model is
+/// behind it today. So this is the ordinary turn pipeline with a synthetic
+/// prompt — same config layering, same session, same card canonicalisation, same
+/// streaming draft — differing only in what triggered it. `arm_bg_wakeup` woke
+/// the bot the same way for background tasks; this is the second caller of that
+/// shape, not a second mechanism.
+///
+/// `peer` is who the introduction is addressed to (the owner, or the group),
+/// `answerer` is the one person entitled to answer an AskUserQuestion it raises
+/// — always the owner, since nobody asked for this turn — and `brief` is the
+/// situation. See the two call sites.
+#[allow(clippy::too_many_arguments)]
+async fn intro_turn(
+    client: &Client,
+    workdir: &str,
+    chat_id: &str,
+    my_username: &str,
+    peer: &str,
+    answerer: &str,
+    brief: String,
+    card_tags: &[String],
+    sessions: &Sessions,
+    workdirs: &Workdirs,
+    coord: &Arc<ExecCoord>,
+    chat_states: &ChatStates,
+    harness: &Arc<dyn Harness>,
+    owner: &Arc<RwLock<OwnerConfig>>,
+) -> Result<()> {
+    let oc = owner.read().await.clone();
+    // Same layering a message-driven turn gets — conv config over owner
+    // defaults. (No live `/model` chat-state: nobody has typed in here yet.)
+    let cc = ConvConfig::fetch(client, chat_id).await;
+    let model = cc.model.clone().or(oc.model.clone());
+    let thinking = cc.thinking.or(oc.thinking);
+    let effort = cc.effort.clone().or(oc.effort.clone());
+    let system = {
+        let mut sys = mafold_preamble(my_username, peer, card_tags);
+        if let Some(extra) = cc.system_prompt.as_ref().or(oc.system_prompt.as_ref()) {
+            sys.push_str("\n\n");
+            sys.push_str(extra);
+        }
+        Some(sys)
+    };
+    let surface_cwd = workdirs.lock().await.get(&session_key(chat_id, None)).cloned();
+    let (turn_workdir, workdir_ns) =
+        resolve_turn_workdir(surface_cwd.as_deref(), cc.cwd.as_deref(), oc.cwd.as_deref(), workdir);
+    // What the room has been saying, so a group introduction can land on the
+    // actual conversation instead of reciting a brochure at it. There is no
+    // triggering message and no sender, so both are empty — the lookback that
+    // harvests "the photo they just posted" is scoped to a trigger sender and
+    // correctly finds nothing.
+    let mut lookback_photos: Vec<String> = vec![];
+    let mut reply_context: Option<String> = None;
+    let group_context = recent_group_context(
+        client, chat_id, my_username, "", "", None, None,
+        &mut lookback_photos, None, None, &mut reply_context,
+    )
+    .await;
+    handle(
+        client, &turn_workdir, workdir_ns, chat_id, None, None, &brief, &[],
+        sessions, coord, chat_states, harness,
+        model, effort, thinking, system,
+        &norm_user(answerer), group_context, &[],
+    )
+    .await
+}
+
+/// The once-ever "I'm online, and here's the machine you pointed at me" report,
+/// sent to the owner's DM the first time this bot's daemon ever connects.
+///
+/// Installing a daemon is currently a silent act: the CLI prints to a terminal
+/// the owner may never look at again, and the bot they just created says nothing
+/// until they think to message it. This is the receipt.
+fn arm_boot_intro(
+    client: Client,
+    workdir: String,
+    my_username: String,
+    owner_username: String,
+    harness: Arc<dyn Harness>,
+    card_tags: Vec<String>,
+    sessions: Sessions,
+    workdirs: Workdirs,
+    coord: Arc<ExecCoord>,
+    chat_states: ChatStates,
+    owner: Arc<RwLock<OwnerConfig>>,
+) {
+    tokio::spawn(async move {
+        // The DM may not exist yet (a freshly created bot has never been
+        // spoken to) — startChat both creates and finds it.
+        let chat_id = match client.resolve_chat(&owner_username).await {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("intro: couldn't open the owner DM with @{owner_username} ({e:#}) — will retry on the next connect");
+                return;
+            }
+        };
+        let host = crate::session::device_name();
+        let os = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
+        let model = owner.read().await.model.clone().unwrap_or_else(|| "the agent default".into());
+        let brief = format!(
+            "[这是一次自我介绍，不是有人在跟你说话。你的守护进程刚刚在这台机器上第一次连上 \
+             Mafold —— @{owner_username} 是你的主人，这里是你和他的私聊。向他报到。]\n\n\
+             守护进程知道的事实：\n\
+             - 机器：{host} · {os}\n\
+             - 工作目录：{workdir}\n\
+             - harness：{}\n\
+             - 模型：{model}\n\n\
+             写一条短的报到。先去看一眼这个工作目录里实际是什么项目（README、\
+             CLAUDE.md、git 状态都行），然后告诉他：你落在哪、这个项目里你能替他做什么、\
+             他可以怎么使唤你。要具体到这台机器和这个仓库 —— 「你好我是 AI 助手」这种\
+             放之四海皆准的话一个字都不要写。别超过一小段。{card_line}",
+            harness.id(),
+            card_line = intro_card_line(&card_tags, &my_username),
+        );
+        match intro_turn(
+            &client, &workdir, &chat_id, &my_username, &owner_username, &owner_username, brief,
+            &card_tags, &sessions, &workdirs, &coord, &chat_states, &harness, &owner,
+        )
+        .await
+        {
+            // Marked only once it actually landed: a turn that died on a broken
+            // harness should introduce itself on the next start, not be
+            // silently marked as done and never speak again.
+            Ok(()) => {
+                mark_intro(&my_username, "boot");
+                println!("✓ first-boot introduction delivered to @{owner_username}");
+            }
+            Err(e) => eprintln!("intro: first-boot report failed ({e:#}) — retrying on the next connect"),
+        }
+    });
 }
 
 /// Why a WS session ended — tells the reconnect loop whether to reconnect
@@ -1702,6 +1988,27 @@ async fn connect_and_run(
     // is the one that validates the output, so the two can't drift.
     let card_tags = available_card_tags(client).await;
     crate::cardtags::set_registry(&card_tags);
+
+    // FIRST CONTACT: this bot has never reported for duty. Fired here rather
+    // than at process start because "接好了" means the socket came up, not that
+    // a binary launched — and a failed attempt then naturally retries on the
+    // next connect instead of needing its own retry loop. The persisted mark is
+    // what keeps it to once ever, across restarts and reconnects.
+    if !intro_done(my_username, "boot") {
+        let oc = owner.read().await;
+        let quiet = matches!(greeting_mode(oc.greeting.as_deref()), Greeting::Off);
+        drop(oc);
+        match (quiet, allow.read().await.owner.clone()) {
+            (true, _) => println!("intro: greeting is off — skipping the first-boot report"),
+            (false, Some(owner_username)) => arm_boot_intro(
+                client.clone(), workdir.to_string(), my_username.to_string(), owner_username,
+                harness.clone(), card_tags.clone(), sessions.clone(), workdirs.clone(),
+                coord.clone(), chat_states.clone(), owner.clone(),
+            ),
+            // Ownerless bot: nobody to report to, and no DM to report in.
+            (false, None) => println!("intro: no owner resolved — skipping the first-boot report"),
+        }
+    }
 
     // Event-log cursor: the highest hub `seq` this daemon has processed,
     // persisted per bot. The hello's head seq says how far behind we are; the
@@ -1975,6 +2282,106 @@ async fn connect_and_run(
             _ => continue,
         };
         let m: IncomingMessage = match serde_json::from_value(raw_msg) { Ok(m) => m, Err(_) => continue };
+        // SERVICE NOTICE — "X joined", "bot Y was added", "renamed to Z". Never
+        // a prompt (it always falls through to `continue` below), but the one
+        // naming US is the daemon finding out it was just dropped into a group.
+        // That is the single moment where speaking first is the entire point:
+        // nobody in the room knows an @-mention is the door, and a bot that
+        // never mentions the door is a bot that is never used again.
+        //
+        // Placed ahead of the self-echo skip on purpose: `bot_added` stamps the
+        // JOINED account as its sender, so the notice about us IS from us.
+        if let Some(sn) = &m.service {
+            let kind = sn.kind.as_deref().unwrap_or("");
+            let joined_here = match kind {
+                // Added to a room that already existed. Both kinds stamp the
+                // JOINED account as the notice's sender, so "is this about me"
+                // is one question either way.
+                "bot_added" | "member_joined" => m.sender.username.eq_ignore_ascii_case(my_username),
+                // Created with us ALREADY in it — "new chat → pick some people
+                // and a bot", which is how most groups with a bot actually come
+                // into being. `create_group` posts no per-member notice, so
+                // without this arm the single most common way to meet the bot
+                // was also the one way it never said anything. The notice is
+                // broadcast to participants only, so receiving it IS the
+                // membership proof (its sender is the creator, not us).
+                "group_created" => true,
+                _ => false,
+            };
+            if joined_here {
+                let chat_id = m.conversation_id.clone();
+                let extra = match greeting_mode(owner.read().await.greeting.as_deref()) {
+                    Greeting::Off => {
+                        println!("← added to {chat_id} (greeting is off → staying quiet)");
+                        continue;
+                    }
+                    Greeting::Default => String::new(),
+                    Greeting::Brief(b) => format!("\n主人给你的额外交代：{b}"),
+                };
+                // Removed and re-added is somebody changing their mind, not a
+                // first meeting — the room has already heard this once.
+                if intro_done(my_username, &chat_id) {
+                    println!("← re-added to {chat_id} (already introduced myself here → staying quiet)");
+                    continue;
+                }
+                println!("← added to {chat_id} → introducing myself");
+                let arrived_at_creation = kind == "group_created";
+                let (client, workdir, me) = (client.clone(), workdir.to_string(), my_username.to_string());
+                let (harness, card_tags) = (harness.clone(), card_tags.clone());
+                let (sessions, workdirs) = (sessions.clone(), workdirs.clone());
+                let (coord, chat_states, owner) = (coord.clone(), chat_states.clone(), owner.clone());
+                let owner_username = allow.read().await.owner.clone().unwrap_or_else(|| me.clone());
+                tokio::spawn(async move {
+                    // Let the room settle. The notice fires the instant the add
+                    // lands — usually before the person who did it has finished
+                    // whatever they came here to do — and an agent that talks
+                    // over its own join notice reads like a bot.
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let title = client
+                        .get_chat(&chat_id)
+                        .await
+                        .ok()
+                        .and_then(|c| c["title"].as_str().map(str::to_string))
+                        .filter(|t| !t.trim().is_empty())
+                        .unwrap_or_else(|| "这个群".into());
+                    // Being added to a running group and being in one from the
+                    // first second are different rooms to walk into: one has a
+                    // conversation already going, the other has nobody in it yet.
+                    let how = if arrived_at_creation {
+                        format!("群「{title}」刚建起来，你从一开始就在里面")
+                    } else {
+                        format!("你刚被拉进群「{title}」")
+                    };
+                    let brief = format!(
+                        "[这是一次自我介绍，不是有人在跟你说话。{how}。]\n\n\
+                         如果上面有这个群最近的聊天记录，先读一遍 —— 让自我介绍落在他们正在聊的\
+                         事情上，而不是背一段简介。然后说清楚三件事：你是谁的 agent、跑在哪台\
+                         机器的什么目录上、这个群里你具体能帮上什么。\n\
+                         最后一句必须写怎么叫你：在群里 @{me} 或者直接回复你的消息你才会应，\
+                         没 @ 你就不会插话。这句不能省 —— 群里没有人知道有这道门，不写清楚\
+                         这条自我介绍就白发了。\n\
+                         很短的一段，别刷屏。{card_line}{extra}",
+                        card_line = intro_card_line(&card_tags, &me),
+                    );
+                    match intro_turn(
+                        &client, &workdir, &chat_id, &me, &title, &owner_username, brief,
+                        &card_tags, &sessions, &workdirs, &coord, &chat_states, &harness, &owner,
+                    )
+                    .await
+                    {
+                        // Marked only on delivery, so a turn lost to a broken
+                        // harness still gets its introduction when the daemon
+                        // next restarts and replays this notice.
+                        Ok(()) => {
+                            mark_intro(&me, &chat_id);
+                            println!("✓ introduced myself in {chat_id}");
+                        }
+                        Err(e) => eprintln!("intro: introduction in {chat_id} failed ({e:#})"),
+                    }
+                });
+            }
+            continue;
+        }
         // Our own echo → skip (never reply to self). Replies to our messages
         // are recognized via the server-stamped `reply_to_sender`, so there's
         // no recent-ids memory to feed.
@@ -5534,5 +5941,203 @@ mod lookback_photo_tests {
         assert!(seen.insert("c")); // evicts "a"
         assert!(seen.insert("a"), "evicted key is fresh again");
         assert!(!seen.insert("c"), "still-resident key is not");
+    }
+}
+
+#[cfg(test)]
+mod intro_tests {
+    use super::{customize_fields, greeting_mode, is_our_stock_seed, Greeting, IncomingMessage};
+
+    /// The off switch has to work in both languages the owner might reach for,
+    /// and in the shapes a text field actually receives (`Off`, ` off `, `0`).
+    /// A greeting that can only be silenced by downgrading the daemon is not a
+    /// switch — it's a hostage situation.
+    #[test]
+    fn greeting_off_is_recognised_however_it_is_written() {
+        for v in ["off", "OFF", "  Off  ", "no", "none", "false", "0", "关", "关闭", "禁用"] {
+            assert!(
+                matches!(greeting_mode(Some(v)), Greeting::Off),
+                "{v:?} should switch introductions off"
+            );
+        }
+    }
+
+    /// Unset / blank = the default behaviour, NOT off. `OwnerConfig` already
+    /// drops empty strings, but the sheet can hand back whitespace.
+    #[test]
+    fn blank_greeting_means_default_not_silence() {
+        for v in [None, Some(""), Some("   ")] {
+            assert!(matches!(greeting_mode(v), Greeting::Default), "{v:?} should be Default");
+        }
+    }
+
+    /// Anything else is the owner writing a brief, which rides into the prompt.
+    #[test]
+    fn anything_else_is_a_brief() {
+        match greeting_mode(Some("说中文，别提你在哪台机器上")) {
+            Greeting::Brief(b) => assert!(b.contains("说中文")),
+            _ => panic!("a written greeting should become a Brief"),
+        }
+    }
+
+    /// THE REGRESSION THIS GUARDS: `is_our_stock_seed` fingerprints a sheet by
+    /// its key sequence, with the appended tail fields (greeting / whitelist /
+    /// blacklist) stripped. Every harness's current stock — greeting included —
+    /// must still fingerprint as ours, or the daemon would treat its OWN seed
+    /// as owner-authored and could never re-seed it again.
+    #[test]
+    fn every_current_stock_shape_is_still_recognised_as_ours() {
+        for harness in ["claude-code", "codex", "kimi-code", "something-unknown"] {
+            let (stock, _) = customize_fields(harness);
+            let schema = stock.as_array().expect("stock schema is an array");
+            assert!(
+                is_our_stock_seed(schema),
+                "{harness}'s own stock seed must fingerprint as ours"
+            );
+            assert!(
+                schema.iter().any(|f| f["key"] == "greeting"),
+                "{harness}: the stock must carry the greeting field"
+            );
+        }
+    }
+
+    /// …and the pre-greeting shapes still are, so sheets seeded by an older
+    /// daemon re-seed into the current stock instead of being frozen forever.
+    #[test]
+    fn pre_greeting_stock_shapes_still_re_seed() {
+        let claude: Vec<serde_json::Value> = ["model", "effort", "system_prompt", "thinking", "cwd"]
+            .iter()
+            .map(|k| serde_json::json!({ "key": k, "options": [{ "value": "fable" }] }))
+            .collect();
+        assert!(is_our_stock_seed(&claude), "a v2 claude-code sheet must stay re-seedable");
+    }
+
+    /// An owner who authored their own fields keeps them — including one that
+    /// happens to end in `greeting`. Stripping the tail must not turn a stranger's
+    /// schema into ours and clobber it.
+    #[test]
+    fn owner_authored_schema_is_never_mistaken_for_stock() {
+        let theirs: Vec<serde_json::Value> = ["tone", "greeting"]
+            .iter()
+            .map(|k| serde_json::json!({ "key": k }))
+            .collect();
+        assert!(!is_our_stock_seed(&theirs));
+    }
+
+    /// The wire shape the whole group-introduction path hangs on: a service
+    /// notice arrives as a normal `messageNew` with EMPTY content, the joined
+    /// account as its sender, and the machine-readable kind under `service`.
+    /// If this stops deserializing, the bot silently never introduces itself.
+    #[test]
+    fn bot_added_notice_carries_its_kind() {
+        let frame = serde_json::json!({
+            "id": "m1",
+            "conversation_id": "c1",
+            "sender": { "username": "opsdu:claude-code", "kind": "bot" },
+            "content": "",
+            "service": { "text": "机器人 Claude 已加入", "icon": "bot", "kind": "bot_added", "params": {} }
+        });
+        let m: IncomingMessage = serde_json::from_value(frame).expect("notice must deserialize");
+        assert_eq!(m.service.as_ref().and_then(|s| s.kind.as_deref()), Some("bot_added"));
+        assert!(m.content.is_empty(), "a notice carries no prompt text");
+    }
+
+    /// A plain message must NOT look like a notice — otherwise the new arm
+    /// would swallow every real message before the reply gate ever ran.
+    #[test]
+    fn an_ordinary_message_has_no_service_block() {
+        let frame = serde_json::json!({
+            "id": "m2",
+            "conversation_id": "c1",
+            "sender": { "username": "opsdu", "kind": "human" },
+            "content": "@claude-code 在吗"
+        });
+        let m: IncomingMessage = serde_json::from_value(frame).expect("message must deserialize");
+        assert!(m.service.is_none());
+    }
+
+    /// Notices we are not the subject of (someone else joined, group renamed)
+    /// still parse — they're just not about us. The arm keys on kind AND sender.
+    #[test]
+    fn other_notices_parse_but_name_someone_else() {
+        let frame = serde_json::json!({
+            "id": "m3",
+            "conversation_id": "c1",
+            "sender": { "username": "someone-else", "kind": "human" },
+            "content": "",
+            "service": { "kind": "member_joined" }
+        });
+        let m: IncomingMessage = serde_json::from_value(frame).expect("notice must deserialize");
+        assert_eq!(m.service.as_ref().and_then(|s| s.kind.as_deref()), Some("member_joined"));
+        assert!(!m.sender.username.eq_ignore_ascii_case("opsdu:claude-code"));
+    }
+}
+
+#[cfg(test)]
+mod stock_seed_tests {
+    use super::*;
+
+    /// Every CURRENT stock seed must fingerprint as ours — otherwise the next
+    /// revision could never re-seed what this one publishes.
+    #[test]
+    fn current_stock_seeds_fingerprint_as_ours() {
+        for harness in ["claude-code", "codex", "kimi-code"] {
+            let (stock, _) = customize_fields(harness);
+            assert!(
+                is_our_stock_seed(stock.as_array().unwrap()),
+                "{harness} stock must match its own fingerprint"
+            );
+        }
+    }
+
+    /// A pre-whitelist/blacklist stock sheet (what deployed daemons published)
+    /// still fingerprints as ours — that match is what re-seeds it into the
+    /// shape that declares whitelist/blacklist, which the server now requires
+    /// before a `{% mafold/customize %}` card may set them.
+    #[test]
+    fn previous_stock_shapes_stay_eligible_for_reseed() {
+        let (stock, _) = customize_fields("claude-code");
+        let mut old = stock.as_array().unwrap().clone();
+        old.retain(|f| !matches!(f["key"].as_str(), Some("whitelist" | "blacklist")));
+        assert!(is_our_stock_seed(&old), "the v2 shape must remain re-seedable");
+    }
+
+    /// An owner-authored sheet must NEVER fingerprint as stock — the daemon
+    /// would replace it. This shape is a real one (reordered keys, no
+    /// system_prompt): the sheet that motivated the whole guard.
+    #[test]
+    fn an_owner_authored_sheet_is_never_ours() {
+        let owner: Vec<serde_json::Value> =
+            ["greeting", "model", "effort", "whitelist", "blacklist", "cwd"]
+                .iter()
+                .map(|k| serde_json::json!({ "key": k, "label": k, "kind": "string" }))
+                .collect();
+        assert!(!is_our_stock_seed(&owner));
+    }
+}
+
+#[cfg(test)]
+mod intro_card_tests {
+    use super::intro_card_line;
+
+    /// Owner decision 2026-08-23: with the contact card published, every
+    /// introduction must close on it — the exact self-closing tag, resolvable
+    /// by `user` alone.
+    #[test]
+    fn demands_the_card_when_the_registry_has_it() {
+        let tags = vec!["mafold/ask".to_string(), "mafold/contact".to_string()];
+        let line = intro_card_line(&tags, "ops:claude");
+        assert!(line.contains(r#"{% mafold/contact user="ops:claude" /%}"#));
+        assert!(line.contains("不能省"));
+    }
+
+    /// No registry entry → no demand. Requiring a tag the renderer doesn't
+    /// know would close every first impression with an "Unsupported card"
+    /// brick (the local-dev api publishes no cards at all).
+    #[test]
+    fn stays_silent_when_the_card_is_not_published() {
+        assert!(intro_card_line(&[], "ops:claude").is_empty());
+        let others = vec!["mafold/ask".to_string(), "opsdu/livedemo".to_string()];
+        assert!(intro_card_line(&others, "ops:claude").is_empty());
     }
 }

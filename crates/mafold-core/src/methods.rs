@@ -44,6 +44,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "auth/device/poll",
     "auth/device/start",
     "auth/login",
+    "auth/logout",
     "auth/register",
     "blockUser",
     "botAppendDelta",
@@ -59,6 +60,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "createChannel",
     "createChatInviteLink",
     "createGroup",
+    "createRoutine",
     "createToken",
     "debug.send_file_as_mafold",
     "debug.send_text_as_mafold",
@@ -71,6 +73,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "deleteFolder",
     "deleteMessages",
     "deleteMessagesForMe",
+    "deleteRoutine",
     "deploySite",
     "depositConnectionCustody",
     "disbandGroup",
@@ -140,6 +143,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "listInstalls",
     "listLanguages",
     "listOAuthGrants",
+    "listRoutines",
     "listSites",
     "listTokens",
     "listVaultDevices",
@@ -257,6 +261,7 @@ pub static KNOWN_METHODS: &[&str] = &[
     "unpinMessage",
     "unpublishCard",
     "updateProfile",
+    "updateRoutine",
     "uploadFile",
     "walletBalances",
     "walletConvert",
@@ -447,6 +452,7 @@ mod tests {
         assert_eq!(sorted, KNOWN_METHODS, "KNOWN_METHODS must stay sorted (binary_search)");
         assert!(is_known("sendMessage"));
         assert!(is_known("auth/login"));
+        assert!(is_known("auth/logout"));
         assert!(!is_known("sendMesage")); // the typo class this layer exists to catch
         assert!(!is_known(""));
     }

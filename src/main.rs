@@ -429,7 +429,9 @@ async fn login(base: &str, username: Option<String>, password: Option<String>, n
     let http = reqwest::Client::new();
     let resp: serde_json::Value = http
         .post(format!("{base}/api/auth/login"))
-        .json(&serde_json::json!({ "username": username, "password": password }))
+        // Same device descriptor the browser device-flow sends — without it
+        // this machine lands in Active Sessions as "Unknown device".
+        .json(&serde_json::json!({ "username": username, "password": password, "device": session::device_name(), "platform": std::env::consts::OS }))
         .send()
         .await
         .context("login request failed")?
