@@ -737,7 +737,7 @@ async fn should_respond(
 /// The bot's OWNER-set config (from the server, via `getBot`), distilled to the
 /// fields the daemon uses to drive harness defaults. Every field is OPTIONAL:
 /// a missing/empty key keeps today's built-in behavior. Unknown keys are ignored.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, PartialEq)]
 struct OwnerConfig {
     /// Default model for turns when the chat hasn't overridden it (`/model`).
     model: Option<String>,
@@ -774,14 +774,15 @@ fn parse_user_list(v: Option<String>) -> Vec<String> {
 
 impl OwnerConfig {
     /// Read the owner config via `getBot { username: <self> }` (callable by the
-    /// bot itself). Best-effort: a failed call or absent keys yield an empty
-    /// config, so the daemon falls back to its built-in defaults.
-    async fn fetch(client: &Client, username: &str) -> Self {
+    /// bot itself). `None` when the call fails — a caller that already HOLDS a
+    /// config keeps it (stale beats empty: swapping in a default over one bad
+    /// HTTP round-trip would silently drop the owner's model/prompt/whitelist).
+    async fn try_fetch(client: &Client, username: &str) -> Option<Self> {
         let detail = match client.bot(username).await {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("note: getBot failed ({e}) — using built-in defaults (no owner config)");
-                return Self::default();
+                eprintln!("note: getBot failed ({e}) — owner config not refreshed");
+                return None;
             }
         };
         // `config` is a flat `{key: value}` map of the owner's stored field
@@ -799,7 +800,7 @@ impl OwnerConfig {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
         };
-        Self {
+        Some(Self {
             model: get("model"),
             effort: get("effort"),
             thinking: get("thinking").and_then(|s| s.parse().ok()),
@@ -809,7 +810,13 @@ impl OwnerConfig {
             cwd: get("cwd").or_else(|| get("workdir")),
             whitelist: parse_user_list(get("whitelist")),
             blacklist: parse_user_list(get("blacklist")),
-        }
+        })
+    }
+
+    /// STARTUP read: with no config held yet, a failed call falls back to an
+    /// empty config so the daemon starts on its built-in defaults.
+    async fn fetch(client: &Client, username: &str) -> Self {
+        Self::try_fetch(client, username).await.unwrap_or_default()
     }
 }
 
@@ -1989,6 +1996,25 @@ async fn connect_and_run(
     let card_tags = available_card_tags(client).await;
     crate::cardtags::set_registry(&card_tags);
 
+    // Re-sync the owner config on EVERY (re)connect, not only at process start.
+    // `events.botConfigUpdated` is the live hot-swap, but it only reaches us
+    // while the socket is up: a change saved during a WS gap (api restart, net
+    // blip) is relayed into a dead connection and never again — the daemon
+    // would keep driving turns with the stale model/prompt/whitelist until its
+    // next restart (2026-08-23: an owner cleared system_prompt around an api
+    // restart; every later turn still carried it). Messages get re-anchored via
+    // the cursor below for exactly this reason — the config gets the same
+    // treatment. Failed fetch → keep what we hold; unchanged → stay silent.
+    if let Some(fresh) = OwnerConfig::try_fetch(client, my_username).await {
+        if *owner.read().await != fresh {
+            let cur_owner = allow.read().await.owner.clone();
+            *allow.write().await =
+                AllowList::build(cur_owner.as_deref(), &fresh.whitelist, &fresh.blacklist);
+            *owner.write().await = fresh;
+            println!("↻ config re-synced on connect — a change had landed while the socket was down");
+        }
+    }
+
     // FIRST CONTACT: this bot has never reported for duty. Fired here rather
     // than at process start because "接好了" means the socket came up, not that
     // a binary launched — and a failed attempt then naturally retries on the
@@ -2243,7 +2269,12 @@ async fn connect_and_run(
         // system prompt / …). The server relays it to us; re-fetch and hot-swap
         // the OwnerConfig so the NEXT turn uses it — no daemon restart needed.
         if method == "events.botConfigUpdated" {
-            let fresh = OwnerConfig::fetch(client, my_username).await;
+            // try_fetch, NOT fetch: on a failed refetch keep the config we
+            // hold — swapping in an empty default here would wipe the owner's
+            // model/prompt/whitelist over one bad HTTP round-trip.
+            let Some(fresh) = OwnerConfig::try_fetch(client, my_username).await else {
+                continue;
+            };
             let model = fresh.model.clone().unwrap_or_else(|| "default".into());
             let effort = fresh.effort.clone().unwrap_or_else(|| "default".into());
             // Rebuild the access gate too (reusing the current owner so a bad
