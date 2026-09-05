@@ -120,7 +120,8 @@ fn store_read(c: &mut Criterion) {
                 s.upsert_conversation(&CoreConversation {
                     id: id.clone(), kind: "direct".into(), title: Some(format!("Chat {i}")),
                     participants: vec![acct("ops"), acct("peer")], updated_at_ms: i as i64,
-                    unread_count: (i % 5) as u32, last_message: Some(msg("last", &id, i as i64, None)),
+                    unread_count: (i % 5) as u32, unread_mention: false,
+                    last_message: Some(msg("last", &id, i as i64, None)),
                     is_forum: false, forum_member_channels: false,
                     member_add_members: false, member_edit_info: false, member_add_bots: false,
                 }).await;

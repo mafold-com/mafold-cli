@@ -50,6 +50,7 @@ impl From<&wire::Conversation> for CoreConversation {
             participants: c.participants.iter().map(CoreAccount::from).collect(),
             updated_at_ms: c.updated_at.timestamp_millis(),
             unread_count: c.unread_count,
+            unread_mention: c.unread_mention,
             is_forum: c.is_forum,
             forum_member_channels: c.forum_member_channels,
             member_add_members: c.member_perms.add_members,

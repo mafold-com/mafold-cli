@@ -84,4 +84,14 @@ pub enum AgentEvent {
     /// message content itself records "answered" (survives reload, reaches
     /// every client). Harnesses never emit this.
     AskAnswered(String),
+    /// (driver-internal) The user spoke again WHILE this turn was running and
+    /// the driver steered the turn with it instead of starting a second one.
+    /// Carries what they said.
+    ///
+    /// It is transcript content, not bookkeeping: the reply that comes back has
+    /// to show WHERE the correction landed, or the turn reads as if the model
+    /// changed its mind on its own. Rendered in time order — after the tool
+    /// activity that had already happened, before whatever the correction
+    /// caused. Harnesses never emit this.
+    Steered(String),
 }

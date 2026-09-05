@@ -180,6 +180,14 @@ impl Client {
         self.post("getChats", json!({})).await
     }
 
+    /// One account (`{ username, display_name, language, … }`). The daemon reads
+    /// the OWNER's `language` — the cloud i18n setting every other Mafold client
+    /// follows — to know which language to introduce itself in. (The api names
+    /// the field `user_id` but accepts a username there.)
+    pub async fn get_user(&self, username: &str) -> Result<Value> {
+        self.post("getUser", json!({ "user_id": username })).await
+    }
+
     /// A single conversation (`{ id, kind, participants, … }`) — used to tell a
     /// group from a DM for the group reply gate.
     pub async fn get_chat(&self, chat_id: &str) -> Result<Value> {
@@ -338,6 +346,25 @@ impl Client {
     pub async fn bot_conv_config(&self, chat_id: &str) -> Result<Value> {
         self.post("getBotConvConfig", json!({ "chat_id": chat_id }))
             .await
+    }
+
+    /// **What configuration this bot is actually running under, for this turn.**
+    ///
+    /// A value can be pinned to a conversation, to a person, to both, or to
+    /// neither, and the server owns the ladder that picks between them
+    /// (`resolveBotConfig`). The daemon used to walk part of it by hand — chat
+    /// bag over owner defaults, and the per-USER bag not at all, so a member's
+    /// own Customize settings were stored, shown, and never read. Asking is both
+    /// shorter and the only way this stays in step with the other clients.
+    ///
+    /// Returns `{ bot, fields: {key: value}, sources: {key: {conv, user}} }`
+    /// with every layer already merged per key.
+    pub async fn resolved_config(&self, chat_id: &str, user: Option<&str>) -> Result<Value> {
+        let mut body = json!({ "chat_id": chat_id });
+        if let Some(u) = user {
+            body["user"] = json!(u);
+        }
+        self.post("resolveBotConfig", body).await
     }
 
     /// The bot's OWNER-set config, callable by the bot itself. Returns `BotDetail`
@@ -677,6 +704,19 @@ impl Client {
     /// and an unfinalized draft is precisely the "forever generating" bubble.
     pub async fn finalize(&self, message_id: &str) -> Result<()> {
         self.post_idempotent("botFinalize", json!({ "message_id": message_id }))
+            .await?;
+        Ok(())
+    }
+
+    /// Throw away one of our own UNFINALIZED drafts — the row goes, with no
+    /// tombstone. The server refuses anything already finalized, so this can
+    /// never be used to erase a real message.
+    ///
+    /// Used when a turn is steered: the reply re-opens BELOW the message that
+    /// steered it, and the bubble it was streaming into has to stop existing
+    /// rather than linger above saying "deleted".
+    pub async fn discard_draft(&self, message_id: &str) -> Result<()> {
+        self.post_idempotent("discardDraft", json!({ "message_id": message_id }))
             .await?;
         Ok(())
     }

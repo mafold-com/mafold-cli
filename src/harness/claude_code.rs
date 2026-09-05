@@ -26,8 +26,13 @@ impl Harness for ClaudeCode {
         super::on_path("claude")
     }
 
+    /// Yes — via the PostToolUse hook registered in [`Self::run`].
+    fn can_steer(&self) -> bool {
+        true
+    }
+
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
-        let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, conv, surface, draft } = turn;
+        let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, steer_file, conv, surface, draft } = turn;
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");
         }
@@ -85,25 +90,47 @@ impl Harness for ClaudeCode {
         // user answers the chat card, then returns the answer as a deny-reason —
         // which claude feeds back as the tool result, same turn. The hook waits
         // on MAFOLD_ASK_FILE (the daemon writes the answer there). See ask_hook.
+        let exe = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_else(|| "mafold".into());
+        let mut pre: Vec<serde_json::Value> = Vec::new();
+        let mut post: Vec<serde_json::Value> = Vec::new();
         if let Some(af) = &ask_file {
             cmd.env("MAFOLD_ASK_FILE", af);
-            let exe = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.to_str().map(String::from))
-                .unwrap_or_else(|| "mafold".into());
-            let settings = serde_json::json!({
-                "hooks": { "PreToolUse": [{
-                    "matcher": "AskUserQuestion",
-                    "hooks": [{ "type": "command", "command": format!("\"{exe}\" ask-hook") }]
-                }, {
-                    // Detach run_in_background Bash tasks into their own session
-                    // (registered under ~/.mafold/bgtasks by MAFOLD_CONV) — claude
-                    // kills its own background shells the moment it exits, so
-                    // without this they can never outlive the turn. See bash_hook.
-                    "matcher": "Bash",
-                    "hooks": [{ "type": "command", "command": format!("\"{exe}\" bash-hook") }]
-                }]}
-            });
+            pre.push(serde_json::json!({
+                "matcher": "AskUserQuestion",
+                "hooks": [{ "type": "command", "command": format!("\"{exe}\" ask-hook") }]
+            }));
+            pre.push(serde_json::json!({
+                // Detach run_in_background Bash tasks into their own session
+                // (registered under ~/.mafold/bgtasks by MAFOLD_CONV) — claude
+                // kills its own background shells the moment it exits, so
+                // without this they can never outlive the turn. See bash_hook.
+                "matcher": "Bash",
+                "hooks": [{ "type": "command", "command": format!("\"{exe}\" bash-hook") }]
+            }));
+        }
+        // Mid-turn steering: what the user says while this turn runs reaches the
+        // model at the next tool-result boundary. PostToolUse, matching every
+        // tool, so the tool that was running when they spoke finishes normally
+        // and nothing already on screen is un-said. See `steer_hook`.
+        if let Some(sf) = &steer_file {
+            cmd.env("MAFOLD_STEER_FILE", sf);
+            post.push(serde_json::json!({
+                "matcher": "*",
+                "hooks": [{ "type": "command", "command": format!("\"{exe}\" steer-hook") }]
+            }));
+        }
+        if !pre.is_empty() || !post.is_empty() {
+            let mut hooks = serde_json::Map::new();
+            if !pre.is_empty() {
+                hooks.insert("PreToolUse".into(), serde_json::Value::Array(pre));
+            }
+            if !post.is_empty() {
+                hooks.insert("PostToolUse".into(), serde_json::Value::Array(post));
+            }
+            let settings = serde_json::json!({ "hooks": hooks });
             cmd.arg("--settings").arg(settings.to_string());
         }
         cmd.kill_on_drop(true);

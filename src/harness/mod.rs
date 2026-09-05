@@ -100,6 +100,12 @@ pub struct Turn {
     /// writes the user's chat-card answer here, the hook reads it and feeds it
     /// back to the model. None = interactive ask unsupported for this harness.
     pub ask_file: Option<String>,
+    /// Per-turn file carrying what the user said WHILE this turn was running.
+    /// The daemon appends; a PostToolUse hook drains it and hands the text to
+    /// the model as the next tool result's context, so a long run is corrected
+    /// at the next tool boundary instead of killed and restarted. None = this
+    /// harness can't be steered mid-turn (the message queues for the next one).
+    pub steer_file: Option<String>,
 }
 
 /// Outcome of a turn.
@@ -285,6 +291,18 @@ pub trait Harness: Send + Sync {
 
     /// Is the harness CLI installed / runnable on this machine?
     fn available(&self) -> bool;
+
+    /// Can a turn of this harness be CORRECTED while it runs — i.e. does it read
+    /// [`Turn::steer_file`] and deliver what it finds to the model mid-flight?
+    ///
+    /// Default false, and the daemon behaves the same either way: a mid-turn
+    /// message is never dropped and never races the running turn. All this
+    /// decides is WHEN it arrives — at the next tool-result boundary, or as the
+    /// follow-up turn — which is the one thing the user is told, so nobody is
+    /// promised a correction that is really a queue.
+    fn can_steer(&self) -> bool {
+        false
+    }
 
     /// Run one turn, pushing normalized events into `sink` as they arrive.
     async fn run(

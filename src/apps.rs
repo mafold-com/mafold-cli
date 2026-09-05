@@ -74,6 +74,17 @@ pub enum AppsCmd {
         /// Capabilities, comma-separated (e.g. `room,chat.send,storage`).
         #[arg(long, value_delimiter = ',')]
         capabilities: Vec<String>,
+        /// One paragraph: what this app is. Shown on the store page and by the
+        /// launch surfaces. Pass `""` to clear it.
+        #[arg(long)]
+        description: Option<String>,
+        /// A preview image — repeat for more. Give a LOCAL IMAGE PATH (uploaded
+        /// for you) or an id you already uploaded. The share card crops the
+        /// first one to 5:4, so lead with the shot you want people to see.
+        /// Passing none leaves the registered set alone; `--screenshot ""`
+        /// clears it.
+        #[arg(long = "screenshot")]
+        screenshots: Vec<String>,
         /// Room schema as a JSON object `{"<key>":"read"|"write"}` (a `key:*`
         /// wildcard is allowed, e.g. `{"issue:*":"write"}`). Declares which room
         /// variables participants — including the bot via `mafold room` — edit.
@@ -137,6 +148,8 @@ pub async fn run(cmd: AppsCmd, base: String, token: Option<String>) -> Result<()
             name,
             icon,
             capabilities,
+            description,
+            screenshots,
             room_schema,
         } => {
             cmd_register(
@@ -145,6 +158,8 @@ pub async fn run(cmd: AppsCmd, base: String, token: Option<String>) -> Result<()
                 name,
                 icon,
                 capabilities,
+                description,
+                screenshots,
                 room_schema,
                 base,
                 token,
@@ -435,12 +450,15 @@ async fn cmd_publish(dir: &str, base: String, token: Option<String>) -> Result<(
 
 // ───────────────────────────── list ─────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_register(
     id: &str,
     url: &str,
     name: Option<String>,
     icon: Option<String>,
     capabilities: Vec<String>,
+    description: Option<String>,
+    screenshots: Vec<String>,
     room_schema: Option<String>,
     base: String,
     token: Option<String>,
@@ -463,12 +481,20 @@ async fn cmd_register(
         None => None,
     };
     let client = Client::new(base, token);
+    // Screenshots are given as local image PATHS or as ids already uploaded.
+    // Uploading them here is the difference between "add a preview" and "go run
+    // uploadFile yourself and paste the id back" — the second is the ergonomics
+    // the product refuses everywhere else.
+    let shots = upload_screenshots(&client, &screenshots).await?;
     let r = client
         .call(
             "registerWebApp",
             serde_json::json!({
                 "id": id, "url": url, "name": name, "icon": icon,
                 "capabilities": capabilities, "room": room,
+                "description": description,
+                // Absent ⇒ the server keeps what's registered; `[]` clears.
+                "screenshots": shots,
             }),
         )
         .await?;
@@ -554,6 +580,41 @@ impl AppManifest {
 /// If `icon` names a LOCAL image file (relative to the project dir) — not a
 /// lucide glyph name and not a URL/data URI — return its path. Requires the file
 /// to exist with a known image extension.
+/// `--screenshot` args → the file ids the registry stores, uploading any that
+/// are local image paths.
+///
+/// Returns `None` when nothing was passed, so the server keeps the registered
+/// set; `Some([])` for an explicit `--screenshot ""`, which clears it.
+async fn upload_screenshots(client: &Client, args: &[String]) -> Result<Option<Vec<String>>> {
+    if args.is_empty() {
+        return Ok(None);
+    }
+    let mut out = Vec::new();
+    for arg in args {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            continue;
+        }
+        let path = Path::new(arg);
+        if !path.is_file() {
+            // Not a path on disk — take it as an id the caller already has.
+            out.push(arg.to_string());
+            continue;
+        }
+        let bytes = std::fs::read(path).with_context(|| format!("reading {arg}"))?;
+        let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("screenshot.png");
+        println!("→ uploading {} ({:.1} KB) …", fname, bytes.len() as f64 / 1024.0);
+        let r = client.upload_media(bytes, fname, mime_for(fname)).await?;
+        let file_id = r["id"]
+            .as_str()
+            .context("uploadFile returned no id")?
+            .to_string();
+        println!("  screenshot: {file_id}");
+        out.push(file_id);
+    }
+    Ok(Some(out))
+}
+
 fn local_logo_path(dir: &str, icon: &str) -> Option<std::path::PathBuf> {
     if icon.starts_with("http://") || icon.starts_with("https://") || icon.starts_with("data:") {
         return None;

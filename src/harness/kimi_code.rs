@@ -51,7 +51,10 @@ impl Harness for KimiCode {
         // `effort` (Kimi has no reasoning tiers) and `ask_file` (no AskUserQuestion
         // PreToolUse hook) don't apply — accepted and ignored. `surface` likewise:
         // the bash-hook that detaches background tasks is only wired for Claude
-        // Code, so nothing here registers any.
+        // Code, so nothing here registers any. `steer_file` too: with no hook to
+        // drain it mid-turn, `can_steer()` stays false and the daemon delivers a
+        // mid-turn message as the FOLLOW-UP turn instead — never dropped, just
+        // later, and the user is told which of the two they got.
         let Turn {
             prompt,
             workdir,
@@ -62,6 +65,7 @@ impl Harness for KimiCode {
             cancel,
             system,
             ask_file: _,
+            steer_file: _,
             conv,
             surface: _,
             draft,

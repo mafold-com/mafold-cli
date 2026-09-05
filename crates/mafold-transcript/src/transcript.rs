@@ -57,6 +57,30 @@ pub type Boundary = fn(&str) -> usize;
 /// into bare card tags here (`{% html %}` → `{% mafold/html %}`).
 pub type Qualify = fn(&str) -> String;
 
+/// End-of-turn stamps the DRIVER appends after the reply is written. They are
+/// not an answer, so a tail holding nothing else is an empty message.
+const DRIVER_CARDS: [&str; 2] = ["mafold/result", "mafold/bgtasks"];
+
+/// Does `md` open any card that isn't one of [`DRIVER_CARDS`]? Used to tell a
+/// reply that answered in cards from one that merely got stamped.
+fn has_own_card(md: &str) -> bool {
+    let mut rest = md;
+    while let Some(i) = rest.find("{%") {
+        let after = &rest[i + 2..];
+        let Some(close) = after.find("%}") else { return false };
+        let inner = after[..close].trim();
+        rest = &after[close + 2..];
+        if inner.starts_with('/') {
+            continue; // a close tag names a card already counted at its open
+        }
+        let name = inner.split_whitespace().next().unwrap_or("");
+        if !name.is_empty() && !DRIVER_CARDS.contains(&name) {
+            return true;
+        }
+    }
+    false
+}
+
 fn commit_everything(buf: &str) -> usize {
     buf.len()
 }
@@ -86,6 +110,16 @@ pub struct Transcript {
     emitted: usize,
     boundary: Boundary,
     qualify: Qualify,
+    /// Per-category tool counts for the WHOLE turn — `counts` is cleared every
+    /// time a group closes, and the fold's one-line summary has to describe all
+    /// of them.
+    totals: HashMap<&'static str, usize>,
+    /// Tool steps committed this turn, across every group. The fold's step
+    /// count.
+    steps: usize,
+    /// Groups closed this turn. Below two (and with no interim narration) there
+    /// is nothing a fold would hide — see [`Transcript::finish_folded`].
+    groups: usize,
 }
 
 impl Default for Transcript {
@@ -116,6 +150,9 @@ impl Transcript {
             emitted: 0,
             boundary,
             qualify,
+            totals: HashMap::new(),
+            steps: 0,
+            groups: 0,
         }
     }
 
@@ -193,6 +230,8 @@ impl Transcript {
             &render::run_summary(&self.counts),
             &render::render_group(&self.group),
         );
+        self.groups += 1;
+        self.steps += self.group.len();
         self.full.push_str(&card);
         self.group.clear();
         // Slots are gone once committed — a result arriving after this takes
@@ -279,6 +318,14 @@ impl Transcript {
                     Advance::Quiet
                 }
             }
+            // A mid-turn correction. Lands where it arrived — after the work
+            // that had already happened, before whatever it changes — which is
+            // exactly what `push_raw` guarantees.
+            AgentEvent::Steered(text) if !text.trim().is_empty() => {
+                self.push_raw(&render::steer_line(text));
+                Advance::Immediate
+            }
+            AgentEvent::Steered(_) => Advance::Quiet,
             AgentEvent::Done { .. } => {
                 self.seal();
                 if let Some(s) = render::render(ev, &mut self.names) {
@@ -291,6 +338,7 @@ impl Transcript {
                 self.flush_text(); // narration before this group goes out first
                 if let Some(k) = render::tool_kind(ev) {
                     *self.counts.entry(k).or_insert(0) += 1;
+                    *self.totals.entry(k).or_insert(0) += 1;
                 }
                 match ev {
                     // The call takes a slot NOW — it paints this push, with its
@@ -387,6 +435,72 @@ impl Transcript {
     pub fn finish(&mut self) -> String {
         self.seal();
         render::heal_open_code(&self.full)
+    }
+
+    /// Terminal, with the turn's working trail FOLDED into one
+    /// `{% mafold/trace %}` — the finished shape of a reply for a transport that
+    /// can rewrite what it already sent (the daemon's draft snapshots).
+    ///
+    /// Everything up to and including the last tool group goes under the lid;
+    /// the closing answer, and the end-of-turn cards that come after it
+    /// (`{% mafold/bgtasks %}`, `{% mafold/result %}`), stay in the open. So a
+    /// finished reply reads as: **the answer**, plus one pill you can lift if
+    /// you want to see how it got there.
+    ///
+    /// It declines in the two cases where a lid would cost more than it saves:
+    ///
+    ///   * **Nothing to hide** — a single tool group and no interim narration is
+    ///     already one pill. Folding it just buries it one tap deeper.
+    ///   * **Nothing left over** — a turn that ends ON its tool work, with no
+    ///     closing sentence, would fold to an empty message. There it folds one
+    ///     group SHALLOWER, so the last thing that happened stays visible.
+    pub fn finish_folded(&mut self) -> String {
+        self.seal();
+        // Live shape is the fallback everywhere below, so a turn that shouldn't
+        // fold takes exactly the path it always took.
+        let plain = |s: &str| render::heal_open_code(s);
+        if self.groups == 0 {
+            return plain(&self.full);
+        }
+        // The trail ends after the last group card. Found by searching rather
+        // than by an offset recorded when the group closed: `qualify` rewrites
+        // committed content, and an offset that survives one rewrite but not the
+        // next is a panic waiting on a char boundary.
+        const CLOSE: &str = "{% /mafold/run %}";
+        let Some(i) = self.full.rfind(CLOSE) else {
+            return plain(&self.full);
+        };
+        let after_last = i + CLOSE.len();
+        let head = &self.full[..after_last];
+        let tail = &self.full[after_last..];
+        // Is there an ANSWER outside the fold? Prose counts, and so does a card
+        // the MODEL produced — a turn whose whole reply is one `{% mafold/html %}`
+        // answered in cards, not in sentences. What doesn't count is the
+        // end-of-turn bookkeeping the driver appends itself: fold everything and
+        // that stamp would be the entire message.
+        let has_answer = !render::strip_cards(tail).trim().is_empty() || has_own_card(tail);
+        let (head, tail) = if has_answer {
+            (head, tail)
+        } else {
+            // Fold one group shallower so the last thing that happened stays on
+            // screen. No earlier group → nothing worth folding, leave it alone.
+            match head.rfind("\n{% mafold/run ") {
+                Some(j) if j > 0 => (&self.full[..j], &self.full[j..]),
+                _ => return plain(&self.full),
+            }
+        };
+        // A lone group with no interim narration is already the pill this would
+        // make. (Measured on the trail alone — the answer outside it is not
+        // what the lid is for.)
+        if self.groups < 2 && render::strip_cards(head).trim().is_empty() {
+            return plain(&self.full);
+        }
+        // Healed as its own document: an unbalanced fence inside the trail must
+        // be closed INSIDE the card, or the client parses the rest of the body
+        // as code and the nested cards vanish.
+        let summary = render::run_summary(&self.totals);
+        let folded = render::trace_card(&summary, self.steps, &plain(head));
+        format!("{folded}{}", plain(tail))
     }
 }
 
@@ -671,6 +785,197 @@ mod tests {
             t.push(&AgentEvent::Image { path: std::path::PathBuf::from("/tmp/x.png") }),
             Advance::Quiet
         );
+        assert_eq!(t.content(), before);
+    }
+}
+
+/// The fold: what a FINISHED reply looks like once its working trail goes under
+/// one lid. Every case is stated against the live shape, because the fold is
+/// only ever allowed to move content — never to lose it.
+#[cfg(test)]
+mod fold_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn call(id: &str, name: &str, input: serde_json::Value) -> AgentEvent {
+        AgentEvent::ToolCall { id: id.into(), name: name.into(), input }
+    }
+    fn result(id: &str, text: &str) -> AgentEvent {
+        AgentEvent::ToolResult { id: id.into(), text: text.into() }
+    }
+    fn done() -> AgentEvent {
+        AgentEvent::Done { duration_ms: Some(1.0), cost_usd: None, tokens: Some(10) }
+    }
+
+    /// A working turn: narration, tools, narration, tools, then the answer. The
+    /// answer stays in the open; everything before it goes under the lid, in the
+    /// order it happened.
+    #[test]
+    fn the_trail_folds_and_the_answer_stays_out() {
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("Let me look at the tests.".into()));
+        t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+        t.push(&result("a", "x\ny"));
+        t.push(&AgentEvent::Text("Now running them.".into()));
+        t.push(&call("b", "Bash", json!({"command": "cargo test"})));
+        t.push(&result("b", "50 passed"));
+        t.push(&AgentEvent::Text("All 50 pass.".into()));
+        t.push(&done());
+        let md = t.finish_folded();
+
+        let open = md.find("{% mafold/trace").expect("folded");
+        let close = md.find("{% /mafold/trace %}").expect("lid closed");
+        let answer = md.find("All 50 pass").expect("answer");
+        assert!(open < close && close < answer, "answer must be outside the lid:\n{md}");
+        for hidden in ["Let me look", "Now running", "cargo test", "{% mafold/run"] {
+            let at = md.find(hidden).unwrap_or_else(|| panic!("{hidden} lost:\n{md}"));
+            assert!(at > open && at < close, "{hidden} escaped the lid:\n{md}");
+        }
+        // The end-of-turn stamp is the driver's, and it belongs after the reply.
+        assert!(md.find("{% mafold/result").expect("stamp") > answer, "{md}");
+    }
+
+    /// The pill says what the WHOLE turn did, not what its last group did.
+    #[test]
+    fn the_summary_counts_every_group() {
+        let mut t = Transcript::new();
+        t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+        t.push(&result("a", "x"));
+        t.push(&AgentEvent::Text("and then".into()));
+        t.push(&call("b", "Read", json!({"file_path": "b.rs"})));
+        t.push(&result("b", "y"));
+        t.push(&AgentEvent::Text("done".into()));
+        let md = t.finish_folded();
+        assert!(md.contains("summary=\"Read 2 files\""), "{md}");
+        assert!(md.contains("steps=\"2\""), "{md}");
+    }
+
+    /// One group and nothing said around it is ALREADY one pill. A lid over it
+    /// only buries the tools a tap deeper.
+    #[test]
+    fn a_lone_group_is_left_alone() {
+        let mut t = Transcript::new();
+        t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+        t.push(&result("a", "x"));
+        t.push(&AgentEvent::Text("Here it is.".into()));
+        t.push(&done());
+        let md = t.finish_folded();
+        assert!(!md.contains("mafold/trace"), "nothing to hide:\n{md}");
+        assert!(md.contains("{% mafold/run"), "{md}");
+    }
+
+    /// …but one group WITH interim narration in front of it does fold: the
+    /// narration is the length being complained about.
+    #[test]
+    fn a_lone_group_with_narration_folds() {
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("First I'll check the file.".into()));
+        t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+        t.push(&result("a", "x"));
+        t.push(&AgentEvent::Text("Here it is.".into()));
+        t.push(&done());
+        let md = t.finish_folded();
+        let open = md.find("{% mafold/trace").expect("folded");
+        let close = md.find("{% /mafold/trace %}").expect("lid");
+        assert!(md.find("First I'll check").unwrap() > open, "{md}");
+        assert!(md.find("Here it is").unwrap() > close, "{md}");
+    }
+
+    /// A turn that ends ON its tool work has no answer to leave outside. Folding
+    /// at the last group would produce an empty message, so it folds one group
+    /// shallower and the last thing that happened stays on screen.
+    #[test]
+    fn a_turn_that_ends_on_tools_keeps_its_last_group_visible() {
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("Fixing it.".into()));
+        t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+        t.push(&result("a", "x"));
+        t.push(&AgentEvent::Text("Now the edit.".into()));
+        t.push(&call("b", "Bash", json!({"command": "cargo test"})));
+        t.push(&result("b", "ok"));
+        t.push(&done());
+        let md = t.finish_folded();
+        let close = md.find("{% /mafold/trace %}").expect("folded");
+        assert!(md.find("cargo test").expect("last group") > close, "{md}");
+        assert!(md.find("Fixing it").expect("early narration") < close, "{md}");
+    }
+
+    /// A reply that answers in a CARD (`{% mafold/html %}`) has an answer just
+    /// as much as one that answers in sentences — the lid must not swallow it.
+    #[test]
+    fn a_card_only_answer_counts_as_an_answer() {
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("Building the chart.".into()));
+        t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+        t.push(&result("a", "x"));
+        t.push(&call("b", "Bash", json!({"command": "ls"})));
+        t.push(&result("b", "y"));
+        t.push_raw("\n{% mafold/html %}\n<p>hi</p>\n{% /mafold/html %}\n");
+        t.push(&done());
+        let md = t.finish_folded();
+        let close = md.find("{% /mafold/trace %}").expect("folded");
+        assert!(md.find("mafold/html").expect("answer card") > close, "{md}");
+        assert!(md.find("Building the chart").unwrap() < close, "{md}");
+    }
+
+    /// No tools at all → a plain reply, folded into nothing.
+    #[test]
+    fn a_toolless_turn_is_untouched() {
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("Just answering.".into()));
+        t.push(&done());
+        assert_eq!(t.finish_folded(), {
+            let mut u = Transcript::new();
+            u.push(&AgentEvent::Text("Just answering.".into()));
+            u.push(&done());
+            u.finish()
+        });
+    }
+
+    /// An unbalanced fence inside the trail is closed INSIDE the lid. Left open
+    /// it would put the rest of the card body "in code" for the client's
+    /// splitter, and every nested tool card in it would vanish.
+    #[test]
+    fn an_open_fence_is_healed_inside_the_lid() {
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("Look:\n```rust\nfn main() {}\n".into()));
+        t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+        t.push(&result("a", "x"));
+        t.push(&AgentEvent::Text("and then".into()));
+        t.push(&call("b", "Bash", json!({"command": "ls"})));
+        t.push(&result("b", "y"));
+        t.push(&AgentEvent::Text("Done.".into()));
+        let md = t.finish_folded();
+        let body = &md[md.find("{% mafold/trace").unwrap()..md.find("{% /mafold/trace %}").unwrap()];
+        assert_eq!(body.matches("```").count() % 2, 0, "fence left open inside the lid:\n{body}");
+    }
+
+    /// A mid-turn correction is transcript content: it lands where it arrived,
+    /// after the work that had already happened.
+    #[test]
+    fn a_steer_lands_in_time_order() {
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("Starting.".into()));
+        t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+        t.push(&result("a", "x"));
+        assert_eq!(t.push(&AgentEvent::Steered("no, the other file".into())), Advance::Immediate);
+        t.push(&call("b", "Read", json!({"file_path": "b.rs"})));
+        t.push(&result("b", "y"));
+        t.push(&AgentEvent::Text("Got it.".into()));
+        let md = t.finish();
+        let first = md.find("a.rs").expect("first read");
+        let steer = md.find("no, the other file").expect("steer");
+        let second = md.find("b.rs").expect("second read");
+        assert!(first < steer && steer < second, "{md}");
+    }
+
+    /// An empty steer says nothing and must not punch a hole in the narration.
+    #[test]
+    fn an_empty_steer_is_a_no_op() {
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("Working.".into()));
+        let before = t.content().to_string();
+        assert_eq!(t.push(&AgentEvent::Steered("   ".into())), Advance::Quiet);
         assert_eq!(t.content(), before);
     }
 }

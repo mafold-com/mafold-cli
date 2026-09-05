@@ -316,6 +316,11 @@ pub struct Conversation {
     /// `skip_serializing_if`, so the client treats absence as zero.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub unread_count: u32,
+    /// Someone @-mentioned the requester inside that unread. The badge then
+    /// reads `@` instead of a number — which of them is talking to you outranks
+    /// how many. Same walk as `unread_count`, so it obeys the same read marker.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unread_mention: bool,
     /// Group avatar (None for direct chats — clients use the peer's avatar).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar: Option<FileRef>,
@@ -492,6 +497,10 @@ pub struct Channel {
     /// Per-requester unread badge, computed at list time (like a dialog row).
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub unread_count: u32,
+    /// Someone @-mentioned the requester inside that unread — the badge reads
+    /// `@` instead of a number. Computed in the same walk as `unread_count`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unread_mention: bool,
     /// Most recent message in this channel, computed at list time for the
     /// channel-list preview. Not stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]

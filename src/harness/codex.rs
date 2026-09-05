@@ -50,6 +50,10 @@ impl Harness for Codex {
         // budget; no AskUserQuestion tool / PreToolUse hook) — accepted and
         // ignored. `surface` likewise: the bash-hook that detaches background
         // tasks is only wired for Claude Code, so nothing here registers any.
+        // `steer_file` too: with no hook to drain it mid-turn, `can_steer()`
+        // stays false and the daemon delivers a mid-turn message as the
+        // FOLLOW-UP turn instead — never dropped, just later, and the user is
+        // told which of the two they got.
         let Turn {
             prompt,
             workdir,
@@ -60,6 +64,7 @@ impl Harness for Codex {
             cancel,
             system,
             ask_file: _,
+            steer_file: _,
             conv,
             surface: _,
             draft,
@@ -141,37 +146,67 @@ fn is_stale_thread(e: &anyhow::Error) -> bool {
     s.contains("thread/resume") || s.contains("no rollout found")
 }
 
+/// The `codex exec` argv for one turn — everything EXCEPT the prompt, which is
+/// fed on stdin. That is what the trailing `-` means: both `codex exec [PROMPT]`
+/// and `codex exec resume <ID> [PROMPT]` document it as "read the instructions
+/// from stdin".
+///
+/// **No argument here may ever contain a newline**, which is why the prompt isn't
+/// one. It is always multi-line (the mafold preamble is joined to the message
+/// with `\n\n---\n\n`) and it grows without bound (it carries the conversation) —
+/// the two things Windows refuses to spawn:
+/// - an npm-installed codex is `%APPDATA%\npm\codex.cmd`, a BATCH FILE, and since
+///   the BatBadBut fix (CVE-2024-24576) Rust's std refuses to spawn one with any
+///   argument containing `\r` or `\n`: `InvalidInput: batch file arguments are
+///   invalid`. On argv, every Codex turn on a stock Windows install therefore
+///   died before the process even started — and the error named nothing an owner
+///   could act on. (Reported from the field; see the test below.)
+/// - a command line is hard-capped at 32,767 UTF-16 units, so a long enough chat
+///   makes `CreateProcessW` refuse the spawn outright (os error 206).
+///
+/// Both disappear when the prompt is stdin; Claude Code's harness feeds its own
+/// prompt that way for the same reasons.
+fn exec_args(session: Option<&str>, model: Option<&str>, effort: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = vec!["exec".into()];
+    // Resume the conversation's Codex thread for context. The subcommand form
+    // is `codex exec resume <THREAD_ID> [options] [prompt]`; options and the
+    // prompt still parse after it.
+    if let Some(sid) = session {
+        args.push("resume".into());
+        args.push(sid.into());
+    }
+    args.push("--json".into());
+    // The daemon already gates WHO can drive the bot (allow-list), exactly as it
+    // does for Claude Code's `--dangerously-skip-permissions`. So run Codex with
+    // full autonomy — no approval prompts (which would hang a headless run), no
+    // sandbox.
+    args.push("--dangerously-bypass-approvals-and-sandbox".into());
+    // Bot workdirs aren't necessarily git repos; Codex otherwise refuses.
+    args.push("--skip-git-repo-check".into());
+    if let Some(m) = model {
+        args.push("--model".into());
+        args.push(m.into());
+    }
+    // Reasoning effort (owner-set via Customization) → Codex's config key.
+    // Codex supports minimal/low/medium/high; the higher mafold tiers clamp to
+    // high. No mapping = Codex's own default.
+    if let Some(eff) = effort.and_then(map_effort) {
+        args.push("-c".into());
+        args.push(format!("model_reasoning_effort=\"{eff}\""));
+    }
+    // `--` stops flag parsing so the `-` after it is read as the prompt argument.
+    args.push("--".into());
+    args.push("-".into());
+    args
+}
+
 /// One `codex exec` invocation (optionally resuming `session`), streaming
 /// normalized events into the sink.
 async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcome> {
     let RunParams { full_prompt, workdir, model, effort, conv, draft, cancel, sink } = *p;
 
     let mut cmd = tokio::process::Command::new(super::program("codex"));
-        cmd.arg("exec");
-        // Resume the conversation's Codex thread for context. The subcommand form
-        // is `codex exec resume <THREAD_ID> [options] [prompt]`; options and the
-        // prompt still parse after it.
-        if let Some(sid) = session {
-            cmd.arg("resume").arg(sid);
-        }
-        cmd.arg("--json")
-            // The daemon already gates WHO can drive the bot (allow-list), exactly
-            // as it does for Claude Code's `--dangerously-skip-permissions`. So run
-            // Codex with full autonomy — no approval prompts (which would hang a
-            // headless run), no sandbox.
-            .arg("--dangerously-bypass-approvals-and-sandbox")
-            // Bot workdirs aren't necessarily git repos; Codex otherwise refuses.
-            .arg("--skip-git-repo-check");
-        if let Some(m) = model {
-            cmd.arg("--model").arg(m);
-        }
-        // Reasoning effort (owner-set via Customization) → Codex's config key.
-        // Codex supports minimal/low/medium/high; the higher mafold tiers clamp to
-        // high. No mapping = Codex's own default.
-        if let Some(eff) = effort.and_then(map_effort) {
-            cmd.arg("-c")
-                .arg(format!("model_reasoning_effort=\"{eff}\""));
-        }
+        cmd.args(exec_args(session, model, effort));
         // Export the current conversation so `mafold room …` targets THIS room
         // (harmless for Codex, which has no room skill today — kept for parity).
         cmd.env("MAFOLD_CONV", conv);
@@ -179,20 +214,16 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
         // media on it. Codex's own generated images are swept up automatically
         // (see ImageSweep); this is the door for everything else it draws.
         cmd.env("MAFOLD_DRAFT", draft);
-        // `--` stops flag parsing so a prompt starting with `-` is taken literally.
-        cmd.arg("--").arg(full_prompt);
         cmd.kill_on_drop(true);
         // Don't let the console child flash a window (the agent runs detached).
         crate::platform::no_window(&mut cmd);
 
         let mut child = cmd
             .current_dir(workdir)
-            // NULL stdin is REQUIRED: with a prompt argument AND a piped (non-tty)
-            // stdin, `codex exec` still tries to read stdin to append it as a
-            // `<stdin>` block, and blocks forever if it never closes — hanging the
-            // whole turn. /dev/null gives it immediate EOF. (Claude Code takes its
-            // prompt via `-p` and doesn't do this.)
-            .stdin(Stdio::null())
+            // PIPED, never null or inherited: the prompt goes in HERE — `exec_args`
+            // ends with the `-` that tells codex to read it from stdin, and nothing
+            // else on the command line ever wants stdin.
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -201,6 +232,20 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
         // exactly THIS process (see harness::live_children) — same contract as
         // the Claude harness; RAII deregisters on every exit path.
         let _child_guard = crate::harness::ChildGuard::new(child.id());
+
+        // Feed the prompt in its OWN task (same shape as the Claude harness): a
+        // prompt past the pipe buffer (~64KB — and this one holds the conversation)
+        // would otherwise block us here while codex is blocked writing stdout that
+        // nobody is reading yet. Dropping the handle closes stdin, which is the EOF
+        // the `-` waits for.
+        if let Some(mut si) = child.stdin.take() {
+            let prompt = full_prompt.to_string();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let _ = si.write_all(prompt.as_bytes()).await;
+                let _ = si.shutdown().await;
+            });
+        }
 
         let stdout = child.stdout.take().context("no stdout")?;
         let mut lines = BufReader::new(stdout).lines();
@@ -658,6 +703,56 @@ fn auth_mode() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The invariant that keeps this harness alive on Windows: the prompt rides
+    /// stdin (argv ends with `--` `-`), and nothing on the command line carries a
+    /// newline — see [`exec_args`]. Resume path included: it takes the same
+    /// trailing prompt argument.
+    #[test]
+    fn the_prompt_never_rides_argv() {
+        for session in [None, Some("01a06b89-3f5e-7e21-b3dc-f0a9c61ffb73")] {
+            let args = exec_args(session, Some("gpt-5-codex"), Some("xhigh"));
+            assert!(
+                !args.iter().any(|a| a.contains('\n') || a.contains('\r')),
+                "a newline in argv is unspawnable against a .cmd: {args:?}"
+            );
+            assert_eq!(args.last().unwrap(), "-", "prompt must come from stdin: {args:?}");
+            assert_eq!(args[args.len() - 2], "--", "{args:?}");
+        }
+    }
+
+    /// The field regression, hermetically: an npm-installed codex is a BATCH FILE
+    /// (`%APPDATA%\npm\codex.cmd`), and Rust's std refuses to spawn one with an
+    /// argument containing a newline. With the prompt on argv this exact spawn
+    /// failed with `batch file arguments are invalid` — no process, no turn, on
+    /// every stock Windows install. It must stay spawnable.
+    #[cfg(windows)]
+    #[test]
+    fn a_batch_file_codex_is_still_spawnable() {
+        let dir = std::env::temp_dir().join(format!("mafold-batspawn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bat = dir.join("codex.cmd");
+        // Echoes its own argv back, so this also covers the quoting cmd.exe does
+        // to `-c model_reasoning_effort="high"` on the way through.
+        std::fs::write(&bat, "@echo off\r\necho %*\r\n").unwrap();
+
+        let out = std::process::Command::new(&bat)
+            .args(exec_args(None, None, Some("high")))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut ch| {
+                use std::io::Write;
+                // The shape of a real prompt: preamble + separator + message.
+                ch.stdin.take().unwrap().write_all(b"You are a bot.\n\n---\n\nhi")?;
+                ch.wait_with_output()
+            })
+            .expect("a .cmd codex must still spawn");
+        let echoed = String::from_utf8_lossy(&out.stdout);
+        assert!(echoed.contains("--json"), "argv mangled: {echoed}");
+        assert!(echoed.contains("model_reasoning_effort"), "argv mangled: {echoed}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn effort_mapping() {

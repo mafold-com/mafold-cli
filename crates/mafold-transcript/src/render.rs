@@ -72,6 +72,9 @@ pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<St
         // Not rendered as new content — the render loop stamps it into the
         // already-emitted ask card via `stamp_ask_answered`.
         AgentEvent::AskAnswered(_) => None,
+        // A seam, not a card: [`steer_line`], spliced by the transcript so it
+        // lands after the group it interrupted rather than inside it.
+        AgentEvent::Steered(text) => Some(steer_line(text)),
     }
 }
 
@@ -198,6 +201,43 @@ pub fn run_summary(counts: &HashMap<&'static str, usize>) -> String {
 /// so it is NOT escaped; each primitive escapes its own body.
 pub fn run_card(summary: &str, body: &str) -> String {
     format!("\n{{% mafold/run summary=\"{}\" %}}\n{}{{% /mafold/run %}}\n", attr_esc(summary), body)
+}
+
+/// Wrap a finished turn's WORKING TRAIL — every interim sentence and every
+/// `{% mafold/run %}` group that came before the answer — in one collapsible
+/// `{% mafold/trace %}`.
+///
+/// Live, a turn SHOULD read as it happens: that's what the run groups and the
+/// narration between them are for. Finished, that same trail is the least
+/// interesting part of the message and it is the longest — a reply whose answer
+/// is four lines arrives twenty screens tall, and the answer is at the bottom.
+/// So the trail stays exactly as it was rendered and gets one lid put on it;
+/// nothing is summarised away and nothing is dropped.
+///
+/// `body` is already valid markdoc (narration + nested cards) and is NOT escaped
+/// — each card inside escaped its own. Only a literal `{% /mafold/trace %}` is
+/// neutralised, so quoted material can never lift the lid off early.
+pub fn trace_card(summary: &str, steps: usize, body: &str) -> String {
+    let body = if body.contains("/mafold/trace") {
+        body.replace("{% /mafold/trace %}", "{ % /mafold/trace % }")
+    } else {
+        body.to_string()
+    };
+    format!(
+        "\n{{% mafold/trace summary=\"{}\" steps=\"{steps}\" %}}\n{}{{% /mafold/trace %}}\n",
+        attr_esc(summary),
+        if body.ends_with('\n') { body } else { format!("{body}\n") },
+    )
+}
+
+/// The user spoke mid-turn and the driver steered with it → a one-line marker in
+/// the transcript, in time order.
+///
+/// Deliberately not a card: it is a seam in the narration, and the reply already
+/// carries their words in their own bubble above. One line that says WHERE the
+/// correction entered is the whole job.
+pub fn steer_line(text: &str) -> String {
+    format!("\n> ↩︎ {}\n", line_esc(text))
 }
 
 /// One atomic step in a run group: a tool CALL and, once it lands, its RESULT.

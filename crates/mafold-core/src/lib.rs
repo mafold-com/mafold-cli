@@ -183,6 +183,13 @@ pub struct CoreConversation {
     /// pill + channel management survive a reload. serde-default → old cached
     /// rows deserialize fine; uniffi defaults keep generated Swift/C#
     /// constructors source-compatible for callers that predate forums.
+    /// Someone @-mentioned me inside that unread — the row's badge reads `@`
+    /// rather than a number. Carried through the cache for the same reason the
+    /// forum flags are: a field the cache drops is a badge that renders wrong
+    /// on every reload until the network answers.
+    #[serde(default)]
+    #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = false))]
+    pub unread_mention: bool,
     #[serde(default)]
     #[cfg_attr(not(target_arch = "wasm32"), uniffi(default = false))]
     pub is_forum: bool,
@@ -1019,7 +1026,7 @@ mod tests {
         core.upsert_conversation(CoreConversation {
             id: "c1".into(), kind: "direct".into(), title: None,
             participants: vec![acct("alice"), acct("bob")],
-            updated_at_ms: 100, unread_count: 2, last_message: None, is_forum: false, forum_member_channels: false,
+            updated_at_ms: 100, unread_count: 2, unread_mention: false, last_message: None, is_forum: false, forum_member_channels: false,
             member_add_members: false, member_edit_info: false, member_add_bots: false,
         }).unwrap();
         core.upsert_message(CoreMessage {
@@ -1051,7 +1058,7 @@ mod tests {
         let core = MafoldCore::open(":memory:".into()).unwrap();
         let c = |id: &str, ts: i64| CoreConversation {
             id: id.into(), kind: "direct".into(), title: None,
-            participants: vec![acct("me"), acct(id)], updated_at_ms: ts, unread_count: 0, last_message: None, is_forum: false, forum_member_channels: false,
+            participants: vec![acct("me"), acct(id)], updated_at_ms: ts, unread_count: 0, unread_mention: false, last_message: None, is_forum: false, forum_member_channels: false,
             member_add_members: false, member_edit_info: false, member_add_bots: false,
         };
         core.replace_conversations(vec![c("a", 1), c("b", 2)]).unwrap();
@@ -1308,7 +1315,7 @@ mod tests {
         };
         core.upsert_conversation(CoreConversation {
             id: "c".into(), kind: "group".into(), title: None,
-            participants: vec![acct("me"), acct("bot")], updated_at_ms: 0, unread_count: 0, last_message: None, is_forum: false, forum_member_channels: false,
+            participants: vec![acct("me"), acct("bot")], updated_at_ms: 0, unread_count: 0, unread_mention: false, last_message: None, is_forum: false, forum_member_channels: false,
             member_add_members: false, member_edit_info: false, member_add_bots: false,
         }).unwrap();
 

@@ -49,6 +49,8 @@ struct ConvMeta {
     title: Option<String>,
     updated_at_ms: i64,
     unread_count: u32,
+    #[serde(default)]
+    unread_mention: bool,
     participants: Vec<CoreAccount>,
     #[serde(default)]
     is_forum: bool,
@@ -396,6 +398,7 @@ impl<S: Storage> Store<S> {
             title: c.title.clone(),
             updated_at_ms: c.updated_at_ms,
             unread_count: c.unread_count,
+            unread_mention: c.unread_mention,
             participants: c.participants.clone(),
             is_forum: c.is_forum,
             forum_member_channels: c.forum_member_channels,
@@ -523,6 +526,7 @@ impl<S: Storage> Store<S> {
                 participants: meta.participants,
                 updated_at_ms: meta.updated_at_ms,
                 unread_count: meta.unread_count,
+                unread_mention: meta.unread_mention,
                 is_forum: meta.is_forum,
                 forum_member_channels: meta.forum_member_channels,
                 member_add_members: meta.member_add_members,
@@ -787,6 +791,7 @@ mod tests {
             s.upsert_conversation(&crate::CoreConversation {
                 id: "convP".into(), kind: "direct".into(), title: None,
                 participants: vec![acct()], updated_at_ms: 0, unread_count: 0,
+                unread_mention: false,
                 last_message: None, is_forum: false, forum_member_channels: false,
                 member_add_members: false, member_edit_info: false, member_add_bots: false,
             }).await;

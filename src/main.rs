@@ -25,6 +25,7 @@ mod langpack;
 mod platform;
 mod room;
 mod session;
+mod steer_hook;
 mod supervisor;
 mod update;
 mod vault;
@@ -208,6 +209,11 @@ enum Cmd {
     /// (claude kills its background shells at exit). Not for humans.
     #[command(hide = true)]
     BashHook,
+    /// (internal) PostToolUse hook claude runs after every tool — delivers what
+    /// the user said mid-turn, so a long run can be corrected instead of killed.
+    /// Not for humans.
+    #[command(hide = true)]
+    SteerHook,
 }
 
 #[tokio::main]
@@ -229,6 +235,9 @@ async fn main() -> Result<()> {
     }
     if matches!(cli.cmd, Cmd::BashHook) {
         return bash_hook::run();
+    }
+    if matches!(cli.cmd, Cmd::SteerHook) {
+        return steer_hook::run();
     }
 
     // Daemon control + self-update need no auth.
@@ -390,7 +399,8 @@ async fn main() -> Result<()> {
         | Cmd::Apps { .. } | Cmd::Room { .. } | Cmd::Connection { .. }
         | Cmd::Langpack { .. } | Cmd::Login { .. } | Cmd::Report
         | Cmd::Up | Cmd::Down { .. } | Cmd::Logs { .. } | Cmd::Rm { .. }
-        | Cmd::Rollback | Cmd::Supervise { .. } | Cmd::AskHook | Cmd::BashHook => unreachable!(),
+        | Cmd::Rollback | Cmd::Supervise { .. } | Cmd::AskHook | Cmd::BashHook
+        | Cmd::SteerHook => unreachable!(),
     }
     Ok(())
 }
@@ -638,10 +648,23 @@ async fn chats(client: &Client) -> Result<()> {
 async fn attach(client: &Client, files: &[String], message: Option<&str>) -> Result<()> {
     let msg = match message {
         Some(m) => m.to_string(),
-        None => std::env::var("MAFOLD_DRAFT").ok().filter(|s| !s.is_empty()).context(
-            "no message to attach to — run this inside an agent turn (the daemon sets \
-             MAFOLD_DRAFT), or pass --message <id>",
-        )?,
+        None => {
+            let env_id = std::env::var("MAFOLD_DRAFT").ok().filter(|s| !s.is_empty()).context(
+                "no message to attach to — run this inside an agent turn (the daemon sets \
+                 MAFOLD_DRAFT), or pass --message <id>",
+            )?;
+            // The reply may have MOVED since this process was spawned: a turn
+            // that gets steered re-opens its draft below the message that
+            // steered it, and our env still names the discarded one. The daemon
+            // leaves a forwarding address keyed by the original id
+            // (`agent::draft_ptr_path`); without following it, a picture the
+            // agent just made would be hung on a draft that no longer exists.
+            std::fs::read_to_string(agent::draft_ptr_path(&env_id))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(env_id)
+        }
     };
     for f in files {
         let path = std::path::Path::new(f);
