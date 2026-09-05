@@ -6,7 +6,7 @@
 //! the next onboarding step. `mafold install` with no argument lists the
 //! runtimes + their install state. The web New-Bot modal's one-click install
 //! rides this too: the supervisor claims a queued install (`claimProvisions`
-//! → `installs`) and calls [`run`] with `yes = true`. @mafold:ai teaches this
+//! → `installs`) and calls [`run`] with `yes = true`. @mafold teaches this
 //! command in-app, so keep behaviour aligned with the product guide
 //! (mafold-api brains/prompts.rs) and the api's `INSTALLABLE_RUNTIMES`.
 

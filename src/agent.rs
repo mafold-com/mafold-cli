@@ -719,6 +719,59 @@ fn mentions_me(text: &str, my_username: &str) -> bool {
     false
 }
 
+/// The frames a turn can be triggered by, and the message each one carries.
+/// `messageNew` carries it at `params`; `threadReply` nests it under
+/// `params.message`; `messageComplete` carries it at `params` — the FINISHED
+/// version of a streamed reply.
+///
+/// `messageComplete` is here because a streamed reply is born empty: the api
+/// broadcasts `messageNew` the instant a bot opens its draft (`content: ""`,
+/// `bot_create_draft`), the text arrives as `messageDraft` snapshots nobody here
+/// subscribes to, and the finished message — the only version that can contain
+/// an `@` — comes back as `messageComplete` (`bot_finalize`). Without this arm
+/// no bot could ever be summoned by another bot's reply: the draft-open frame
+/// died in the empty-content skip and the finish was never looked at. Found in
+/// the field 2026-09-05: @opsdu:codex ended a reply with `@linsky:opus48 …` and
+/// opus48 (online, allow-listed) never answered; opus48 then ended its reply
+/// with `@opsdu:codex …` and codex never answered either.
+///
+/// Nothing is delivered twice: a human's message is finalized at send time and
+/// never produces a `messageComplete`; a bot's draft-open is dropped as empty
+/// and its finish is judged once (the message-id dedup below is the backstop).
+fn trigger_message(method: &str, env: &serde_json::Value) -> Option<serde_json::Value> {
+    match method {
+        "events.messageNew" | "events.messageComplete" => Some(env["params"].clone()),
+        "events.threadReply" => Some(env["params"]["message"].clone()),
+        _ => None,
+    }
+}
+
+/// Frames the daemon must never lose: replayed after a reconnect gap and pinned
+/// to disk the moment they are consumed. The `trigger_message` shapes plus
+/// `chatCleared`. A stale inline query / probe / push job is deliberately NOT
+/// here — replaying those re-fires their side effects. ONE list: the replay
+/// filter and the cursor pin used to carry their own copies of it, and a copy
+/// is how `messageComplete` would have gone missing from one of them.
+fn is_durable_event(method: &str) -> bool {
+    matches!(
+        method,
+        "events.messageNew" | "events.threadReply" | "events.messageComplete" | "events.chatCleared"
+    )
+}
+
+/// Does this message take the AI door — `should_respond`'s explicit-@-only
+/// branch, no reply-to / always-on / DM-answers-everything, no gate card? A
+/// bot-kind sender does. So does ANY message that arrived as a finished stream
+/// (`messageComplete`): humans never open drafts, so a finish is machine-
+/// authored by construction, whatever the author's account kind says. That is
+/// the brain-backed human-kind accounts (@claude, the official-AI matrix
+/// account) — their replies must not be able to drive an always-on bot the way
+/// a person's words do. The api applies the same rule on its side
+/// (`fire_bots_on_finish`), so a finish is judged alike on both bot families.
+fn machine_authored(sender_kind: &str, via_finish: bool) -> bool {
+    via_finish || sender_kind.eq_ignore_ascii_case("bot")
+}
+
 /// Did THIS sender address the bot in THIS message? An `@handle` in the words the
 /// sender actually typed — never one quoted out of somebody else's transcript.
 /// A forward says so two different ways and both have to count: the wire flag
@@ -1178,6 +1231,32 @@ fn mark_intro(my_username: &str, key: &str) {
     }
 }
 
+/// Intro keys with a turn IN FLIGHT right now (`boot`, or a conversation id).
+///
+/// The persisted mark above cannot do this job alone, and that gap IS the bug:
+/// the mark lands when the intro TURN lands, and an intro turn takes a minute
+/// (it goes and reads the working directory before it writes a word). Every
+/// reconnect inside that minute read an unmarked key and armed another one — so
+/// on a link that drops and comes back in 2s (a proxy cutting long streams is
+/// enough) the owner got the same report three, four times in a row.
+///
+/// So: claim the key BEFORE spawning, and release it only if the turn FAILED —
+/// a failed introduction retrying on the next connect is deliberate. Lives
+/// outside the reconnect loop for the same reason `seen` does: the duplicates it
+/// exists to stop arrive on the NEXT connection.
+type IntrosLive = Arc<Mutex<HashSet<String>>>;
+
+/// Claim `key` for an intro turn about to be spawned. False = one is already in
+/// flight (or already landed) in this process, so stay quiet.
+async fn claim_intro(live: &IntrosLive, key: &str) -> bool {
+    live.lock().await.insert(key.to_string())
+}
+
+/// A claimed intro that never landed — let the next connect try it again.
+async fn release_intro(live: &IntrosLive, key: &str) {
+    live.lock().await.remove(key);
+}
+
 /// What the owner's `greeting` field says about introducing yourself.
 enum Greeting {
     /// Unset — introduce yourself the standard way.
@@ -1490,8 +1569,12 @@ pub async fn run(client: Client, workdir: Option<String>, harness_id: String, au
     // reconnect-replay duplicates it exists to stop arrive on the NEXT
     // connection, so a per-connection set would forget exactly when it matters.
     let mut seen = RecentSet::new(512);
+    // Introductions in flight — outside the loop for the same reason as `seen`:
+    // an intro turn outlives the connection that armed it, and the reconnect it
+    // has to survive is precisely the one that used to arm a second copy.
+    let intros_live: IntrosLive = Default::default();
     loop {
-        match connect_and_run(&client, &workdir, &my_username, &sessions, &workdirs, &coord, &chat_states, &harness, &owner, &allow, auto_update, &mut seen).await {
+        match connect_and_run(&client, &workdir, &my_username, &sessions, &workdirs, &coord, &chat_states, &harness, &owner, &allow, auto_update, &mut seen, &intros_live).await {
             Ok(WsExit::Deprovisioned) => deprovision_and_exit(&my_username, &client.token, "bot deleted server-side"),
             Ok(WsExit::AuthRejected) => {
                 auth_rejects += 1;
@@ -2042,6 +2125,7 @@ fn arm_boot_intro(
     coord: Arc<ExecCoord>,
     chat_states: ChatStates,
     owner: Arc<RwLock<OwnerConfig>>,
+    live: IntrosLive,
 ) {
     tokio::spawn(async move {
         // The DM may not exist yet (a freshly created bot has never been
@@ -2050,6 +2134,7 @@ fn arm_boot_intro(
             Ok(id) => id,
             Err(e) => {
                 eprintln!("intro: couldn't open the owner DM with @{owner_username} ({e:#}) — will retry on the next connect");
+                release_intro(&live, "boot").await;
                 return;
             }
         };
@@ -2101,7 +2186,10 @@ fn arm_boot_intro(
                 mark_intro(&my_username, "boot");
                 println!("✓ first-boot introduction delivered to @{owner_username}");
             }
-            Err(e) => eprintln!("intro: first-boot report failed ({e:#}) — retrying on the next connect"),
+            Err(e) => {
+                eprintln!("intro: first-boot report failed ({e:#}) — retrying on the next connect");
+                release_intro(&live, "boot").await;
+            }
         }
     });
 }
@@ -2139,6 +2227,9 @@ async fn connect_and_run(
     auto_update: bool,
     // Cross-connection duplicate-delivery memory (see the guard below).
     seen: &mut RecentSet,
+    // Introductions already in flight — also cross-connection, and for the same
+    // reason: the duplicate arrives on the NEXT connect (see `IntrosLive`).
+    intros_live: &IntrosLive,
 ) -> Result<WsExit> {
     use tokio_tungstenite::tungstenite;
     // Bounded handshake: the connect path has no timeout of its own, so a
@@ -2211,11 +2302,17 @@ async fn connect_and_run(
         drop(oc);
         match (quiet, allow.read().await.owner.clone()) {
             (true, _) => println!("intro: greeting is off — skipping the first-boot report"),
-            (false, Some(owner_username)) => arm_boot_intro(
-                client.clone(), workdir.to_string(), my_username.to_string(), owner_username,
-                harness.clone(), card_tags.clone(), sessions.clone(), workdirs.clone(),
-                coord.clone(), chat_states.clone(), owner.clone(),
-            ),
+            // Claimed BEFORE arming (see `IntrosLive`): the mark below only
+            // lands when the turn does, so without this every reconnect during
+            // that minute armed another copy of the same report.
+            (false, Some(owner_username)) if claim_intro(intros_live, "boot").await => {
+                arm_boot_intro(
+                    client.clone(), workdir.to_string(), my_username.to_string(), owner_username,
+                    harness.clone(), card_tags.clone(), sessions.clone(), workdirs.clone(),
+                    coord.clone(), chat_states.clone(), owner.clone(), intros_live.clone(),
+                )
+            }
+            (false, Some(_)) => println!("intro: the first-boot report is already in flight — not arming a second"),
             // Ownerless bot: nobody to report to, and no DM to report in.
             (false, None) => println!("intro: no owner resolved — skipping the first-boot report"),
         }
@@ -2258,9 +2355,9 @@ async fn connect_and_run(
                 match serde_json::from_str(&text) { Ok(v) => v, Err(_) => continue }
             }
         };
-        // React to new top-level messages AND thread replies (so the bot can be
-        // @-mentioned inside a thread). `messageNew` carries the message at
-        // `params`; `threadReply` nests it under `params.message`.
+        // React to new top-level messages, thread replies (so the bot can be
+        // @-mentioned inside a thread) AND finished streams (so another bot's
+        // reply can @-mention it) — `trigger_message` has the three shapes.
         let method = env.get("method").and_then(|m| m.as_str()).unwrap_or("");
         // ── Reconnect catch-up ───────────────────────────────────────────
         // hello carries the server's head seq. Behind it → fetch the gap and
@@ -2279,15 +2376,12 @@ async fn connect_and_run(
             } else if last_seq < head {
                 match client.get_updates(last_seq).await {
                     Ok(items) => {
-                        // Replay message-bearing events (+ chatCleared) only:
-                        // a stale inline query / probe / push job must not
-                        // re-fire its side effects.
+                        // Replay message-bearing events (+ chatCleared) only
+                        // (`is_durable_event`): a stale inline query / probe /
+                        // push job must not re-fire its side effects.
                         let items: Vec<_> = items
                             .into_iter()
-                            .filter(|u| matches!(
-                                u["method"].as_str().unwrap_or(""),
-                                "events.messageNew" | "events.threadReply" | "events.chatCleared"
-                            ))
+                            .filter(|u| is_durable_event(u["method"].as_str().unwrap_or("")))
                             .collect();
                         if !items.is_empty() {
                             println!("↻ catch-up: replaying {} missed event(s) (seq {last_seq} → {head})", items.len());
@@ -2318,10 +2412,7 @@ async fn connect_and_run(
             // milliseconds between = message lost" for "consumed frames never
             // replay" — the second failure is the one seen in the field.
             // Non-message frames keep the 2s throttle.
-            let pin_now = matches!(
-                method,
-                "events.messageNew" | "events.threadReply" | "events.chatCleared"
-            );
+            let pin_now = is_durable_event(method);
             if pin_now || last_cursor_save.elapsed() >= Duration::from_secs(2) {
                 save_cursor(my_username, last_seq);
                 last_cursor_save = std::time::Instant::now();
@@ -2492,11 +2583,10 @@ async fn connect_and_run(
             }
             continue;
         }
-        let raw_msg = match method {
-            "events.messageNew" => env["params"].clone(),
-            "events.threadReply" => env["params"]["message"].clone(),
-            _ => continue,
-        };
+        let Some(raw_msg) = trigger_message(method, &env) else { continue };
+        // A finished stream is machine-authored whatever the account kind says
+        // — see `machine_authored`.
+        let via_finish = method == "events.messageComplete";
         let m: IncomingMessage = match serde_json::from_value(raw_msg) { Ok(m) => m, Err(_) => continue };
         // SERVICE NOTICE — "X joined", "bot Y was added", "renamed to Z". Never
         // a prompt (it always falls through to `continue` below), but the one
@@ -2543,12 +2633,21 @@ async fn connect_and_run(
                     println!("← re-added to {chat_id} (already introduced myself here → staying quiet)");
                     continue;
                 }
+                // Same claim as the boot report, and needed for the same reason
+                // twice over: the mark lands only when the turn does, AND this
+                // notice is exactly the kind of event the catch-up replay hands
+                // us again after a reconnect.
+                if !claim_intro(intros_live, &chat_id).await {
+                    println!("← added to {chat_id} (an introduction is already in flight → staying quiet)");
+                    continue;
+                }
                 println!("← added to {chat_id} → introducing myself");
                 let arrived_at_creation = kind == "group_created";
                 let (client, workdir, me) = (client.clone(), workdir.to_string(), my_username.to_string());
                 let (harness, card_tags) = (harness.clone(), card_tags.clone());
                 let (sessions, workdirs) = (sessions.clone(), workdirs.clone());
                 let (coord, chat_states, owner) = (coord.clone(), chat_states.clone(), owner.clone());
+                let live = intros_live.clone();
                 let owner_username = allow.read().await.owner.clone().unwrap_or_else(|| me.clone());
                 tokio::spawn(async move {
                     // Let the room settle. The notice fires the instant the add
@@ -2631,7 +2730,10 @@ async fn connect_and_run(
                             mark_intro(&me, &chat_id);
                             println!("✓ introduced myself in {chat_id}");
                         }
-                        Err(e) => eprintln!("intro: introduction in {chat_id} failed ({e:#})"),
+                        Err(e) => {
+                            eprintln!("intro: introduction in {chat_id} failed ({e:#})");
+                            release_intro(&live, &chat_id).await;
+                        }
                     }
                 });
             }
@@ -2644,10 +2746,12 @@ async fn connect_and_run(
             continue;
         }
         // Skip truly empty messages — but an image-only message (empty text +
-        // attachments) is real, so keep it.
+        // attachments) is real, so keep it. A bot's draft-open (`messageNew`
+        // with `content: ""`) dies here on purpose: its finished text arrives
+        // as `messageComplete` and is judged then (`trigger_message`).
         if m.content.trim().is_empty() && m.attachments.is_empty() { continue; }
 
-        let sender_is_bot = m.sender.kind.eq_ignore_ascii_case("bot");
+        let sender_is_bot = machine_authored(&m.sender.kind, via_finish);
         let sender_lc = m.sender.username.trim().to_lowercase();
         // Relayed, not authored. Read once here because THREE doors below must
         // agree about it: the access gate, the `/command` dispatch, the reply
@@ -6277,9 +6381,9 @@ mod customize_seed_tests {
 #[cfg(test)]
 mod gate_tests {
     use super::{
-        directed_at_me, mentions_me, resolve_turn_workdir, sanitize_attachment_name,
-        should_respond, slash_command, strip_body_records, turn_session_key, AllowList,
-        ChatStates, ConvGate,
+        directed_at_me, is_durable_event, machine_authored, mentions_me, resolve_turn_workdir,
+        sanitize_attachment_name, should_respond, slash_command, strip_body_records,
+        trigger_message, turn_session_key, AllowList, ChatStates, ConvGate,
     };
     use crate::client::Client;
     use std::collections::HashSet;
@@ -6305,6 +6409,59 @@ mod gate_tests {
         assert!(!mentions_me("ping @claude", "ops:claude"));                 // partial ≠ full handle
         assert!(!mentions_me("just chatting, no mention", "ops:claude"));
         assert!(!mentions_me("@opsclaudex", "ops:claude"));                  // longer handle ≠
+    }
+
+    /// A streamed reply is born empty and finishes as `messageComplete`. The
+    /// dispatch arm, the reconnect replay and the cursor pin must all agree
+    /// that the finish is a message-bearing frame, or another bot's `@` in it
+    /// is never seen (2026-09-05: two online bots, both mute).
+    #[test]
+    fn a_finished_stream_is_a_trigger_frame() {
+        use serde_json::json;
+        let msg = json!({ "id": "m1", "content": "@ops:claude 看下" });
+        // The three shapes.
+        assert_eq!(
+            trigger_message("events.messageNew", &json!({ "params": msg })),
+            Some(msg.clone())
+        );
+        assert_eq!(
+            trigger_message(
+                "events.threadReply",
+                &json!({ "params": { "message": msg, "thread_summary": {} } })
+            ),
+            Some(msg.clone())
+        );
+        assert_eq!(
+            trigger_message("events.messageComplete", &json!({ "params": msg })),
+            Some(msg.clone())
+        );
+        // The stream's own progress is not a trigger — it would run a turn on
+        // every 300ms snapshot — and is not worth replaying either.
+        for quiet in [
+            "events.messageDraft", "events.messageDelta", "events.typing",
+            "events.inlineQuery", "events.hello", "events.draftDiscarded",
+        ] {
+            assert_eq!(trigger_message(quiet, &json!({ "params": msg })), None, "{quiet}");
+            assert!(!is_durable_event(quiet), "{quiet} must not be replayed");
+        }
+        // Whatever carries a trigger is replayed and pinned; chatCleared too.
+        for durable in [
+            "events.messageNew", "events.threadReply", "events.messageComplete",
+            "events.chatCleared",
+        ] {
+            assert!(is_durable_event(durable), "{durable}");
+        }
+    }
+
+    /// A finish takes the AI door regardless of the author's account kind: the
+    /// brain-backed human-kind accounts (@claude) stream too, and their replies
+    /// must not drive an always-on bot the way a person's words do.
+    #[test]
+    fn a_finished_stream_is_machine_authored() {
+        assert!(machine_authored("bot", false));
+        assert!(machine_authored("Bot", true));
+        assert!(!machine_authored("human", false));
+        assert!(machine_authored("human", true), "a human-kind brain's finish is still a machine's");
     }
 
     #[test]
@@ -6702,9 +6859,36 @@ mod lookback_photo_tests {
 #[cfg(test)]
 mod intro_tests {
     use super::{
-        customize_fields, greeting_mode, intro_lang, is_our_stock_seed, Greeting, IncomingMessage,
-        IntroLang,
+        claim_intro, customize_fields, greeting_mode, intro_lang, is_our_stock_seed, release_intro,
+        Greeting, IncomingMessage, IntroLang, IntrosLive,
     };
+
+    /// The bug this guard replaces: the persisted mark lands only when the intro
+    /// TURN lands — a minute later — so every reconnect inside that window read
+    /// an unmarked key and armed another copy. On a link dropping every few
+    /// seconds the owner got the same first-boot report three, four times in a
+    /// row. The claim is taken before spawning, so the reconnect stays quiet.
+    #[tokio::test]
+    async fn a_reconnect_cannot_arm_an_introduction_that_is_still_running() {
+        let live: IntrosLive = Default::default();
+        assert!(claim_intro(&live, "boot").await, "the first connect arms it");
+        assert!(!claim_intro(&live, "boot").await, "the reconnect must stay quiet");
+        assert!(!claim_intro(&live, "boot").await);
+        // A room is its own introduction, and a replayed add is not a new one.
+        assert!(claim_intro(&live, "chat-1").await);
+        assert!(!claim_intro(&live, "chat-1").await);
+    }
+
+    /// …but a claim is not a tombstone. An introduction that FAILED has to be
+    /// tried again on the next connect — that retry is the whole reason the mark
+    /// is written on delivery rather than on arming.
+    #[tokio::test]
+    async fn a_failed_introduction_is_armed_again_on_the_next_connect() {
+        let live: IntrosLive = Default::default();
+        assert!(claim_intro(&live, "boot").await);
+        release_intro(&live, "boot").await; // the turn came back Err
+        assert!(claim_intro(&live, "boot").await, "a failed intro must still retry");
+    }
 
     /// The owner's cloud `Account.language` decides — in whatever BCP-47 shape
     /// the setting arrives ("zh-Hans" from the app, "zh_CN.UTF-8" from a shell).

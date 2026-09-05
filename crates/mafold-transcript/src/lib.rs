@@ -15,7 +15,7 @@
 //!      group, and lands each result inside the card of the call that made it.
 //!
 //! Who uses it: the self-hosted daemon (`mafold-cli`, over its harnesses) and
-//! the api's server-side brains (`mafold-api`, e.g. the `@mafold:app` builder).
+//! the api's server-side brains (`mafold-api`, e.g. @mafold's app builder).
 //! They differ only in transport — snapshots vs. append-only deltas — which is
 //! the one axis [`Transcript`] deliberately leaves to the caller.
 

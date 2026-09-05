@@ -80,7 +80,9 @@ impl Harness for Codex {
             _ => prompt,
         };
 
+        let program = super::program("codex");
         let p = RunParams {
+            program: &program,
             full_prompt: &full_prompt,
             workdir: &workdir,
             model: model.as_deref(),
@@ -129,6 +131,10 @@ impl Harness for Codex {
 /// fresh-thread retry.
 #[derive(Clone, Copy)]
 struct RunParams<'a> {
+    /// The `codex` binary to spawn — resolved once by [`Harness::run`]. A
+    /// parameter rather than a lookup inside the run so the tests below can
+    /// drive the whole event loop against a scripted stream.
+    program: &'a std::ffi::OsStr,
     full_prompt: &'a str,
     workdir: &'a str,
     model: Option<&'a str>,
@@ -203,9 +209,9 @@ fn exec_args(session: Option<&str>, model: Option<&str>, effort: Option<&str>) -
 /// One `codex exec` invocation (optionally resuming `session`), streaming
 /// normalized events into the sink.
 async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcome> {
-    let RunParams { full_prompt, workdir, model, effort, conv, draft, cancel, sink } = *p;
+    let RunParams { program, full_prompt, workdir, model, effort, conv, draft, cancel, sink } = *p;
 
-    let mut cmd = tokio::process::Command::new(super::program("codex"));
+    let mut cmd = tokio::process::Command::new(program);
         cmd.args(exec_args(session, model, effort));
         // Export the current conversation so `mafold room …` targets THIS room
         // (harmless for Codex, which has no room skill today — kept for parity).
@@ -312,6 +318,9 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
                 }
                 // One `codex exec` run = one turn; its completion ends the stream.
                 "turn.completed" => {
+                    // A turn that COMPLETED is a success, whatever it had to
+                    // survive on the way — drop any retry notice taken below.
+                    error = None;
                     sweep_images!(); // must precede Done — the renderer stops there
                     let u = &v["usage"];
                     let toks: u64 = ["input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens"]
@@ -331,7 +340,24 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
                     let _ = child.start_kill();
                     break;
                 }
-                // Fatal stream error — surface + stop.
+                // NOT fatal on its own, however much it reads like it. Codex
+                // streams its RETRY NOTICES through `error` — "Reconnecting... 2/5
+                // (stream disconnected before completion: …)" comes straight out
+                // of its `core/src/responses_retry.rs`, as does "Falling back from
+                // WebSockets to HTTPS transport." — and then it carries on: up to
+                // five notices, after which the turn either completes normally or
+                // ends with a bare `error` + a `turn.failed`.
+                //
+                // Killing the child on the first one (what this did) shot codex
+                // MID-RECONNECT: every transient blip — one proxy hiccup is enough
+                // — became "⚠️ Agent stopped: Reconnecting... 2/5" on a turn that
+                // would have finished by itself. Worse, `agent.rs` reads a turn
+                // error on a RESUMED session as "this thread is corrupt" and drops
+                // the session, so the next message lost the conversation too.
+                //
+                // So: remember it and let the STREAM decide. `turn.completed`
+                // clears it, `turn.failed` overwrites it with the real reason, and
+                // if the stream just ends this is the last word we had.
                 "error" => {
                     error = Some(
                         v["message"]
@@ -339,8 +365,6 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
                             .map(str::to_string)
                             .unwrap_or_else(|| v.to_string()),
                     );
-                    let _ = child.start_kill();
-                    break;
                 }
                 phase @ ("item.started" | "item.updated" | "item.completed") => {
                     handle_item(phase, &v["item"], sink, &mut produced);
@@ -703,6 +727,125 @@ fn auth_mode() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `codex` stand-in that prints `stream` on stdout, one JSON event per
+    /// line, and exits 0 — enough to drive the whole event loop.
+    fn scripted_codex(dir: &std::path::Path, stream: &[&str]) -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            let path = dir.join("codex.cmd");
+            let mut s = String::from("@echo off\r\n");
+            for line in stream {
+                s.push_str(&format!("echo {line}\r\n"));
+            }
+            std::fs::write(&path, s).unwrap();
+            path
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join("codex.sh");
+            let mut s = String::from("#!/bin/sh\n");
+            for line in stream {
+                s.push_str(&format!("cat <<'MAFOLD_JSON'\n{line}\nMAFOLD_JSON\n"));
+            }
+            std::fs::write(&path, s).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+    }
+
+    /// Drive one turn against a scripted stream.
+    async fn run_scripted(tag: &str, stream: &[&str]) -> TurnOutcome {
+        let dir = std::env::temp_dir().join(format!("mafold-codex-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = scripted_codex(&dir, stream);
+        let workdir = dir.to_string_lossy().to_string();
+        let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (sink, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let out = run_once(
+            &RunParams {
+                program: program.as_os_str(),
+                full_prompt: "hi",
+                workdir: &workdir,
+                model: None,
+                effort: None,
+                conv: "conv",
+                draft: "draft",
+                cancel: &cancel,
+                sink: &sink,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    /// Codex streams RETRY NOTICES through `error` events ("Reconnecting... 2/5
+    /// …", from its `core/src/responses_retry.rs`) and then carries on. This
+    /// harness used to kill the child on the first one, so a single proxy hiccup
+    /// became "⚠️ Agent stopped: Reconnecting... 2/5" on a turn codex was still
+    /// finishing — and `agent.rs` dropped the resumed session on top of it.
+    /// A turn that reconnects and completes is a SUCCESS.
+    #[tokio::test]
+    async fn a_reconnect_notice_does_not_end_the_turn() {
+        let out = run_scripted(
+            "reconnect",
+            &[
+                r#"{"type":"thread.started","thread_id":"01a06fa7-61a1-7871-adaf-7410e6e063e3"}"#,
+                r#"{"type":"turn.started"}"#,
+                r#"{"type":"error","message":"Reconnecting... 1/5 stream disconnected before completion"}"#,
+                r#"{"type":"error","message":"Reconnecting... 2/5 stream disconnected before completion"}"#,
+                r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"OK"}}"#,
+                r#"{"type":"turn.completed","usage":{"output_tokens":5}}"#,
+            ],
+        )
+        .await;
+        assert_eq!(out.error, None, "a completed turn must not carry a retry notice");
+        assert!(out.produced, "the message it recovered to send must survive");
+        assert_eq!(out.session.as_deref(), Some("01a06fa7-61a1-7871-adaf-7410e6e063e3"));
+    }
+
+    /// …and when the retries really are exhausted, the LAST word wins: codex's
+    /// own reason from `turn.failed`, not the "Reconnecting... 5/5" banner that
+    /// happens to precede it.
+    #[tokio::test]
+    async fn an_exhausted_retry_fails_with_codex_s_reason() {
+        let out = run_scripted(
+            "exhausted",
+            &[
+                r#"{"type":"thread.started","thread_id":"t-1"}"#,
+                r#"{"type":"error","message":"Reconnecting... 5/5 stream disconnected before completion"}"#,
+                r#"{"type":"error","message":"stream disconnected before completion: Transport error"}"#,
+                r#"{"type":"turn.failed","error":{"message":"stream disconnected before completion: Transport error"}}"#,
+            ],
+        )
+        .await;
+        let err = out.error.expect("an exhausted retry must still fail the turn");
+        assert!(err.contains("stream disconnected"), "{err}");
+        assert!(!err.contains("Reconnecting"), "the banner is not the reason: {err}");
+    }
+
+    /// A stream that dies mid-turn without saying why still has to say SOMETHING:
+    /// the last notice is the only word we had.
+    #[tokio::test]
+    async fn a_stream_that_just_stops_surfaces_its_last_notice() {
+        let out = run_scripted(
+            "eof",
+            &[
+                r#"{"type":"thread.started","thread_id":"t-2"}"#,
+                r#"{"type":"error","message":"Reconnecting... 3/5 stream disconnected before completion"}"#,
+            ],
+        )
+        .await;
+        assert_eq!(
+            out.error.as_deref(),
+            Some("Reconnecting... 3/5 stream disconnected before completion")
+        );
+    }
 
     /// The invariant that keeps this harness alive on Windows: the prompt rides
     /// stdin (argv ends with `--` `-`), and nothing on the command line carries a
