@@ -429,11 +429,18 @@ impl ApiClient {
     // ── bot streaming-draft pipeline (the daemon's reply path) ──
     /// Open a streaming draft; returns the draft `Message` (its id is what
     /// `bot_append_delta`/`bot_finalize` target).
+    ///
+    /// `trigger_id` names the incoming message this reply answers. It is what
+    /// lets the server bill a metered turn to the person who asked (and refuse
+    /// the draft outright when they may not, or must pay first): a draft with
+    /// no trigger is never billed, so a caller that doesn't know it passes
+    /// `None` and the reply simply runs free.
     pub async fn bot_create_draft(
         &self,
         chat_id: Uuid,
         thread_root_id: Option<Uuid>,
         channel_id: Option<Uuid>,
+        trigger_id: Option<Uuid>,
     ) -> Result<wire::Message, RpcError> {
         let mut body = serde_json::json!({ "chat_id": chat_id });
         if let Some(root) = thread_root_id {
@@ -441,6 +448,9 @@ impl ApiClient {
         }
         if let Some(ch) = channel_id {
             body["channel_id"] = serde_json::json!(ch);
+        }
+        if let Some(t) = trigger_id {
+            body["trigger_id"] = serde_json::json!(t);
         }
         self.call_typed("botCreateDraft", &body).await
     }
@@ -533,7 +543,7 @@ mod tests {
         assert!(page.items.iter().any(|m| m.id == sent.id), "sent message in history");
 
         // Draft pipeline (ordinary account works — accounts are symmetric).
-        let draft = api.bot_create_draft(conv.id, None, None).await.expect("draft");
+        let draft = api.bot_create_draft(conv.id, None, None, None).await.expect("draft");
         api.bot_append_delta(draft.id, "hello ").await.expect("delta1");
         api.bot_append_delta(draft.id, "world").await.expect("delta2");
         api.bot_finalize(draft.id).await.expect("finalize");
@@ -654,7 +664,7 @@ mod tests {
         let chat = Uuid::parse_str("0a02b7d1-6a3c-49f7-97a3-1ec54cf9e2f1").unwrap();
         let ch = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
 
-        let draft = api.bot_create_draft(chat, None, Some(ch)).await.expect("draft");
+        let draft = api.bot_create_draft(chat, None, Some(ch), None).await.expect("draft");
         assert_eq!(draft.id.to_string(), "6dd93a1e-46e4-4d31-a461-c8c8fbf9f0a5");
         let body: serde_json::Value = serde_json::from_str(&mock.request(0).body).unwrap();
         assert_eq!(body["channel_id"], ch.to_string());

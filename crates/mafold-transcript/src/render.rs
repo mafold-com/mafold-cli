@@ -8,6 +8,13 @@ use std::collections::HashMap;
 
 use crate::event::AgentEvent;
 
+/// The prefixes of the one-line notices this renderer writes on a producer's or
+/// the driver's behalf — a usage limit, a compaction, a steer seam. Named so the
+/// writer and the reader ([`is_notice_line`]) can never disagree by a byte.
+pub(crate) const RATE_LIMIT_PREFIX: &str = "_⏳ ";
+pub(crate) const COMPACTED_PREFIX: &str = "_🗜️ ";
+pub(crate) const STEER_PREFIX: &str = "> ↩︎ ";
+
 /// Render one event to a markdoc string (text or a card), or `None` to skip.
 /// `names` tracks `tool_use_id → tool name` so a bash `tool_result` can be
 /// matched to its call.
@@ -63,13 +70,24 @@ pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<St
         // and claim it freed 100% of the context — a number that is simply not
         // true. The card stays for `/compact`, which does know both.
         AgentEvent::Compacted { pre_tokens } => Some(match pre_tokens {
-            Some(n) => format!("\n_🗜️ Context auto-compacted ({} before)_\n", fmt_count(*n)),
-            None => "\n_🗜️ Context auto-compacted_\n".to_string(),
+            Some(n) => format!("\n{COMPACTED_PREFIX}Context auto-compacted ({} before)_\n", fmt_count(*n)),
+            None => format!("\n{COMPACTED_PREFIX}Context auto-compacted_\n"),
         }),
-        AgentEvent::RateLimited { kind, resets_at } => Some(format!(
-            "\n_⏳ Usage limit reached ({kind}){}_\n",
-            reset_hint(*resets_at, now_unix())
-        )),
+        // Only a REFUSAL is news. The `allowed_*` states are threshold
+        // warnings — the request went through, and Claude Code re-sends the
+        // same warning on EVERY turn from the moment utilization crosses 0.75
+        // until the window resets, which is days. Rendering those stamped a
+        // usage-limit line onto every single reply for most of a week, which
+        // is precisely how a line stops being read. The status still reaches
+        // the seat logic (it decides which login a turn runs on); the
+        // transcript only speaks when the seat actually said no.
+        //
+        // Matched by prefix, not by equality: an unknown future status is
+        // shown rather than swallowed — silence is only for the states we
+        // know are non-events.
+        AgentEvent::RateLimited { kind, resets_at, status } => (!status.starts_with("allowed")).then(|| {
+            format!("\n{RATE_LIMIT_PREFIX}Usage limit reached ({kind}){}_\n", reset_hint(*resets_at, now_unix()))
+        }),
         // Not rendered as new content — the render loop stamps it into the
         // already-emitted ask card via `stamp_ask_answered`.
         AgentEvent::AskAnswered(_) => None,
@@ -238,7 +256,7 @@ pub fn trace_card(summary: &str, steps: usize, body: &str) -> String {
 /// carries their words in their own bubble above. One line that says WHERE the
 /// correction entered is the whole job.
 pub fn steer_line(text: &str) -> String {
-    format!("\n> ↩︎ {}\n", line_esc(text))
+    format!("\n{STEER_PREFIX}{}\n", line_esc(text))
 }
 
 /// One atomic step in a run group: a tool CALL and, once it lands, its RESULT.
@@ -559,6 +577,59 @@ fn tool_detail(name: &str, input: &Value) -> String {
 /// cards); a card nested inside another of the SAME name would close early,
 /// which nothing produces today.
 pub fn strip_cards(md: &str) -> String {
+    strip_cards_where(md, |_| true)
+}
+
+/// Is `name` (`owner/slug`) one of the cards THIS renderer emits — the agent
+/// transcript machinery, as opposed to content a model or a person authored?
+/// The list is the renderer's own vocabulary: every `{% mafold/… %}` this file
+/// writes, plus the driver-appended stamps (`bgtasks`) and the liveness card.
+pub fn is_transcript_card(name: &str) -> bool {
+    matches!(
+        name,
+        "mafold/run"
+            | "mafold/trace"
+            | "mafold/tool"
+            | "mafold/bash"
+            | "mafold/diff"
+            | "mafold/todo"
+            | "mafold/thinking"
+            | "mafold/compact"
+            | "mafold/result"
+            | "mafold/generating"
+            | "mafold/bgtasks"
+    )
+}
+
+/// [`strip_cards`], but only for the cards the transcript machinery produced
+/// ([`is_transcript_card`]). A `{% mafold/html %}` the model wrote or a
+/// `{% mafold/quote %}` the person sent stays — it is content; a run group, a
+/// result stamp or a folded trace is the bot's own process and bookkeeping,
+/// which a model reading its history should not be re-taught to write.
+pub fn strip_transcript_cards(md: &str) -> String {
+    strip_cards_where(md, is_transcript_card)
+}
+
+/// Is this line one of the renderer's own notices — a usage limit, a
+/// compaction, a steer seam? They are content (they belong in the trail, in
+/// time order) but they are not an ANSWER: when `finish_folded` asks whether the
+/// model said anything after its last tool group, a notice must not answer yes
+/// on the model's behalf.
+pub fn is_notice_line(line: &str) -> bool {
+    let t = line.trim_start();
+    [RATE_LIMIT_PREFIX, COMPACTED_PREFIX, STEER_PREFIX].iter().any(|p| t.starts_with(p))
+}
+
+/// `md` with every notice line ([`is_notice_line`]) removed.
+pub fn strip_notices(md: &str) -> String {
+    md.lines().filter(|l| !is_notice_line(l)).collect::<Vec<_>>().join("\n")
+}
+
+/// The walker behind both strips. A card whose name fails `cut` is copied
+/// through verbatim — open tag, body and close tag — and the walk continues
+/// after its open tag, so a content card nesting a transcript card still has
+/// the inner one cut.
+fn strip_cards_where(md: &str, cut: impl Fn(&str) -> bool) -> String {
     let mut out = String::with_capacity(md.len());
     let mut rest = md;
     while let Some(i) = rest.find("{%") {
@@ -573,6 +644,12 @@ pub fn strip_cards(md: &str) -> String {
         let inner = after[2..close].trim();
         let self_closing = after[..tag_end].ends_with("/%}");
         let name = inner.trim_start_matches('/').split_whitespace().next().unwrap_or("");
+        let keep = !name.is_empty() && !cut(name);
+        if keep {
+            out.push_str(&after[..tag_end]);
+            rest = &after[tag_end..];
+            continue;
+        }
         if self_closing || inner.starts_with('/') || name.is_empty() {
             rest = &after[tag_end..];
             continue;
@@ -587,6 +664,40 @@ pub fn strip_cards(md: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+#[cfg(test)]
+mod strip_transcript_tests {
+    use super::*;
+
+    const MD: &str = "Here:\n{% mafold/html %}<b>x</b>{% /mafold/html %}\n\
+        {% mafold/run summary=\"Ran 1 shell command\" %}\n{% mafold/bash cmd=\"ls\" /%}\n{% /mafold/run %}\n\
+        Done.\n{% mafold/result duration=\"1.0s\" %}\n{\"tokens\":3}\n{% /mafold/result %}\n";
+
+    /// The model's own content card stays; the machinery around it — the run
+    /// group, its tool cards, the result stamp and its JSON — goes.
+    #[test]
+    fn transcript_cards_go_and_content_cards_stay() {
+        let out = strip_transcript_cards(MD);
+        assert!(out.contains("{% mafold/html %}<b>x</b>{% /mafold/html %}"), "{out}");
+        assert!(out.contains("Here:") && out.contains("Done."), "{out}");
+        for gone in ["mafold/run", "mafold/bash", "mafold/result", "tokens"] {
+            assert!(!out.contains(gone), "{gone} survived: {out}");
+        }
+        // The full strip still takes everything, as it always did.
+        let all = strip_cards(MD);
+        assert!(!all.contains("mafold/html") && !all.contains("<b>x</b>"), "{all}");
+        assert!(all.contains("Here:") && all.contains("Done."), "{all}");
+    }
+
+    /// A transcript card nested inside a content card is cut out of it; the
+    /// content card itself is kept.
+    #[test]
+    fn a_nested_transcript_card_is_cut_from_inside_a_kept_one() {
+        let md = "{% mafold/quote %}said:\n{% mafold/result /%}\nthat{% /mafold/quote %}";
+        let out = strip_transcript_cards(md);
+        assert_eq!(out, "{% mafold/quote %}said:\n\nthat{% /mafold/quote %}");
+    }
 }
 
 fn fmt_count(n: u64) -> String {
@@ -1063,12 +1174,68 @@ mod notice_tests {
     fn a_usage_limit_renders_its_kind() {
         let mut names = HashMap::new();
         let out = render(
-            &AgentEvent::RateLimited { kind: "five_hour".into(), resets_at: None },
+            &AgentEvent::RateLimited { kind: "five_hour".into(), resets_at: None, status: "rejected".into() },
             &mut names,
         )
         .unwrap();
         assert!(out.contains("five_hour"), "{out}");
-        assert!(out.contains("Usage limit"), "{out}");
+        assert!(out.contains("Usage limit reached"), "{out}");
+    }
+
+    /// `allowed_warning` = utilization crossed a threshold and the request
+    /// went through. Claude Code repeats it on EVERY turn until the window
+    /// resets (days), so it must render nothing at all — the values below are
+    /// verbatim off this machine's stream on 2026-09-06, the day an
+    /// 84%-used account got "Usage limit reached" stamped onto every reply.
+    #[test]
+    fn a_threshold_warning_renders_nothing() {
+        let mut names = HashMap::new();
+        assert_eq!(
+            render(
+                &AgentEvent::RateLimited {
+                    kind: "seven_day".into(),
+                    resets_at: Some(1786712400),
+                    status: "allowed_warning".into(),
+                },
+                &mut names,
+            ),
+            None,
+        );
+    }
+
+    /// A status this build has never seen is NOT assumed harmless: silence is
+    /// reserved for the `allowed_*` family we know to be non-events.
+    #[test]
+    fn an_unknown_status_still_speaks() {
+        let mut names = HashMap::new();
+        let out = render(
+            &AgentEvent::RateLimited { kind: "five_hour".into(), resets_at: None, status: "something_new".into() },
+            &mut names,
+        )
+        .expect("an unrecognized status must not be swallowed");
+        assert!(out.contains("Usage limit reached"), "{out}");
+    }
+
+    /// Every notice the renderer writes is recognised by the reader that strips
+    /// them — by the SAME prefix constant, so the two cannot drift — and prose
+    /// on either side of a notice is untouched.
+    #[test]
+    fn notice_lines_strip_and_prose_stays() {
+        let mut names = HashMap::new();
+        let limit = render(
+            &AgentEvent::RateLimited { kind: "seven_day".into(), resets_at: None, status: "rejected".into() },
+            &mut names,
+        )
+        .unwrap();
+        let compact = render(&AgentEvent::Compacted { pre_tokens: Some(1200) }, &mut names).unwrap();
+        let steer = steer_line("no, the other one");
+        let md = format!("Answer.{limit}{compact}{steer}more");
+        let left = strip_notices(&md);
+        assert!(left.contains("Answer.") && left.contains("more"), "{left}");
+        for gone in ["Usage limit", "auto-compacted", "the other one"] {
+            assert!(!left.contains(gone), "{gone} survived:\n{left}");
+        }
+        assert!(strip_notices("plain prose\n\nmore prose").contains("more prose"));
     }
 }
 

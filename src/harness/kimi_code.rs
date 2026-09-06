@@ -66,6 +66,9 @@ impl Harness for KimiCode {
             system,
             ask_file: _,
             steer_file: _,
+            // Kimi has one login per machine; per-turn seats are a Claude
+            // Code thing today (`crate::accounts`).
+            env: _,
             conv,
             surface: _,
             draft,
@@ -115,13 +118,13 @@ impl Harness for KimiCode {
         Value::Array(vec![])
     }
 
-    async fn command(&self, _client: &Client, _chat_id: &str, _name: &str, _arg: &str, _workdir: &str, _session: Option<&str>) -> CommandOutcome {
+    async fn command(&self, _client: &Client, _chat_id: &str, _name: &str, _arg: &str, _workdir: &str, _session: Option<&str>, _env: &[(String, String)]) -> CommandOutcome {
         // No emulated slash commands — anything that isn't a daemon control command
         // is forwarded to `kimi --print` as a prompt.
         CommandOutcome::Forward
     }
 
-    async fn status_line(&self) -> String {
+    async fn status_line(&self, _env: &[(String, String)]) -> String {
         if !super::on_path("kimi") {
             return String::new();
         }
@@ -298,21 +301,22 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
     }
 
     if stopped {
-        return Ok(TurnOutcome { produced, stopped: true, session: session_id, error });
+        return Ok(TurnOutcome { produced, stopped: true, session: session_id, error, limit: None });
     }
     if let Some(e) = error {
-        return Ok(TurnOutcome { produced, stopped: false, session: session_id, error: Some(e) });
+        return Ok(TurnOutcome { produced, stopped: false, session: session_id, error: Some(e), limit: None });
     }
     match status {
         Ok(s) if s.success() => {
             let _ = sink.send(AgentEvent::Done { duration_ms: None, cost_usd: None, tokens: None });
-            Ok(TurnOutcome { produced, stopped: false, session: session_id, error: None })
+            Ok(TurnOutcome { produced, stopped: false, session: session_id, error: None, limit: None })
         }
         Ok(s) => Ok(TurnOutcome {
             produced,
             stopped: false,
             session: session_id,
             error: Some(build_error(&plain_text, &stderr_buf, s.code())),
+            limit: None,
         }),
         Err(e) => bail!("waiting on `kimi` failed: {e}"),
     }

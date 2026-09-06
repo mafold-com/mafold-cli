@@ -73,11 +73,19 @@ pub enum AgentEvent {
     /// a hang. `pre_tokens` is the context size that was compacted, when the
     /// producer reports it.
     Compacted { pre_tokens: Option<u64> },
-    /// The producer reported a usage limit that is NOT in the healthy state —
-    /// the quota is exhausted or restricted. Producers emit this ONLY for the
-    /// non-healthy states; a limit that's fine is not news and must not be
-    /// relayed into every reply.
-    RateLimited { kind: String, resets_at: Option<i64> },
+    /// The producer reported a usage limit that is NOT in the healthy state.
+    /// Producers emit this ONLY for the non-healthy states; a limit that's
+    /// fine is not news and must not be relayed into every reply.
+    ///
+    /// `status` is the producer's own word for how bad it is, and the two
+    /// cases are genuinely different events:
+    /// - `rejected` — the request was REFUSED. The seat is out; the turn ends
+    ///   unless something else can run it.
+    /// - `allowed_warning` — utilization crossed a threshold (0.75) and the
+    ///   request went through anyway. Claude Code repeats this every turn
+    ///   until the window resets, i.e. for days, so it is a signal for the
+    ///   seat logic and NOT something to render (see `render`).
+    RateLimited { kind: String, resets_at: Option<i64>, status: String },
     /// End-of-turn summary.
     Done {
         duration_ms: Option<f64>,

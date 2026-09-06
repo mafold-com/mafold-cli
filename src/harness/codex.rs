@@ -66,6 +66,10 @@ impl Harness for Codex {
             system,
             ask_file: _,
             steer_file: _,
+            // Codex keys its login by `CODEX_HOME`, which the daemon's own
+            // environment already carries; per-turn seats are a Claude Code
+            // thing today (`crate::accounts`).
+            env: _,
             conv,
             surface: _,
             draft,
@@ -113,13 +117,13 @@ impl Harness for Codex {
         Value::Array(vec![])
     }
 
-    async fn command(&self, _client: &Client, _chat_id: &str, _name: &str, _arg: &str, _workdir: &str, _session: Option<&str>) -> CommandOutcome {
+    async fn command(&self, _client: &Client, _chat_id: &str, _name: &str, _arg: &str, _workdir: &str, _session: Option<&str>, _env: &[(String, String)]) -> CommandOutcome {
         // No emulated slash commands yet — anything that isn't a daemon control
         // command is forwarded to `codex exec` as a prompt.
         CommandOutcome::Forward
     }
 
-    async fn status_line(&self) -> String {
+    async fn status_line(&self, _env: &[(String, String)]) -> String {
         auth_status_line().await
     }
 
@@ -408,6 +412,7 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
                 stopped,
                 session: session_id,
                 error,
+                limit: None,
             });
         }
         let status = child.wait().await?;
@@ -434,6 +439,7 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
             stopped,
             session: session_id,
             error: None,
+            limit: None,
         })
 }
 

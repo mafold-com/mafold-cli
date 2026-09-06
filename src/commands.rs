@@ -21,22 +21,24 @@ pub enum Outcome {
 
 /// Route a slash command. `name` is lowercased, without the leading slash.
 /// (`/login` is handled in agent.rs — it needs the daemon's per-chat state to
-/// relay the pasted auth code into the login process.)
-pub async fn handle(name: &str, _arg: &str, workdir: &str, session: Option<&str>) -> Outcome {
+/// relay the pasted auth code into the login process.) `env` is the seat the
+/// chat runs on (`crate::accounts`): everything here that asks `claude` or
+/// Anthropic a question asks it about THAT login.
+pub async fn handle(name: &str, _arg: &str, workdir: &str, session: Option<&str>, env: &[(String, String)]) -> Outcome {
     match name {
         // ── usage stats (rich card): local transcript scan + live rate limits ──
         "stats" | "usage" | "cost" => {
-            Outcome::Reply(stats(&fetch_limits().await, workdir, session))
+            Outcome::Reply(stats(&fetch_limits(env).await, workdir, session))
         }
         // ── auth ──
-        "logout" => Outcome::Reply(logout().await),
+        "logout" => Outcome::Reply(logout(env).await),
         // ── read local config / state ──
         "config" | "settings" => Outcome::Reply(dump_settings(workdir)),
         "memory" => Outcome::Reply(dump_memory(workdir)),
         "mcp" => Outcome::Reply(fence_block(
             "🔌 MCP servers",
             "",
-            &run_claude(&["mcp", "list"], 25).await,
+            &run_claude(&["mcp", "list"], 25, env).await,
         )),
         "agents" => Outcome::Reply(dump_agents(workdir)),
         "skills" => Outcome::Reply(dump_skills(workdir)),
@@ -55,7 +57,7 @@ pub async fn handle(name: &str, _arg: &str, workdir: &str, session: Option<&str>
         "doctor" => Outcome::Reply(fence_block(
             "🩺 claude doctor",
             "",
-            &run_claude(&["doctor"], 30).await,
+            &run_claude(&["doctor"], 30, env).await,
         )),
         // ── terminal-only: a friendly mock note ──
         n if mock_desc(n).is_some() => Outcome::Reply(mock_reply(n)),
@@ -65,22 +67,35 @@ pub async fn handle(name: &str, _arg: &str, workdir: &str, session: Option<&str>
 
 // ───────────────────────── auth ─────────────────────────
 
-/// `/logout` — clear the host's Anthropic credentials.
-async fn logout() -> String {
-    let out = run_claude(&["auth", "logout"], 20).await;
+/// `/logout` — clear the Anthropic credentials of the seat `env` selects.
+async fn logout(env: &[(String, String)]) -> String {
+    let who = crate::accounts::Account::from_env(env).name;
+    let out = run_claude(&["auth", "logout"], 20, env).await;
+    crate::accounts::forget_seat(&who);
     format!(
-        "👋 Logged out of Anthropic.\n{}\n⚠️ This is the account that powers THIS agent's `claude`. Until you `/login` again (or re-auth on the host), I can't reply to tasks.",
+        "👋 Logged out of Anthropic (account `{who}`).\n{}\n⚠️ This is the login that powers THIS chat's `claude`. Until you `/login` again (or re-auth on the host), turns here fall through to another account — or fail, if there is none.",
         if out.trim().is_empty() { String::new() } else { format!("{}\n", out.trim()) },
     )
 }
 
-pub async fn auth_status_line() -> String {
-    let o = run_claude(&["auth", "status", "--text"], 8).await;
+/// First line of `claude auth status --text` for the seat `env` selects
+/// ("Login method: Claude Max account"), "" when it can't be asked.
+pub async fn auth_status_line(env: &[(String, String)]) -> String {
+    let o = run_claude(&["auth", "status", "--text"], 8, env).await;
     o.lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or("")
         .to_string()
+}
+
+/// `claude auth status --json` for the seat `env` selects — the email, org
+/// and plan behind a login, straight from Claude Code. None when the CLI
+/// can't run or that seat isn't logged in.
+pub(crate) async fn auth_status_json(env: &[(String, String)]) -> Option<serde_json::Value> {
+    let out = run_claude(&["auth", "status", "--json"], 8, env).await;
+    let v: serde_json::Value = serde_json::from_str(out.trim()).ok()?;
+    v["loggedIn"].as_bool().unwrap_or(false).then_some(v)
 }
 
 // ───────────────────────── config dumps ─────────────────────────
@@ -1046,14 +1061,17 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Claude Code's OAuth access token, from wherever the platform keeps it:
-/// `~/.claude/.credentials.json` on Linux/Windows, the login Keychain on macOS.
+/// Claude Code's OAuth access token for the seat `env` selects, from wherever
+/// the platform keeps it: `<dir>/.credentials.json` on Linux/Windows, the
+/// login Keychain on macOS — under the item Claude Code names after that
+/// directory (`crate::accounts::Account::keychain_service`).
 ///
 /// None when it is missing, unreadable, or already expired. We deliberately do
 /// NOT use the refresh token — minting credentials is Claude Code's job, and an
 /// expired one simply drops us to the cached copy on the next line.
-pub(crate) fn oauth_token() -> Option<String> {
-    let raw = match std::fs::read_to_string(home().join(".claude/.credentials.json")) {
+pub(crate) fn oauth_token(env: &[(String, String)]) -> Option<String> {
+    let acct = crate::accounts::Account::from_env(env);
+    let raw = match std::fs::read_to_string(acct.credentials_file()) {
         Ok(s) => s,
         Err(_) => {
             if !cfg!(target_os = "macos") {
@@ -1063,7 +1081,7 @@ pub(crate) fn oauth_token() -> Option<String> {
                 .args([
                     "find-generic-password",
                     "-s",
-                    "Claude Code-credentials",
+                    &acct.keychain_service(),
                     "-w",
                 ])
                 .output()
@@ -1106,13 +1124,13 @@ pub(crate) enum UtilizationProbe {
     Unreachable,
 }
 
-/// `GET /api/oauth/usage`, with the status preserved.
+/// `GET /api/oauth/usage` for the seat `env` selects, with the status preserved.
 ///
 /// Single source for this call: the `/stats` card wants only the happy path,
-/// seat-health wants the failure taxonomy, and two probes of the same endpoint
-/// would drift (§0).
-pub(crate) async fn probe_utilization() -> UtilizationProbe {
-    let Some(token) = oauth_token() else {
+/// seat-health and the pre-turn seat check want the failure taxonomy, and two
+/// probes of the same endpoint would drift (§0).
+pub(crate) async fn probe_utilization(env: &[(String, String)]) -> UtilizationProbe {
+    let Some(token) = oauth_token(env) else {
         return UtilizationProbe::NoCredential;
     };
     let res = match reqwest::Client::new()
@@ -1135,8 +1153,8 @@ pub(crate) async fn probe_utilization() -> UtilizationProbe {
     }
 }
 
-async fn fetch_utilization_live() -> Option<serde_json::Value> {
-    match probe_utilization().await {
+async fn fetch_utilization_live(env: &[(String, String)]) -> Option<serde_json::Value> {
+    match probe_utilization(env).await {
         UtilizationProbe::Ok(v) => Some(v),
         _ => None,
     }
@@ -1174,8 +1192,10 @@ pub(crate) fn plan_tier() -> Option<String> {
 /// `{kind, percent, severity, resets_at, scope.model.display_name, is_active}`.
 /// Reset times are rendered RELATIVE ("resets in 4h 44m"): the payload is UTC and
 /// we have no timezone database, and it reads better anyway — it's how Claude's
-/// own panel puts it.
-fn parse_utilization(util: &serde_json::Value, age_secs: i64) -> String {
+/// own panel puts it. `with_tier` adds the plan chip; it comes from
+/// `~/.claude.json`, which every login on the machine shares and the LAST one
+/// to sign in owns, so only the default seat can wear it truthfully.
+fn parse_utilization(util: &serde_json::Value, age_secs: i64, with_tier: bool) -> String {
     let now = now_ms() / 1000;
     let mut out = String::new();
     for l in util["limits"].as_array().into_iter().flatten() {
@@ -1205,8 +1225,10 @@ fn parse_utilization(util: &serde_json::Value, age_secs: i64) -> String {
     }
     // The tier rides in the header badge, not a key-value row — it labels the
     // whole card, the way Claude's own panel puts "Max (20x)" next to the title.
-    if let Some(p) = plan_tier() {
-        out.push_str(&format!("chip|{p}\n"));
+    if with_tier {
+        if let Some(p) = plan_tier() {
+            out.push_str(&format!("chip|{p}\n"));
+        }
     }
     // WHEN, not "how long ago": we only know the age at emit time, so a baked
     // "just now" is still saying "just now" an hour later. The card holds the
@@ -1223,20 +1245,26 @@ fn parse_utilization(util: &serde_json::Value, age_secs: i64) -> String {
 ///    unavailable, e.g. no readable credential.
 ///
 /// Best-effort throughout: "" means the card simply omits the limits section.
-async fn fetch_limits() -> String {
-    if let Some(u) = fetch_utilization_live().await {
-        let s = parse_utilization(&u, 0);
+/// All three sources answer for the seat `env` selects — except the on-disk
+/// cache, which belongs to whichever login last refreshed it and is therefore
+/// only trusted for the default seat.
+async fn fetch_limits(env: &[(String, String)]) -> String {
+    let default_seat = crate::accounts::Account::from_env(env).is_default();
+    if let Some(u) = fetch_utilization_live(env).await {
+        let s = parse_utilization(&u, 0, default_seat);
         if !s.is_empty() {
             return s;
         }
     }
-    if let Some((u, age)) = cached_utilization() {
-        let s = parse_utilization(&u, age);
-        if !s.is_empty() {
-            return s;
+    if default_seat {
+        if let Some((u, age)) = cached_utilization() {
+            let s = parse_utilization(&u, age, true);
+            if !s.is_empty() {
+                return s;
+            }
         }
     }
-    parse_usage_text(&run_claude_stdin("/usage", 30).await)
+    parse_usage_text(&run_claude_stdin("/usage", 30, env).await)
 }
 
 /// Parse the plain-text `/usage` report into `limit|label|pct|note` +
@@ -1345,11 +1373,12 @@ fn parse_usage_text(text: &str) -> String {
     out
 }
 
-/// Pipe `input` into a headless `claude -p` and return its (ANSI-stripped)
-/// output, or "" on any failure/timeout.
-async fn run_claude_stdin(input: &str, secs: u64) -> String {
+/// Pipe `input` into a headless `claude -p` (on the seat `env` selects) and
+/// return its (ANSI-stripped) output, or "" on any failure/timeout.
+async fn run_claude_stdin(input: &str, secs: u64, env: &[(String, String)]) -> String {
     let mut cmd = tokio::process::Command::new(crate::harness::program("claude"));
     cmd.arg("-p")
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1535,7 +1564,7 @@ fn jsonl_transcripts(root: &Path) -> Vec<PathBuf> {
 
 /// `claude --version` → "2.1.198" (first token; "" if the CLI is missing).
 pub(crate) async fn claude_version() -> String {
-    let out = run_claude(&["--version"], 8).await;
+    let out = run_claude(&["--version"], 8, &[]).await;
     out.split_whitespace()
         .next()
         .unwrap_or("")
@@ -1972,9 +2001,13 @@ fn mock_reply(name: &str) -> String {
 
 // ───────────────────────── helpers ─────────────────────────
 
-async fn run_claude(args: &[&str], secs: u64) -> String {
+/// Run `claude <args>` on the seat `env` selects (see `crate::accounts`) and
+/// return its output; `&[]` = the daemon's own login.
+async fn run_claude(args: &[&str], secs: u64, env: &[(String, String)]) -> String {
     let mut cmd = tokio::process::Command::new(crate::harness::program("claude"));
-    cmd.args(args).stdin(Stdio::null());
+    cmd.args(args)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(Stdio::null());
     crate::platform::no_window(&mut cmd);
     let fut = cmd.output();
     match tokio::time::timeout(Duration::from_secs(secs), fut).await {
@@ -2364,7 +2397,7 @@ Last 7d · 7983 requests · 30 sessions
     #[tokio::test]
     #[ignore = "spawns a real `claude -p` (~4s)"]
     async fn limits_smoke_print() {
-        let s = fetch_limits().await;
+        let s = fetch_limits(&[]).await;
         println!("{s}");
     }
 

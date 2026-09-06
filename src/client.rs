@@ -64,6 +64,38 @@ impl<'a> Dest<'a> {
     }
 }
 
+/// The server refused to open a draft ON PURPOSE: a 403 whose `description`
+/// the server prefixes with `access_denied` (this sender may not drive the bot)
+/// or `payment_required` (they must authorize payment first, or are out of
+/// funds). Either way the server has ALREADY answered them in the chat, as the
+/// bot — so the daemon's whole job is to stop quietly: no turn, no retry, no
+/// lost-turn notice. Distinct from every other `create_draft` failure, which
+/// is an outage the user must be told about.
+#[derive(Debug)]
+pub struct DraftRefused(pub String);
+
+impl DraftRefused {
+    fn from_rpc(e: &mafold_core::RpcError) -> Option<Self> {
+        let mafold_core::RpcError::Api(env) = e else { return None };
+        let v: Value = serde_json::from_str(env).ok()?;
+        let desc = v.get("description").and_then(Value::as_str)?;
+        // The server wraps its refusal in `ApiError::PermissionDenied`, whose
+        // Display prefixes "permission denied: " — the contract is the code
+        // that follows it.
+        let code = desc.trim_start_matches("permission denied: ");
+        (code.starts_with("access_denied") || code.starts_with("payment_required"))
+            .then(|| DraftRefused(code.to_string()))
+    }
+}
+
+impl std::fmt::Display for DraftRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "turn refused by server: {}", self.0)
+    }
+}
+
+impl std::error::Error for DraftRefused {}
+
 #[derive(Clone)]
 pub struct Client {
     pub http: reqwest::Client,
@@ -498,6 +530,8 @@ impl Client {
     /// retried freely, but a 5xx envelope is the server admitting it broke, not
     /// answering. This one is only consulted where a single extra attempt buys
     /// something that matters (see `create_draft`).
+    /// See [`is_server_blip`] — same classifier, exposed for the refusal check
+    /// which must run first (a 403 is neither a blip nor a connect failure).
     fn is_server_blip(e: &mafold_core::RpcError) -> bool {
         use mafold_core::RpcError as R;
         match e {
@@ -525,11 +559,18 @@ impl Client {
     /// replies"). Connect-phase failures are retried a couple of times (observed
     /// real-world cause: a local proxy killing fresh TLS connections right after
     /// the WS reconnects).
+    ///
+    /// `trigger_id` is the incoming message this reply answers. It is what lets
+    /// the server decide, BEFORE any model runs, whether this turn is free,
+    /// billed to that sender's wallet, or refused — a draft with no trigger is
+    /// never billed. A refusal comes back as [`DraftRefused`]: the server has
+    /// already spoken in the chat, so the caller must post nothing.
     pub async fn create_draft(
         &self,
         chat_id: &str,
         thread_root_id: Option<&str>,
         channel_id: Option<&str>,
+        trigger_id: Option<&str>,
     ) -> Result<String> {
         // TYPED through the core: ids parse to real Uuids up front (a malformed
         // id fails here, not as a server 400), and the result is a wire::Message.
@@ -542,15 +583,25 @@ impl Client {
             .map(uuid::Uuid::parse_str)
             .transpose()
             .context("botCreateDraft: bad channel_id")?;
+        // A trigger id we can't parse is a trigger we don't have: the turn runs
+        // free rather than dying on a malformed id nobody typed.
+        let trigger = trigger_id.filter(|t| !t.is_empty()).and_then(|t| uuid::Uuid::parse_str(t).ok());
         let api = self.api();
         let mut delay = std::time::Duration::from_millis(500);
         let mut connect_tries = 0;
         let mut blip_retried = false;
         let draft = loop {
-            let err = match api.bot_create_draft(chat, root, channel).await {
+            let err = match api.bot_create_draft(chat, root, channel, trigger).await {
                 Ok(m) => break m,
                 Err(e) => e,
             };
+            // A deliberate "no" (403 + a description the server prefixes on
+            // purpose): the sender may not drive this bot, or must authorize
+            // payment first. The server has already answered them in the chat
+            // as the bot, so this is not a failure to retry or announce.
+            if let Some(reason) = DraftRefused::from_rpc(&err) {
+                return Err(anyhow::Error::new(reason));
+            }
             // Never left this machine → a retry cannot duplicate anything.
             if matches!(err, mafold_core::RpcError::Connect(_)) && connect_tries < 2 {
                 connect_tries += 1;
@@ -1504,7 +1555,7 @@ mod lost_turn_tests {
         let (base, seen) = stub(500, r#"{"ok":false,"error_code":500,"description":"boom"}"#).await;
         let c = Client::new(base, "t".into());
         let err = c
-            .create_draft("11111111-2222-3333-4444-555555555555", None, None)
+            .create_draft("11111111-2222-3333-4444-555555555555", None, None, None)
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("botCreateDraft failed"), "{err:#}");

@@ -11,7 +11,7 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
 
-use super::{AgentEvent, CommandOutcome, Harness, Turn, TurnOutcome};
+use super::{AgentEvent, CommandOutcome, Harness, SeatHealth, SeatLimit, Turn, TurnOutcome};
 use mafold_transcript::RunStats;
 use crate::client::Client;
 
@@ -33,7 +33,7 @@ impl Harness for ClaudeCode {
     }
 
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
-        let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, steer_file, conv, surface, draft } = turn;
+        let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, steer_file, conv, surface, draft, env } = turn;
         let _ = sink.send(AgentEvent::Stats(RunStats {
             effort: effort.clone(), ..Default::default()
         }));
@@ -80,6 +80,13 @@ impl Harness for ClaudeCode {
         // media on it, so an image the agent makes lands in the same bubble as
         // the text about it.
         cmd.env("MAFOLD_DRAFT", &draft);
+        // The seat: which Claude login this turn runs on
+        // (`CLAUDE_SECURESTORAGE_CONFIG_DIR`, see `crate::accounts`). Empty for
+        // the default login — the daemon's own environment already is it.
+        // Only the credential moves with it; `~/.claude` (memory, skills,
+        // sessions) stays shared, which is what lets a `--resume` below carry
+        // on under a different account.
+        cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         // Extended thinking: a non-zero budget makes the model think before each
         // reply (streamed as `thinking` blocks). No env = Claude Code's default.
         if let Some(budget) = thinking {
@@ -221,6 +228,10 @@ impl Harness for ClaudeCode {
         let mut session_id: Option<String> = None;
         // Set when an API / execution error ends the turn — surfaced to the user.
         let mut error: Option<String> = None;
+        // Set when the seat REFUSED a request (a `rejected` rate-limit event):
+        // if the turn then ends on an error, that is why, and the caller can
+        // move it to another login (see `TurnOutcome::limit`).
+        let mut limit: Option<super::LimitHit> = None;
         // The last few NON-JSON stdout lines. `claude` prints its fatal reasons
         // as plain text on stdout — a usage cap, an auth failure, a `--resume`
         // id whose transcript is gone — NOT as stream-json, and the parser below
@@ -298,8 +309,16 @@ impl Harness for ClaudeCode {
             // emits one of these on ordinary healthy turns too, and echoing
             // "your quota is fine" into every reply is noise, not news.
             if v["type"] == "rate_limit_event" {
-                if let Some((kind, resets_at)) = rate_limit_notice(&v["rate_limit_info"]) {
-                    let _ = sink.send(AgentEvent::RateLimited { kind, resets_at });
+                if let Some((kind, resets_at, status)) = rate_limit_notice(&v["rate_limit_info"]) {
+                    // A refusal is the seat itself saying no. A threshold
+                    // warning (`allowed_warning`) is not — the request went
+                    // through — so it must never move the turn to another
+                    // login, or a 76%-used account would hand every turn away
+                    // for the rest of the week.
+                    if status == "rejected" {
+                        limit = Some(super::LimitHit { kind: kind.clone(), resets_at });
+                    }
+                    let _ = sink.send(AgentEvent::RateLimited { kind, resets_at, status });
                 }
                 continue;
             }
@@ -497,7 +516,7 @@ impl Harness for ClaudeCode {
             let _ = child.start_kill(); // idempotent; ensures the error path stops it too
             let _ = child.wait().await; // reap; the exit status is irrelevant here
             if let Some(t) = stderr_task { t.abort(); }
-            return Ok(TurnOutcome { produced, stopped, session: session_id, error });
+            return Ok(TurnOutcome { limit: limit_hit(limit.clone(), error.as_deref()), produced, stopped, session: session_id, error });
         }
         // `claude` normally exits within a beat of its final `result`. When it
         // does NOT — more queued input behind us, a background task it is still
@@ -519,7 +538,7 @@ impl Harness for ClaudeCode {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 if let Some(t) = stderr_task { t.abort(); }
-                return Ok(TurnOutcome { produced, stopped, session: session_id, error });
+                return Ok(TurnOutcome { limit: limit_hit(limit.clone(), error.as_deref()), produced, stopped, session: session_id, error });
             }
         };
         if !status.success() {
@@ -544,30 +563,69 @@ impl Harness for ClaudeCode {
             // death burned the whole turn on a reply card that lived a couple of
             // seconds and the user had to notice and resend by hand. `produced`
             // rides along, so a run that already streamed work is never redone.
+            let reason = exit_reason(status.code(), &err, plain_tail.make_contiguous());
             return Ok(TurnOutcome {
                 produced,
                 stopped,
                 session: session_id,
-                error: Some(exit_reason(status.code(), &err, plain_tail.make_contiguous())),
+                limit: limit_hit(limit, Some(&reason)),
+                error: Some(reason),
             });
         }
         if let Some(t) = stderr_task { t.abort(); }
-        Ok(TurnOutcome { produced, stopped, session: session_id, error: None })
+        Ok(TurnOutcome { produced, stopped, session: session_id, error: None, limit: None })
     }
 
     fn discover(&self, workdir: &str) -> Value {
         crate::discover::all(workdir)
     }
 
-    async fn command(&self, _client: &Client, _chat_id: &str, name: &str, arg: &str, workdir: &str, session: Option<&str>) -> CommandOutcome {
-        match crate::commands::handle(name, arg, workdir, session).await {
+    async fn command(&self, _client: &Client, _chat_id: &str, name: &str, arg: &str, workdir: &str, session: Option<&str>, env: &[(String, String)]) -> CommandOutcome {
+        match crate::commands::handle(name, arg, workdir, session, env).await {
             crate::commands::Outcome::Reply(text) => CommandOutcome::Reply(text),
             crate::commands::Outcome::Forward => CommandOutcome::Forward,
         }
     }
 
-    async fn status_line(&self) -> String {
-        crate::commands::auth_status_line().await
+    async fn status_line(&self, env: &[(String, String)]) -> String {
+        crate::commands::auth_status_line(env).await
+    }
+
+    /// The seat `env` selects, asked the same quota-free question Claude Code
+    /// asks itself (`/api/oauth/usage`), with the failure taxonomy kept apart
+    /// — 401 wants a login, 403 does not, unreachable wants patience.
+    async fn seat_health(&self, env: &[(String, String)]) -> SeatHealth {
+        use crate::commands::UtilizationProbe as P;
+        match crate::commands::probe_utilization(env).await {
+            P::Ok(v) => {
+                let limits = v["limits"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|l| {
+                        let percent = l["percent"].as_f64()?;
+                        let kind = l["kind"].as_str().unwrap_or("usage").to_string();
+                        Some(SeatLimit {
+                            label: seat_limit_label(&kind, l),
+                            kind,
+                            percent,
+                            resets_at: l["resets_at"].as_str().and_then(crate::commands::iso_epoch_secs),
+                        })
+                    })
+                    .collect();
+                // The plan chip comes from `~/.claude.json`, which the LAST
+                // login to sign in owns — only the default seat can claim it.
+                let tier = if crate::accounts::Account::from_env(env).is_default() {
+                    crate::commands::plan_tier()
+                } else {
+                    None
+                };
+                SeatHealth::from_limits(tier, limits)
+            }
+            P::NoCredential => SeatHealth::unauthenticated(),
+            P::Http(s) => SeatHealth::from_status(s),
+            P::Unreachable => SeatHealth::unreachable(),
+        }
     }
 
     async fn cli_version(&self) -> String {
@@ -583,18 +641,53 @@ fn compaction_pre_tokens(v: &Value) -> Option<u64> {
 }
 
 /// The usage-limit state worth relaying from a `rate_limit_event`'s
-/// `rate_limit_info`, or None when the limit is healthy. Claude emits one of
-/// these on ordinary turns too, so the "allowed" gate is what keeps this from
-/// stamping a quota notice onto every single reply — it is load-bearing, not
-/// defensive.
-fn rate_limit_notice(info: &Value) -> Option<(String, Option<i64>)> {
-    if info["status"].as_str().unwrap_or("allowed") == "allowed" {
+/// `rate_limit_info` — `(kind, resets_at, status)` — or None when the limit
+/// is healthy. Claude emits one of these on ordinary turns too, so the
+/// "allowed" gate is what keeps this from stamping a quota notice onto every
+/// single reply — it is load-bearing, not defensive. The status rides along
+/// because `rejected` (refused) and `allowed_warning` (full, but extra usage
+/// is paying) are different news, to the reader and to the seat logic.
+fn rate_limit_notice(info: &Value) -> Option<(String, Option<i64>, String)> {
+    let status = info["status"].as_str().unwrap_or("allowed");
+    if status == "allowed" {
         return None;
     }
     Some((
         info["rateLimitType"].as_str().unwrap_or("usage").to_string(),
         info["resetsAt"].as_i64(),
+        status.to_string(),
     ))
+}
+
+/// Did this run end BECAUSE the seat's usage window is full? Only a turn that
+/// ended on an error can have — a refused request the SDK then recovered from
+/// is not a wall. The evidence is a `rejected` rate-limit event seen on the
+/// stream, or a fatal reason that says so in words (`Claude usage limit
+/// reached|<epoch>` on stdout, `You've hit your session limit · resets …` as
+/// the result).
+fn limit_hit(seen: Option<super::LimitHit>, error: Option<&str>) -> Option<super::LimitHit> {
+    let text = error?;
+    if seen.is_some() {
+        return seen;
+    }
+    crate::accounts::usage_limit_reset(text).map(|resets_at| super::LimitHit { kind: "usage".into(), resets_at })
+}
+
+/// The human label for a usage window, the way the `/stats` card names them.
+fn seat_limit_label(kind: &str, l: &Value) -> String {
+    match kind {
+        "session" => "Session".to_string(),
+        "weekly_all" => "Week (all models)".to_string(),
+        "weekly_scoped" => format!("Week ({})", l["scope"]["model"]["display_name"].as_str().unwrap_or("scoped")),
+        other => {
+            let s = other.replace('_', " ");
+            let mut c = s.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        }
+    }
 }
 
 /// Keep the last few plain-text stdout lines (see `plain_tail`). Bounded in both
@@ -807,7 +900,27 @@ mod tests {
             r#"{"status":"rejected","resetsAt":1785901800,"rateLimitType":"five_hour"}"#,
         )
         .unwrap();
-        assert_eq!(rate_limit_notice(&v), Some(("five_hour".into(), Some(1785901800))));
+        assert_eq!(rate_limit_notice(&v), Some(("five_hour".into(), Some(1785901800), "rejected".into())));
+    }
+
+    /// A THRESHOLD warning, verbatim off this machine's stream on
+    /// 2026-09-06: utilization 0.91 past a 0.75 threshold, `isUsingOverage`
+    /// false — the request was allowed. It is carried (with its status, which
+    /// is what keeps the renderer and the seat logic from mistaking it for a
+    /// refusal), never dropped: only `allowed` proper is a non-event here.
+    #[test]
+    fn a_threshold_warning_keeps_its_status() {
+        let v: Value = serde_json::from_str(
+            r#"{"status":"allowed_warning","resetsAt":1786712400,"rateLimitType":"seven_day",
+                "utilization":0.91,"isUsingOverage":false,"surpassedThreshold":0.75}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rate_limit_notice(&v),
+            Some(("seven_day".into(), Some(1786712400), "allowed_warning".into()))
+        );
+        // …and it must NOT be treated as the seat refusing the turn.
+        assert_eq!(limit_hit(None, Some("some unrelated error")), None);
     }
 
     /// An unfamiliar shape must not be silently swallowed: anything that isn't
@@ -815,6 +928,32 @@ mod tests {
     #[test]
     fn an_unrecognized_rate_limit_status_is_still_relayed() {
         let v: Value = serde_json::from_str(r#"{"status":"something_new"}"#).unwrap();
-        assert_eq!(rate_limit_notice(&v), Some(("usage".into(), None)));
+        assert_eq!(rate_limit_notice(&v), Some(("usage".into(), None, "something_new".into())));
+    }
+
+    /// The wall is only a wall when the turn ENDED on it: a refusal the SDK
+    /// recovered from (the turn finished clean) must not send the caller off
+    /// to re-run a finished turn on another account.
+    #[test]
+    fn a_limit_only_counts_when_the_turn_ended_on_an_error() {
+        let seen = Some(super::super::LimitHit { kind: "five_hour".into(), resets_at: Some(1) });
+        assert_eq!(limit_hit(seen.clone(), None), None, "clean end: no wall");
+        assert_eq!(limit_hit(seen.clone(), Some("anything")), seen, "the event is the evidence");
+        // No event, but the reason says it in words (both field shapes).
+        let by_text = limit_hit(None, Some("claude exited unsuccessfully: Claude usage limit reached|1785900000")).unwrap();
+        assert_eq!(by_text.resets_at, Some(1785900000));
+        assert!(limit_hit(None, Some("You've hit your session limit · resets 6:30pm (Asia/Shanghai)")).is_some());
+        assert_eq!(limit_hit(None, Some("No conversation found with session ID: 29cbfee1")), None);
+    }
+
+    /// The `/api/oauth/usage` windows become the seat's limits, most-occupied
+    /// first, labelled the way `/stats` labels them.
+    #[test]
+    fn seat_limit_labels_follow_the_stats_card() {
+        let scoped: Value = serde_json::json!({ "scope": { "model": { "display_name": "Fable" } } });
+        assert_eq!(seat_limit_label("session", &Value::Null), "Session");
+        assert_eq!(seat_limit_label("weekly_all", &Value::Null), "Week (all models)");
+        assert_eq!(seat_limit_label("weekly_scoped", &scoped), "Week (Fable)");
+        assert_eq!(seat_limit_label("some_new_window", &Value::Null), "Some new window");
     }
 }

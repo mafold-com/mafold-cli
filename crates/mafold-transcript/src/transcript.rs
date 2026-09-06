@@ -422,6 +422,24 @@ impl Transcript {
                 }
                 Advance::Done
             }
+            // A notice from the producer or the driver — a usage limit, a
+            // compaction — is narration, not tool work. It lands in time order
+            // OUTSIDE any group (`push_raw` closes the open one first). Filed
+            // into the group instead, a notice with no tool beside it opened a
+            // tool-less `{% mafold/run summary="Details" %}`; and since Claude
+            // Code reports its rate-limit state AFTER the final text, that
+            // phantom group became the "last tool group" `finish_folded` folds
+            // up to, and the answer went under the lid with the trail
+            // (2026-09-06).
+            AgentEvent::RateLimited { .. } | AgentEvent::Compacted { .. } => {
+                match render::render(ev, &mut self.names) {
+                    Some(s) => {
+                        self.push_raw(&s);
+                        Advance::Immediate
+                    }
+                    None => Advance::Quiet,
+                }
+            }
             // tool / diff / bash result / thinking → into the current group.
             _ => {
                 self.flush_text(); // narration before this group goes out first
@@ -564,10 +582,12 @@ impl Transcript {
         let tail = &self.full[after_last..];
         // Is there an ANSWER outside the fold? Prose counts, and so does a card
         // the MODEL produced — a turn whose whole reply is one `{% mafold/html %}`
-        // answered in cards, not in sentences. What doesn't count is the
-        // end-of-turn bookkeeping the driver appends itself: fold everything and
-        // that stamp would be the entire message.
-        let has_answer = !render::strip_cards(tail).trim().is_empty() || has_own_card(tail);
+        // answered in cards, not in sentences. What doesn't count is what the
+        // driver and the producer wrote on their own behalf: the end-of-turn
+        // stamp, and the notice lines (a usage limit, a compaction, a steer
+        // seam). Fold everything and those would be the entire message.
+        let has_answer =
+            !render::strip_notices(&render::strip_cards(tail)).trim().is_empty() || has_own_card(tail);
         let (head, tail) = if has_answer {
             (head, tail)
         } else {
@@ -1066,5 +1086,77 @@ mod fold_tests {
         let before = t.content().to_string();
         assert_eq!(t.push(&AgentEvent::Steered("   ".into())), Advance::Quiet);
         assert_eq!(t.content(), before);
+    }
+
+    /// THE BUG (2026-09-06): Claude Code reports its usage-limit state after
+    /// the final text. Filed as a tool-group item, that notice opened a
+    /// tool-less "Details" group behind the answer, `finish_folded` took it for
+    /// the last tool group, and the answer went under the lid with the trail.
+    /// A notice is a line in time order; the answer stays in the open.
+    #[test]
+    fn a_notice_after_the_answer_does_not_bury_it() {
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("Looking.".into()));
+        t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+        t.push(&result("a", "x"));
+        t.push(&AgentEvent::Text("and".into()));
+        t.push(&call("b", "Bash", json!({"command": "ls"})));
+        t.push(&result("b", "y"));
+        t.push(&AgentEvent::Text("Here is the answer.".into()));
+        assert_eq!(
+            t.push(&AgentEvent::RateLimited { kind: "seven_day".into(), resets_at: None, status: "rejected".into() }),
+            Advance::Immediate
+        );
+        t.push(&done());
+        let md = t.finish_folded();
+        let close = md.find("{% /mafold/trace %}").expect("folded");
+        let answer = md.find("Here is the answer").expect("answer");
+        assert!(answer > close, "answer buried under the lid:\n{md}");
+        assert!(!md.contains("summary=\"Details\""), "a notice is not a tool group:\n{md}");
+        assert!(md.find("Usage limit").expect("notice") > answer, "notice keeps its time order:\n{md}");
+        assert_eq!(md.matches("{% mafold/run ").count(), 2, "{md}");
+    }
+
+    /// A notice between two tool groups is a line between two run cards — not
+    /// a third card, and not inside either of them.
+    #[test]
+    fn a_notice_between_groups_is_a_line_not_a_group() {
+        let mut t = Transcript::new();
+        t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+        t.push(&result("a", "x"));
+        t.push(&AgentEvent::Compacted { pre_tokens: Some(90_000) });
+        t.push(&call("b", "Read", json!({"file_path": "b.rs"})));
+        t.push(&result("b", "y"));
+        t.push(&AgentEvent::Text("Done.".into()));
+        let md = t.finish();
+        assert_eq!(md.matches("{% mafold/run ").count(), 2, "{md}");
+        assert!(!md.contains("Details"), "{md}");
+        let first_close = md.find("{% /mafold/run %}").unwrap();
+        let notice = md.find("auto-compacted").expect("notice");
+        let second_open = md.rfind("{% mafold/run ").unwrap();
+        assert!(first_close < notice && notice < second_open, "{md}");
+    }
+
+    /// A turn that ends on tool work AND a notice still has no answer: the
+    /// notice must not count as one, or the whole trail folds and the message
+    /// is one line saying "usage limit". It folds one group shallower, as it
+    /// would without the notice, and the notice follows the visible group.
+    #[test]
+    fn a_turn_ending_on_tools_and_a_notice_keeps_its_last_group_visible() {
+        let mut t = Transcript::new();
+        t.push(&AgentEvent::Text("Fixing it.".into()));
+        t.push(&call("a", "Read", json!({"file_path": "a.rs"})));
+        t.push(&result("a", "x"));
+        t.push(&AgentEvent::Text("Now the edit.".into()));
+        t.push(&call("b", "Bash", json!({"command": "cargo test"})));
+        t.push(&result("b", "ok"));
+        t.push(&AgentEvent::RateLimited { kind: "five_hour".into(), resets_at: None, status: "rejected".into() });
+        t.push(&done());
+        let md = t.finish_folded();
+        let close = md.find("{% /mafold/trace %}").expect("folded");
+        let last = md.find("cargo test").expect("last group");
+        assert!(last > close, "last group must stay visible:\n{md}");
+        assert!(md.find("Usage limit").expect("notice") > last, "{md}");
+        assert!(md.find("Fixing it").expect("early narration") < close, "{md}");
     }
 }

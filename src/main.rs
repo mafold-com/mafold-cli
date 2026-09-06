@@ -6,6 +6,7 @@
 //!
 //! Auth is a bot token (`mb_…`) via --token or $MAFOLD_BOT_TOKEN.
 
+mod accounts;
 mod agent;
 mod apps;
 mod ask_hook;
@@ -169,6 +170,11 @@ enum Cmd {
         /// Local harness hint; the server (getMe) is authoritative at runtime.
         #[arg(long)]
         harness: Option<String>,
+        /// Extra environment for this daemon (repeatable, KEY=VALUE) — e.g.
+        /// `--env CLAUDE_SECURESTORAGE_CONFIG_DIR=~/.mafold/claude-accounts/work`
+        /// pins it to one Claude login (see `/login <name>` for adding logins)
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
     },
     /// Remove a bot daemon from the local config (stops it too).
     Rm { name: String },
@@ -377,7 +383,11 @@ async fn main() -> Result<()> {
             name,
             workdir,
             harness,
-        } => supervisor::add(name, token, workdir, harness, &cli.base, cli.no_auto_update)?,
+            env,
+        } => {
+            let env = supervisor::parse_env(&env)?;
+            supervisor::add(name, token, workdir, harness, env, &cli.base, cli.no_auto_update)?
+        }
         Cmd::Chats => chats(&Client::new(cli.base, token)).await?,
         Cmd::Send {
             chat,

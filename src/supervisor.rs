@@ -24,6 +24,36 @@ pub struct DaemonCfg {
     /// Local harness hint; the server (`getMe`) is authoritative at runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
+    /// Extra environment for this daemon's process and everything it spawns —
+    /// the way to pin ONE daemon to a particular login without touching the
+    /// others: `CLAUDE_SECURESTORAGE_CONFIG_DIR` for Claude Code (its turns
+    /// then treat that login as their `default`, see `accounts.rs`),
+    /// `CODEX_HOME` for Codex. Generic on purpose — no per-harness field.
+    /// `mafold add … --env KEY=VALUE`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// `KEY=VALUE` pairs from `--env`, as the map [`DaemonCfg::env`] holds. A
+/// leading `~/` in a value is the home directory (shells only expand it at the
+/// start of a word, so `KEY=~/x` reaches us verbatim).
+pub fn parse_env(pairs: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut m = std::collections::BTreeMap::new();
+    for p in pairs {
+        let Some((k, v)) = p.split_once('=') else {
+            anyhow::bail!("--env expects KEY=VALUE, got `{p}`");
+        };
+        let k = k.trim();
+        if k.is_empty() || k.contains(|c: char| c.is_whitespace() || c == '=') {
+            anyhow::bail!("--env: `{p}` is not a valid variable name");
+        }
+        let v = match v.strip_prefix("~/") {
+            Some(rest) => home().join(rest).to_string_lossy().into_owned(),
+            None => v.to_string(),
+        };
+        m.insert(k.to_string(), v);
+    }
+    Ok(m)
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -117,21 +147,36 @@ fn reap() {
 /// supervisor's own provision claim calls THIS (its next tick starts the
 /// daemon); routing it through `add()` would have the running supervisor call
 /// `up()` → `kill_supervisor_process()` — terminating itself mid-claim.
-pub fn wire(name: String, token: String, workdir: String, harness: Option<String>) -> Result<()> {
+pub fn wire(
+    name: String,
+    token: String,
+    workdir: String,
+    harness: Option<String>,
+    env: std::collections::BTreeMap<String, String>,
+) -> Result<()> {
     let workdir = fs::canonicalize(&workdir).map(|p| p.to_string_lossy().into_owned()).unwrap_or(workdir);
     let mut c = load();
     c.daemons.retain(|d| d.name != name);
-    c.daemons.push(DaemonCfg { name: name.clone(), token, workdir, harness: harness.filter(|s| !s.is_empty()) });
+    c.daemons.push(DaemonCfg { name: name.clone(), token, workdir, harness: harness.filter(|s| !s.is_empty()), env });
     store(&c)?;
     println!("✓ added daemon `{name}`");
     Ok(())
 }
 
-/// `mafold add <name> --workdir … [--harness …]` (token from global --token).
-/// A daemon should simply exist — so adding one brings the boot-persistent
-/// supervisor up: it runs now AND after every reboot, no extra step.
-pub fn add(name: String, token: String, workdir: String, harness: Option<String>, base: &str, no_auto_update: bool) -> Result<()> {
-    wire(name, token, workdir, harness)?;
+/// `mafold add <name> --workdir … [--harness …] [--env K=V …]` (token from
+/// global --token). A daemon should simply exist — so adding one brings the
+/// boot-persistent supervisor up: it runs now AND after every reboot, no
+/// extra step.
+pub fn add(
+    name: String,
+    token: String,
+    workdir: String,
+    harness: Option<String>,
+    env: std::collections::BTreeMap<String, String>,
+    base: &str,
+    no_auto_update: bool,
+) -> Result<()> {
+    wire(name, token, workdir, harness, env)?;
     up(base, no_auto_update)
 }
 
@@ -822,7 +867,9 @@ async fn poll_provisions(http: &reqwest::Client, base: &str, sess: &crate::sessi
         let workdir = provision_workdir(&name);
         // wire(), NOT add(): add()'s `up()` would kill_supervisor_process() —
         // i.e. this very process, mid-claim. The next tick starts the daemon.
-        match wire(name.clone(), token, workdir, harness) {
+        // A provisioned daemon runs on the machine's own login — pinning one
+        // to another account is a local decision (`mafold add --env`).
+        match wire(name.clone(), token, workdir, harness, Default::default()) {
             Ok(()) => println!("⬇ provisioned @{name} — its daemon starts on the next tick"),
             Err(e) => eprintln!("provision @{name} failed: {e}"),
         }
@@ -910,6 +957,9 @@ fn start_one(base: &str, d: &DaemonCfg) -> Result<Option<u32>> {
     cmd.arg("agent")
         // The supervisor owns updates — daemons never self-update.
         .arg("--no-auto-update")
+        // The daemon's own extras first, so nothing in them can shadow the
+        // MAFOLD_* identity below.
+        .envs(&d.env)
         .env("MAFOLD_BASE", base)
         .env("MAFOLD_BOT_TOKEN", &d.token)
         .env("MAFOLD_WORKDIR", &d.workdir)
@@ -1020,8 +1070,13 @@ pub fn status() {
             Some(p) if alive(p) => format!("running (pid {p})"),
             _ => "stopped".into(),
         };
+        let env = if d.env.is_empty() {
+            String::new()
+        } else {
+            format!("  ·  env: {}", d.env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" "))
+        };
         println!(
-            "  • {:<26} {:<20} harness={}  ·  {}",
+            "  • {:<26} {:<20} harness={}  ·  {}{env}",
             d.name,
             state,
             d.harness.as_deref().unwrap_or("claude-code"),
@@ -1047,7 +1102,23 @@ mod tests {
     use super::*;
 
     fn cfg(name: &str) -> DaemonCfg {
-        DaemonCfg { name: name.into(), token: "mb_x".into(), workdir: "/tmp".into(), harness: None }
+        DaemonCfg { name: name.into(), token: "mb_x".into(), workdir: "/tmp".into(), harness: None, env: Default::default() }
+    }
+
+    /// `--env` pairs become the daemon's extra environment; a leading `~/`
+    /// is the home directory, and a pair without `=` is refused rather than
+    /// silently dropped.
+    #[test]
+    fn env_pairs_parse_and_expand_home() {
+        let m = parse_env(&["A=1".into(), "CLAUDE_SECURESTORAGE_CONFIG_DIR=~/.mafold/claude-accounts/work".into()]).unwrap();
+        assert_eq!(m["A"], "1");
+        assert!(m["CLAUDE_SECURESTORAGE_CONFIG_DIR"].ends_with("/.mafold/claude-accounts/work"));
+        assert!(!m["CLAUDE_SECURESTORAGE_CONFIG_DIR"].starts_with('~'));
+        assert!(parse_env(&["NOEQUALS".into()]).is_err());
+        assert!(parse_env(&["=x".into()]).is_err());
+        // Older daemons.json rows have no `env` — they still load.
+        let d: DaemonCfg = serde_json::from_str(r#"{"name":"a:b","token":"mb_x","workdir":"/tmp"}"#).unwrap();
+        assert!(d.env.is_empty());
     }
 
     /// `mafold down claude-code` against a daemon registered as

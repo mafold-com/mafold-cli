@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 /// Names handled by the daemon itself (prepended as control commands) — kept out
 /// of the discovered/built-in list so the menu never shows duplicates.
-const RESERVED: &[&str] = &["clear", "new", "stop", "model", "status", "cwd", "help"];
+const RESERVED: &[&str] = &["clear", "new", "stop", "model", "status", "cwd", "help", "account", "login"];
 
 /// Built-in Claude Code slash commands (v2.1.x). These have no file to scan, so
 /// they're listed here. The daemon emulates many of them (config dumps, /login,

@@ -107,6 +107,21 @@ pub struct Turn {
     /// at the next tool boundary instead of killed and restarted. None = this
     /// harness can't be steered mid-turn (the message queues for the next one).
     pub steer_file: Option<String>,
+    /// Extra process environment for the harness child — the SEAT this turn
+    /// runs on: `CLAUDE_SECURESTORAGE_CONFIG_DIR` picks the Claude login
+    /// (`crate::accounts`), and whatever a future harness keys its login by
+    /// (`CODEX_HOME`) goes through the same door. Applied verbatim on top of
+    /// the daemon's own env; empty = the harness's default login.
+    pub env: Vec<(String, String)>,
+}
+
+/// The seat behind a turn said no: its usage window is full.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LimitHit {
+    /// The window, in the harness's own words (`five_hour`, `seven_day`, …).
+    pub kind: String,
+    /// Epoch seconds it rolls over, when the harness said.
+    pub resets_at: Option<i64>,
 }
 
 /// Outcome of a turn.
@@ -123,6 +138,13 @@ pub struct TurnOutcome {
     /// specific reason to surface to the user. The turn stops cleanly and the
     /// session is still persisted, so a retry resumes with context.
     pub error: Option<String>,
+    /// Set (alongside `error`) when the run ended because the SEAT was
+    /// exhausted — a `rejected` rate-limit event, or a result / exit whose
+    /// reason says the usage limit was reached. Kept apart from `error` so the
+    /// caller can move the same turn to another seat instead of treating the
+    /// session as broken: nothing about the conversation is wrong, only the
+    /// account is out of quota.
+    pub limit: Option<LimitHit>,
 }
 
 /// Where a slash command lands when not a daemon control command.
@@ -320,7 +342,10 @@ pub trait Harness: Send + Sync {
     /// or return `Forward` to run it as a prompt.
     /// `session` is this chat's live harness session id, when it has one — the
     /// only reliable way to report on it, since sibling chats can share a
-    /// workdir and their transcripts race for newest-mtime.
+    /// workdir and their transcripts race for newest-mtime. `env` is the seat
+    /// the chat runs on (see [`Turn::env`]): `/usage`, `/logout` and friends
+    /// must answer for THAT login, not for whichever one the daemon started in.
+    #[allow(clippy::too_many_arguments)]
     async fn command(
         &self,
         client: &Client,
@@ -329,10 +354,13 @@ pub trait Harness: Send + Sync {
         arg: &str,
         workdir: &str,
         session: Option<&str>,
+        env: &[(String, String)],
     ) -> CommandOutcome;
 
-    /// One-line status (e.g. auth account) appended to `/status`. Empty = none.
-    async fn status_line(&self) -> String {
+    /// One-line status (e.g. auth account) appended to `/status`, for the seat
+    /// `env` selects. Empty = none.
+    async fn status_line(&self, env: &[(String, String)]) -> String {
+        let _ = env;
         String::new()
     }
 
@@ -350,7 +378,8 @@ pub trait Harness: Send + Sync {
         String::new()
     }
 
-    /// Probe the subscription seat behind this harness (see [`SeatHealth`]).
+    /// Probe the subscription seat behind this harness (see [`SeatHealth`]) —
+    /// the one `env` selects (see [`Turn::env`]; empty = the default login).
     ///
     /// Default is `unknown` — a harness that cannot ask its upstream "am I still
     /// allowed, and how full is my window" must say so rather than imply health.
@@ -366,7 +395,8 @@ pub trait Harness: Send + Sync {
     /// it would spawn a codex process on every heartbeat. Wiring that up needs
     /// process-lifetime harness instances, which is a separate change; until
     /// then `unknown` is the honest answer.
-    async fn seat_health(&self) -> SeatHealth {
+    async fn seat_health(&self, env: &[(String, String)]) -> SeatHealth {
+        let _ = env;
         SeatHealth::unknown()
     }
 }
@@ -457,9 +487,11 @@ pub fn probe_with_versions() -> Vec<(&'static str, bool, Option<String>)> {
 /// straight to the `harnesses` field.
 ///
 /// Seat health is probed only for harnesses actually installed (asking a missing
-/// CLI about its subscription is noise), and sequentially: only Claude Code does
-/// I/O today, its probe is timeout-bounded at 5s, and a heartbeat has no latency
-/// budget worth a join set for.
+/// CLI about its subscription is noise). A harness with several logins on this
+/// machine (Claude Code's account registry) reports every one of them under
+/// `accounts`, probed side by side; `health` stays the single-seat answer — the
+/// seat a turn would land on right now, i.e. the first healthy one — so a
+/// reader that only knows the older shape still gets the verdict that matters.
 pub async fn report_rows() -> Vec<Value> {
     let probed = tokio::task::spawn_blocking(probe_with_versions)
         .await
@@ -474,15 +506,35 @@ pub async fn report_rows() -> Vec<Value> {
         // `opencode`/`openclaw` — verified live: both rows came back "Max
         // (20x)" with Claude's windows. Ask the harness who it actually is
         // instead of keeping a second list of "ids that are implemented" (§9).
-        let health = match select(id) {
-            h if available && h.id() == id => Some(h.seat_health().await),
-            _ => None,
+        let h = select(id);
+        let implemented = available && h.id() == id;
+        let (health, accounts) = if implemented {
+            // Only Claude Code keys logins by directory today; every other
+            // harness has exactly one seat, its default.
+            let seats = if id == "claude-code" {
+                crate::accounts::load().accounts
+            } else {
+                vec![crate::accounts::Account::default_login()]
+            };
+            let envs: Vec<Vec<(String, String)>> = seats.iter().map(|a| a.env()).collect();
+            let probes: Vec<SeatHealth> =
+                futures_util::future::join_all(envs.iter().map(|e| h.seat_health(e))).await;
+            let lead = probes.iter().position(|s| s.state == "ok").unwrap_or(0);
+            let accounts: Vec<Value> = seats
+                .iter()
+                .zip(&probes)
+                .map(|(a, s)| serde_json::json!({ "name": a.name, "email": a.email, "health": s }))
+                .collect();
+            (probes.get(lead).cloned(), accounts)
+        } else {
+            (None, Vec::new())
         };
         rows.push(serde_json::json!({
             "id": id,
             "available": available,
             "version": version,
             "health": health,
+            "accounts": accounts,
         }));
     }
     rows
