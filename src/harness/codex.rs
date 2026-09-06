@@ -31,6 +31,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::{AgentEvent, CommandOutcome, Harness, Turn, TurnOutcome};
+use mafold_transcript::RunStats;
 use crate::client::Client;
 
 pub struct Codex;
@@ -210,6 +211,13 @@ fn exec_args(session: Option<&str>, model: Option<&str>, effort: Option<&str>) -
 /// normalized events into the sink.
 async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcome> {
     let RunParams { program, full_prompt, workdir, model, effort, conv, draft, cancel, sink } = *p;
+    let stats_started_ms = mafold_transcript::stats::now_ms();
+    let mut item_stats = super::codex_stats::ItemStats::default();
+    let _ = sink.send(AgentEvent::Stats(RunStats {
+        model: model.map(str::to_string),
+        effort: effort.and_then(map_effort).map(str::to_string),
+        ..Default::default()
+    }));
 
     let mut cmd = tokio::process::Command::new(program);
         cmd.args(exec_args(session, model, effort));
@@ -303,6 +311,9 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
                 Err(_) => continue,
             };
 
+            if let Some(phase) = v["type"].as_str().filter(|p| p.starts_with("item.")) {
+                item_stats.observe(phase, &v["item"]);
+            }
             match v["type"].as_str().unwrap_or("") {
                 // The thread id — our resumable session for this conversation.
                 "thread.started" => {
@@ -323,14 +334,22 @@ async fn run_once(p: &RunParams<'_>, session: Option<&str>) -> Result<TurnOutcom
                     error = None;
                     sweep_images!(); // must precede Done — the renderer stops there
                     let u = &v["usage"];
-                    let toks: u64 = ["input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens"]
-                        .iter()
-                        .filter_map(|k| u[*k].as_u64())
-                        .sum();
+                    let mut stats = RunStats::codex(u);
+                    stats.merge(&item_stats.snapshot());
+                    if let Some(thread) = session_id.as_deref() {
+                        let home = codex_home();
+                        let thread = thread.to_string();
+                        let metadata = tokio::task::spawn_blocking(move ||
+                            super::codex_stats::metadata(&home, &thread, stats_started_ms)
+                        ).await.unwrap_or_default();
+                        stats.merge(&metadata);
+                    }
+                    let toks = stats.total_tokens;
+                    let _ = sink.send(AgentEvent::Stats(stats));
                     let _ = sink.send(AgentEvent::Done {
                         duration_ms: None,
                         cost_usd: None,
-                        tokens: if toks > 0 { Some(toks) } else { None },
+                        tokens: toks,
                     });
                     break;
                 }
@@ -757,13 +776,17 @@ mod tests {
 
     /// Drive one turn against a scripted stream.
     async fn run_scripted(tag: &str, stream: &[&str]) -> TurnOutcome {
+        run_scripted_events(tag, stream).await.0
+    }
+
+    async fn run_scripted_events(tag: &str, stream: &[&str]) -> (TurnOutcome, Vec<AgentEvent>) {
         let dir = std::env::temp_dir().join(format!("mafold-codex-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let program = scripted_codex(&dir, stream);
         let workdir = dir.to_string_lossy().to_string();
         let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
-        let (sink, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sink, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let out = run_once(
             &RunParams {
                 program: program.as_os_str(),
@@ -781,7 +804,26 @@ mod tests {
         .await
         .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
-        out
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() { events.push(ev); }
+        (out, events)
+    }
+
+    #[tokio::test]
+    async fn codex_stdout_preserves_usage_into_the_result_body() {
+        let (out, events) = run_scripted_events("result-stats", &[
+            r#"{"type":"thread.started","thread_id":"fixture"}"#,
+            r#"{"type":"item.completed","item":{"id":"reply","type":"agent_message","text":"OK"}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":20}}"#,
+        ]).await;
+        assert!(out.produced);
+        let mut tx = mafold_transcript::Transcript::new();
+        for event in events { tx.push(&event); }
+        let md = tx.finish();
+        assert!(md.contains("\"total_tokens\":120"), "{md}");
+        assert!(md.contains("\"cache_read_tokens\":80"), "{md}");
+        assert!(md.contains("\"cost_usd\":null"), "{md}");
+        assert!(md.contains("\"context_used_tokens\":null"), "{md}");
     }
 
     /// Codex streams RETRY NOTICES through `error` events ("Reconnecting... 2/5

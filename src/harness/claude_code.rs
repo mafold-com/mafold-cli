@@ -12,6 +12,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::{AgentEvent, CommandOutcome, Harness, Turn, TurnOutcome};
+use mafold_transcript::RunStats;
 use crate::client::Client;
 
 pub struct ClaudeCode;
@@ -33,6 +34,9 @@ impl Harness for ClaudeCode {
 
     async fn run(&self, turn: Turn, sink: UnboundedSender<AgentEvent>) -> Result<TurnOutcome> {
         let Turn { prompt, workdir, session, model, effort, thinking, cancel, system, ask_file, steer_file, conv, surface, draft } = turn;
+        let _ = sink.send(AgentEvent::Stats(RunStats {
+            effort: effort.clone(), ..Default::default()
+        }));
         if !Path::new(&workdir).is_dir() {
             bail!("working directory does not exist: {workdir} — check --workdir");
         }
@@ -280,6 +284,12 @@ impl Harness for ClaudeCode {
             // model output. A turn that only compacted and then said nothing is
             // still an empty turn, and must stay eligible for the caller's
             // empty-turn retry.
+            if v["type"] == "system" && v["subtype"] == "init" {
+                let _ = sink.send(AgentEvent::Stats(RunStats {
+                    model: v["model"].as_str().map(str::to_string),
+                    ..Default::default()
+                }));
+            }
             if v["type"] == "system" && v["subtype"] == "compact_boundary" {
                 let _ = sink.send(AgentEvent::Compacted { pre_tokens: compaction_pre_tokens(&v) });
                 continue;
@@ -389,12 +399,24 @@ impl Harness for ClaudeCode {
                 // next `message_start` is a genuinely new message, not a retry.
                 msg_text.clear();
             }
+            if v["type"] == "assistant" {
+                let usage = RunStats::anthropic(&v["message"]["usage"]);
+                let _ = sink.send(AgentEvent::Stats(RunStats {
+                    model: v["message"]["model"].as_str().map(str::to_string),
+                    context_used_tokens: usage.input_tokens,
+                    context_basis: usage.input_tokens.map(|_| "last_request_input".into()),
+                    ..Default::default()
+                }));
+            }
             // Tool results (e.g. bash output).
             if v["type"] == "user" {
                 if let Some(blocks) = v["message"]["content"].as_array() {
                     for b in blocks {
                         if b["type"] == "tool_result" {
                             if let Some(id) = b["tool_use_id"].as_str() {
+                                let _ = sink.send(AgentEvent::ToolStatus {
+                                    id: id.to_string(), failed: b["is_error"].as_bool().unwrap_or(false),
+                                });
                                 let _ = sink.send(AgentEvent::ToolResult { id: id.to_string(), text: tool_result_text(b) });
                                 produced = true;
                             }
@@ -449,6 +471,17 @@ impl Harness for ClaudeCode {
                         produced = true;
                     }
                 }
+                let mut stats = RunStats::anthropic(&v["usage"]);
+                stats.model_requests = v["num_turns"].as_u64();
+                if let Some(models) = v["modelUsage"].as_object().filter(|m| m.len() == 1) {
+                    if let Some((model, usage)) = models.iter().next() {
+                        stats.model = Some(model.clone());
+                        stats.context_limit_tokens = usage["contextWindow"].as_u64();
+                    }
+                }
+                stats.cost_usd = v["total_cost_usd"].as_f64();
+                stats.cost_kind = stats.cost_usd.map(|_| "reported".into());
+                let _ = sink.send(AgentEvent::Stats(stats));
                 let toks = usage_tokens(&v);
                 let _ = sink.send(AgentEvent::Done {
                     duration_ms: v["duration_ms"].as_f64(),

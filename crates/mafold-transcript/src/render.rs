@@ -21,6 +21,7 @@ use crate::event::AgentEvent;
 /// is still a result the user needs to see.
 pub fn render(ev: &AgentEvent, names: &mut HashMap<String, String>) -> Option<String> {
     match ev {
+        AgentEvent::Stats(_) | AgentEvent::ToolStatus { .. } => None,
         AgentEvent::Text(t) => Some(t.clone()),
         AgentEvent::ToolCall { id, name, input } => {
             names.insert(id.clone(), name.to_lowercase());
@@ -495,6 +496,13 @@ fn synth_hunk(old: &str, new: &str) -> (usize, usize, String) {
     for l in &oldl { body.push('-'); body.push_str(l); body.push('\n'); }
     for l in &newl { body.push('+'); body.push_str(l); body.push('\n'); }
     (newl.len(), oldl.len(), body)
+}
+
+pub fn result_with_stats(stats: &crate::RunStats) -> String {
+    let legacy = result_tag(stats.duration_ms, stats.cost_usd, stats.total_tokens)
+        .unwrap_or_else(|| "\n{% mafold/result /%}\n".into());
+    format!("{} %}}\n{}\n{{% /mafold/result %}}\n",
+        legacy.trim_end().trim_end_matches(" /%}"), stats.card_body())
 }
 
 fn result_tag(dur: Option<f64>, cost: Option<f64>, tokens: Option<u64>) -> Option<String> {

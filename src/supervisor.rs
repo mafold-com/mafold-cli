@@ -932,6 +932,13 @@ fn start_one(base: &str, d: &DaemonCfg) -> Result<Option<u32>> {
 /// daemons), or stop just one daemon. `down` is the explicit "off": after it, the
 /// supervisor won't come back on reboot until `mafold up` / `add` again.
 pub fn down(only: Option<&str>) -> Result<()> {
+    let c = load();
+    // A name that matches nothing is a typo or a wrong guess, never a no-op.
+    // 2026-09-05: a bot restarted itself with `mafold down claude-code` while
+    // registered as `fei_pota:claude-code`, read the "0 daemon(s) stopped" as
+    // success, and the stuck turn it was trying to shake off lived on for
+    // another seven minutes of "why is it still ignoring me".
+    require_known(only, &c.daemons)?;
     // Stop the supervisor FIRST (when stopping everything) so it doesn't just
     // respawn the daemons we're about to kill — remove the service so KeepAlive /
     // Restart doesn't relaunch it, then kill the process.
@@ -940,7 +947,6 @@ pub fn down(only: Option<&str>) -> Result<()> {
         kill_supervisor_process();
         println!("✓ stopped supervisor (autostart removed)");
     }
-    let c = load();
     let mut stopped = 0;
     for d in &c.daemons {
         if only.is_some_and(|n| n != d.name) { continue; }
@@ -951,6 +957,33 @@ pub fn down(only: Option<&str>) -> Result<()> {
     }
     println!("{stopped} daemon(s) stopped");
     Ok(())
+}
+
+/// `down <name>` must name a configured daemon. Daemons are registered under the
+/// bot's full handle (`owner:bot`), which is not how anyone says them out loud,
+/// so besides listing what IS configured the error points at the handle whose
+/// bot part matches. Resolving the short form silently is a separate decision:
+/// two owners' bots on one machine can share it, so here it is only a hint.
+fn require_known(only: Option<&str>, daemons: &[DaemonCfg]) -> Result<()> {
+    let Some(n) = only else { return Ok(()) };
+    if daemons.iter().any(|d| d.name == n) {
+        return Ok(());
+    }
+    let known: Vec<&str> = daemons.iter().map(|d| d.name.as_str()).collect();
+    if known.is_empty() {
+        anyhow::bail!("no daemon named `{n}` — none configured (see `mafold status`)");
+    }
+    let meant: Vec<&str> = known
+        .iter()
+        .copied()
+        .filter(|k| k.rsplit(':').next() == Some(n) || k.eq_ignore_ascii_case(n))
+        .collect();
+    let hint = match meant.as_slice() {
+        [] => String::new(),
+        [one] => format!(" — did you mean `{one}`?"),
+        many => format!(" — did you mean one of: {}?", many.join(", ")),
+    };
+    anyhow::bail!("no daemon named `{n}`{hint}\nconfigured: {}", known.join(", "))
 }
 
 fn stop_one(name: &str) -> Result<()> {
@@ -1007,4 +1040,41 @@ pub fn logs(name: &str) -> Result<()> {
         println!("{l}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(name: &str) -> DaemonCfg {
+        DaemonCfg { name: name.into(), token: "mb_x".into(), workdir: "/tmp".into(), harness: None }
+    }
+
+    /// `mafold down claude-code` against a daemon registered as
+    /// `fei_pota:claude-code` printed "0 daemon(s) stopped" and exited 0 — a
+    /// restart that never happened, read as one that did.
+    #[test]
+    fn an_unknown_name_is_an_error_that_names_the_real_one() {
+        let d = [cfg("fei_pota:claude-code"), cfg("fei_pota:cuicui")];
+        let e = require_known(Some("claude-code"), &d).unwrap_err().to_string();
+        assert!(e.contains("no daemon named `claude-code`"), "{e}");
+        assert!(e.contains("did you mean `fei_pota:claude-code`"), "{e}");
+        assert!(e.contains("fei_pota:cuicui"), "{e}");
+        // the exact handle, and "everything", stay fine
+        assert!(require_known(Some("fei_pota:cuicui"), &d).is_ok());
+        assert!(require_known(None, &d).is_ok());
+        // nothing configured at all says so instead of listing nothing
+        let e = require_known(Some("x"), &[]).unwrap_err().to_string();
+        assert!(e.contains("none configured"), "{e}");
+    }
+
+    /// Two owners' bots can share the short form on one machine — the hint
+    /// lists both rather than picking one, which is why matching it silently
+    /// is a separate decision.
+    #[test]
+    fn a_shared_short_name_lists_every_candidate() {
+        let d = [cfg("a:assistant"), cfg("b:assistant")];
+        let e = require_known(Some("assistant"), &d).unwrap_err().to_string();
+        assert!(e.contains("did you mean one of: a:assistant, b:assistant"), "{e}");
+    }
 }

@@ -32,6 +32,11 @@
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
+// Which `{% … %}` sit inside markdown code is ONE rule for every Rust scanner
+// (this qualifier, the api's and the daemon's @-mention gates) — and it mirrors
+// the client splitter, `cards/split.ts`.
+use mafold_transcript::prose::{code_ranges, in_code};
+
 /// The account whose cards are first-party. Mirrors `cards_api::OFFICIAL_SCOPE`.
 const OFFICIAL: &str = "mafold";
 
@@ -145,86 +150,6 @@ pub fn qualify(text: &str) -> String {
     }
     out.push_str(&text[copied..]);
     out
-}
-
-/// Byte ranges that sit inside markdown code — fenced blocks and inline
-/// backtick spans. Same rule as the client splitter (`cards/split.ts`), so the
-/// daemon and the renderer agree on which `{% … %}` are live tags.
-fn code_ranges(s: &str) -> Vec<(usize, usize)> {
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    // Fenced blocks: a line whose start (≤3 spaces in) is ``` or ~~~ opens; the
-    // next fence line of the same char and at least as long closes it.
-    let mut open_at: Option<(usize, char, usize)> = None;
-    let mut pos = 0usize;
-    while pos <= s.len() {
-        let end = s[pos..].find('\n').map_or(s.len(), |i| pos + i);
-        let line = &s[pos..end];
-        let fence = fence_mark(line);
-        match (open_at, fence) {
-            (None, Some(f)) => open_at = Some((pos, f.0, f.1)),
-            (Some((from, ch, len)), Some(f)) if f.0 == ch && f.1 >= len => {
-                ranges.push((from, end));
-                open_at = None;
-            }
-            _ => {}
-        }
-        if end == s.len() {
-            break;
-        }
-        pos = end + 1;
-    }
-    if let Some((from, _, _)) = open_at {
-        ranges.push((from, s.len())); // unclosed fence → code to EOF
-    }
-    // Inline spans outside fenced blocks: a run of N backticks closes at the
-    // next run of exactly N (CommonMark).
-    let fenced = ranges.clone();
-    let b = s.as_bytes();
-    let mut open: Option<(usize, usize)> = None;
-    let mut i = 0usize;
-    while i < b.len() {
-        if b[i] != b'`' {
-            i += 1;
-            continue;
-        }
-        let run = i;
-        while i < b.len() && b[i] == b'`' {
-            i += 1;
-        }
-        let len = i - run;
-        if in_code(run, &fenced) {
-            open = None;
-            continue;
-        }
-        match open {
-            None => open = Some((run, len)),
-            Some((from, want)) if want == len => {
-                ranges.push((from, i));
-                open = None;
-            }
-            _ => {}
-        }
-    }
-    ranges
-}
-
-/// `(fence char, run length)` when the line opens/closes a fence.
-fn fence_mark(line: &str) -> Option<(char, usize)> {
-    let indent = line.len() - line.trim_start_matches(' ').len();
-    if indent > 3 {
-        return None;
-    }
-    let rest = &line[indent..];
-    let ch = rest.chars().next()?;
-    if ch != '`' && ch != '~' {
-        return None;
-    }
-    let n = rest.chars().take_while(|c| *c == ch).count();
-    (n >= 3).then_some((ch, n))
-}
-
-fn in_code(i: usize, ranges: &[(usize, usize)]) -> bool {
-    ranges.iter().any(|(a, b)| i >= *a && i < *b)
 }
 
 #[cfg(test)]

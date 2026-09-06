@@ -627,6 +627,80 @@ const TOKEN: &[SecretField] = &[
     },
 ];
 
+/// The payload of a connection that DESCRIBES ITS OWN SERVER.
+///
+/// Every other row above says where a credential goes (`mcp_url`) and how it
+/// rides (`auth`) in the registry — data the pack signs and a client trusts.
+/// A user's own MCP server cannot be a row in that pack: it is one person's
+/// endpoint, and a registry that took per-user rows from the api would let a
+/// server that can already rewrite a connection's cleartext `provider` field
+/// point any existing credential at a row of its choosing. So the address
+/// lives in the ONE place the server provably cannot write: the sealed
+/// payload. `endpoint` here is not a secret; it is inside the ciphertext
+/// because that is what makes it unforgeable, not because it is private.
+///
+/// `access_token` is named exactly as [`BEARER`]'s `field` so that the common
+/// case — a server wanting `Authorization: Bearer <token>` — needs no auth
+/// override at all. `auth_header` / `auth_prefix` exist for the rare server
+/// with its own header (Figma's `X-Figma-Token` is the precedent), and are
+/// issued by the link flow rather than typed: a form asking "which header?"
+/// would be asking most people a question they cannot answer.
+///
+/// Declaring `endpoint` as a payload key IS the delegation — see
+/// [`ProviderInfo::delegates_endpoint`]. A row that does not declare it keeps
+/// answering "this provider has no server" no matter what its payload says,
+/// which is the whole guarantee.
+const MCP_SELF_DESCRIBED: &[SecretField] = &[
+    SecretField {
+        key: "endpoint",
+        label: "Server URL",
+        required: true,
+        issued: false,
+    },
+    SecretField {
+        key: "access_token",
+        label: "Access token",
+        required: false,
+        issued: false,
+    },
+    SecretField {
+        key: "auth_header",
+        label: "Credential header",
+        required: false,
+        issued: true,
+    },
+    SecretField {
+        key: "auth_prefix",
+        label: "Credential prefix",
+        required: false,
+        issued: true,
+    },
+    SecretField {
+        key: "refresh_token",
+        label: "Refresh token",
+        required: false,
+        issued: true,
+    },
+    SecretField {
+        key: "expires_at",
+        label: "Expires at (unix ms)",
+        required: false,
+        issued: true,
+    },
+    SecretField {
+        key: "client_id",
+        label: "OAuth client id",
+        required: false,
+        issued: true,
+    },
+    SecretField {
+        key: "token_endpoint",
+        label: "Token endpoint",
+        required: false,
+        issued: true,
+    },
+];
+
 /// Every provider Mafold knows how to hold a credential for.
 pub const PROVIDERS: &[ProviderSpec] = &[
     ProviderSpec {
@@ -886,10 +960,60 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         device_bound: true,
         oauth_client: None,
     },
+    // Any MCP server the user can name — the one row that is not a vendor.
+    //
+    // This exists for the vendors this table does not have yet (owner,
+    // 2026-09-04: "自定义 mcp 主要就是指我们这边没开放的,比如 stripe"). A person
+    // who wants Stripe's MCP server today should not have to wait for a row
+    // to be authored, signed and published; they type the URL and the same
+    // machinery — sealed payload, device-side calls, `connection.use` grants —
+    // carries it. When a first-party row for that vendor lands later, the two
+    // coexist; nothing is migrated (owner ruling, same day).
+    //
+    // What is deliberately ABSENT: `mcp_url`. That field empty plus `endpoint`
+    // among the payload keys is the signal — to the core, to the cli, to the
+    // web — that the sealed payload names the server. See
+    // [`MCP_SELF_DESCRIBED`] for why the address has to travel sealed.
+    //
+    // `oauth_capable: false` is not a statement that these servers lack OAuth
+    // (most vendor-hosted ones have it, with dynamic registration). It cannot
+    // be answered statically at all: the answer is per server, discovered when
+    // the URL is typed. A client draws a URL-first flow for this row and
+    // probes, rather than reading these booleans.
+    ProviderSpec {
+        id: "mcp",
+        display: "MCP server",
+        blurb: "Any MCP server you can reach — vendors we haven't added yet",
+        // No vendor, so no vendor mark — the same placeholder `computer` wears.
+        badge: "",
+        kind: ProviderKind::ApiKey,
+        fields: MCP_SELF_DESCRIBED,
+        import_path: None,
+        env_var: None,
+        // The default when the payload carries no override. Named `access_token`
+        // on both sides on purpose; see `MCP_SELF_DESCRIBED`.
+        auth: BEARER,
+        oauth_capable: false,
+        help_url: Some("https://modelcontextprotocol.io/clients"),
+        mcp_url: None,
+        native_api: None,
+        device_bound: false,
+        oauth_client: None,
+    },
 ];
 
 pub fn provider(id: &str) -> Option<&'static ProviderSpec> {
     PROVIDERS.iter().find(|p| p.id == id)
+}
+
+impl ProviderSpec {
+    /// Whether this row leaves the server address to the sealed payload.
+    ///
+    /// The compiled-table twin of [`ProviderInfo::delegates_endpoint`]; the
+    /// rule is spelled out there.
+    pub fn delegates_endpoint(&self) -> bool {
+        self.mcp_url.is_none() && self.fields.iter().any(|f| f.key == "endpoint")
+    }
 }
 
 /// The registry as a client sees it — display-ready, so a UI renders it
@@ -1010,6 +1134,29 @@ pub struct ProviderInfo {
     /// pretend. The only part of a provider that a release still gates.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_api: Option<String>,
+}
+
+impl ProviderInfo {
+    /// Whether this row leaves the server address to the sealed payload.
+    ///
+    /// **The rule, in one line: a row that names no `mcp_url` but declares
+    /// `endpoint` among its payload keys has delegated "where to send" to the
+    /// ciphertext.** Two things make that a mechanism rather than a name check:
+    ///
+    ///  * It is read off fields every client already has on the wire — nothing
+    ///    was added to this struct, which matters because the served pack's
+    ///    digest is computed by re-serialising parsed rows, so a field an
+    ///    older client drops would make it reject the whole registry (the
+    ///    `computer` lesson).
+    ///  * It never fires for a row that DOES name a server. Notion's payload
+    ///    cannot redirect Notion's token: the registry wins whenever it speaks,
+    ///    and only silence hands the question to the payload.
+    ///
+    /// Rows with neither (`anthropic-api`, `claude-code-oauth`) stay what they
+    /// are — credentials handed to a tool, with no server to call.
+    pub fn delegates_endpoint(&self) -> bool {
+        self.mcp_url.is_none() && self.payload_keys.iter().any(|k| k == "endpoint")
+    }
 }
 
 /// The key a published provider pack must be signed with, base64 raw Ed25519.
@@ -1308,8 +1455,60 @@ mod tests {
                 "figma-oauth",
                 "github",
                 "computer",
+                "mcp",
             ]
         );
+    }
+
+    /// The `mcp` row is the first provider whose SERVER is chosen by the user,
+    /// and the shape below is what every client keys off — not the id.
+    ///
+    ///  * no `mcp_url`, `endpoint` in the payload keys: the delegation signal;
+    ///  * `endpoint` and `access_token` are the only DRAWN fields, so an older
+    ///    client that predates the URL-first flow still renders something a
+    ///    person can fill — and stores a payload the new core can call;
+    ///  * every key a link flow issues survives `filter_payload`, or the
+    ///    renewal material vanishes at seal time (the `expires_at` lesson);
+    ///  * no other row declares `endpoint`, so the signal cannot misfire on a
+    ///    vendor whose payload was sealed by an older client.
+    #[test]
+    fn the_mcp_row_delegates_its_server_to_the_sealed_payload() {
+        let spec = provider("mcp").expect("the mcp row");
+        assert!(spec.delegates_endpoint());
+        assert!(spec.mcp_url.is_none() && spec.native_api.is_none());
+        assert!(!spec.device_bound && spec.oauth_client.is_none());
+
+        let info = provider_infos().into_iter().find(|p| p.id == "mcp").unwrap();
+        assert!(info.delegates_endpoint());
+        assert_eq!(
+            info.fields.iter().map(|f| f.key.as_str()).collect::<Vec<_>>(),
+            vec!["endpoint", "access_token"]
+        );
+        assert!(info.fields[0].required && !info.fields[1].required);
+        for key in [
+            "endpoint",
+            "access_token",
+            "auth_header",
+            "auth_prefix",
+            "refresh_token",
+            "expires_at",
+            "client_id",
+            "token_endpoint",
+        ] {
+            assert!(info.payload_keys.iter().any(|k| k == key), "payload must keep `{key}`");
+        }
+        // The default ride is the standard bearer header on `access_token`, so
+        // a payload with no override needs no translation.
+        assert_eq!(info.auth.field, "access_token");
+        assert!(info.browser_linkable && !info.device_link && !info.oauth);
+
+        for other in provider_infos().iter().filter(|p| p.id != "mcp") {
+            assert!(
+                !other.delegates_endpoint(),
+                "{}: only the self-described row may delegate its endpoint",
+                other.id
+            );
+        }
     }
 
     /// The `computer` row is the first provider that is a MACHINE, and three of
@@ -1393,8 +1592,13 @@ mod tests {
             // no vendor at all — every surface draws a placeholder for it — and
             // inventing a logo for "a computer" would be four cuts of art for a
             // row that isn't a brand.
+            // A `device_bound` row has no vendor at all — every surface draws a
+            // placeholder for it — and inventing a logo for "a computer" would
+            // be four cuts of art for a row that isn't a brand. The self-
+            // described row is vendor-less the same way: it stands for every
+            // server the table does not name.
             assert!(
-                !p.badge.is_empty() || p.device_bound,
+                !p.badge.is_empty() || p.device_bound || p.delegates_endpoint(),
                 "{}: no badge slug",
                 p.id
             );

@@ -23,7 +23,7 @@ use serde_json::{Map, Value};
 use crate::mcp::{McpClient, McpError, MethodSpec};
 use crate::net;
 use crate::vault::{self, Key};
-use mafold_types::connections::ProviderInfo;
+use mafold_types::connections::{AuthInfo, ProviderInfo};
 
 /// How long a fetched tool catalog stays fresh in memory.
 ///
@@ -163,14 +163,76 @@ impl Runtime {
     }
 
     /// The MCP endpoint for a connection, or a sentence about why there is none.
-    fn endpoint(spec: &ProviderInfo) -> Result<&str> {
-        spec.mcp_url.as_deref().ok_or_else(|| {
-            format!(
-                "{} has no MCP server, so it has no methods — it is a credential to hand to a \
-                 tool, not a thing to call",
-                spec.display
-            )
-        })
+    ///
+    /// **The registry speaks first, and the payload only when it is silent.**
+    /// A row that names an `mcp_url` is sent there and nowhere else — a sealed
+    /// payload cannot redirect Notion's token, however it was written. A row
+    /// that instead delegates ([`ProviderInfo::delegates_endpoint`]) is the
+    /// user's own server, and the address lives in the ciphertext because that
+    /// is the one place the api provably cannot put an address of its choosing
+    /// (`.docs/custom-mcp-v1.md` §2). Every other row has no server at all.
+    ///
+    /// Takes the OPENED payload, which is why callers open before they ask:
+    /// the order used to be the reverse, and for a delegating row that is a
+    /// question asked before the answer exists.
+    fn endpoint(spec: &ProviderInfo, payload: &Map<String, Value>) -> Result<String> {
+        if let Some(url) = spec.mcp_url.as_deref() {
+            return Ok(url.to_string());
+        }
+        if spec.delegates_endpoint() {
+            return payload
+                .get("endpoint")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    // A fixable state, and the sentence must say so: this is a
+                    // row that was sealed without its address, not a provider
+                    // that has none.
+                    "this connection carries no server address — link it again from \
+                     Settings ▸ Connections"
+                        .to_string()
+                });
+        }
+        Err(format!(
+            "{} has no MCP server, so it has no methods — it is a credential to hand to a \
+             tool, not a thing to call",
+            spec.display
+        ))
+    }
+
+    /// How the credential rides for this connection.
+    ///
+    /// The registry's [`AuthInfo`] for every row that names its server. For a
+    /// delegating row the payload may carry `auth_header` / `auth_prefix` —
+    /// the link flow writes them for a server that wants something other than
+    /// `Authorization: Bearer` (Figma's `X-Figma-Token` is the shape this is
+    /// for). The FIELD never moves: it is `access_token` on both sides so the
+    /// common case needs no override at all.
+    fn auth_for(spec: &ProviderInfo, payload: &Map<String, Value>) -> AuthInfo {
+        let mut auth = spec.auth.clone();
+        if !spec.delegates_endpoint() {
+            return auth;
+        }
+        // The prefix is NOT trimmed: its trailing space is the whole point
+        // (`Bearer ` vs `Bearer`), and a server reads `BearerTOKEN` as garbage.
+        let raw = |k: &str| {
+            payload
+                .get(k)
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string)
+        };
+        if let Some(header) = raw("auth_header") {
+            auth.header = header.trim().to_string();
+            // A custom header carries the token verbatim unless the payload
+            // says otherwise: `X-Api-Key: Bearer …` is what nobody means.
+            auth.prefix = raw("auth_prefix").unwrap_or_default();
+        } else if let Some(prefix) = raw("auth_prefix") {
+            auth.prefix = prefix;
+        }
+        auth
     }
 
     /// Every method a connection offers, cached in memory.
@@ -189,10 +251,12 @@ impl Runtime {
         if spec.native_api.as_deref() == Some(crate::computer::DRIVER) {
             return Ok(crate::computer::method_specs());
         }
-        let url = Self::endpoint(&spec)?;
+        // Open before asking where to send: a delegating row keeps its address
+        // in the payload.
         let payload = self.refreshed_payload(name, &conn, &spec).await?;
+        let url = Self::endpoint(&spec, &payload)?;
 
-        let methods = match self.catalog(url, &spec, &payload).await {
+        let methods = match self.catalog(&url, &spec, &payload).await {
             Ok(m) => m,
             // The credential was refused even after any renewal above, so the
             // grant itself is gone (revoked at the provider, or a refresh token
@@ -218,7 +282,8 @@ impl Runtime {
         spec: &ProviderInfo,
         payload: &Map<String, Value>,
     ) -> std::result::Result<Vec<MethodSpec>, McpError> {
-        let mut client = McpClient::new(url, &spec.auth, &credential(spec, payload));
+        let mut client =
+            McpClient::new(url, &Self::auth_for(spec, payload), &credential(spec, payload));
         client.initialize().await?;
         client.list_tools().await
     }
@@ -413,10 +478,11 @@ impl Runtime {
     pub async fn call(&mut self, name: &str, method: &str, params: Value) -> Result<Value> {
         let conn = self.get(name).await?;
         let spec = self.descriptor_of(&conn).await?;
-        let url = Self::endpoint(&spec)?;
         let payload = self.refreshed_payload(name, &conn, &spec).await?;
+        let url = Self::endpoint(&spec, &payload)?;
 
-        let mut client = McpClient::new(url, &spec.auth, &credential(&spec, &payload));
+        let mut client =
+            McpClient::new(&url, &Self::auth_for(&spec, &payload), &credential(&spec, &payload));
         client.initialize().await.map_err(|e| match e {
             McpError::Unauthorized(m) => unauthorized_msg(name, &spec, &m),
             e => e.to_string(),
@@ -673,6 +739,18 @@ pub fn needs_renewal(payload: &Map<String, Value>) -> bool {
 /// adds the only thing the provider cannot know: which Mafold connection this
 /// was, and how to fix it here.
 fn unauthorized_msg(name: &str, spec: &ProviderInfo, detail: &str) -> String {
+    if spec.delegates_endpoint() {
+        // The server is the user's own choice, so "which provider" says
+        // nothing useful; where to re-link does. The address it needs is in
+        // the payload the caller just opened — not repeated here, where it
+        // would ride into logs alongside the provider's refusal.
+        return format!(
+            "the server behind `{name}` refused this credential: {detail}\n  \
+             re-link it from Settings ▸ Connections, or:  \
+             mafold connection add {name} --provider {} --url <server>",
+            spec.id
+        );
+    }
     format!(
         "{} refused this credential: {detail}\n  \
          re-link it:  mafold connection add {name} --provider {}",
@@ -826,10 +904,115 @@ mod tests {
     /// message has to say which it is.
     #[test]
     fn a_provider_without_mcp_explains_itself() {
-        let err = Runtime::endpoint(&info("anthropic-api")).unwrap_err();
+        let none = Map::new();
+        let err = Runtime::endpoint(&info("anthropic-api"), &none).unwrap_err();
         assert!(err.contains("no MCP server"), "{err}");
-        assert!(Runtime::endpoint(&info("notion")).is_ok());
-        assert!(Runtime::endpoint(&info("figma")).is_ok());
+        assert!(Runtime::endpoint(&info("notion"), &none).is_ok());
+        assert!(Runtime::endpoint(&info("figma"), &none).is_ok());
+    }
+
+    /// The self-described row: its server is wherever the SEALED payload says.
+    #[test]
+    fn a_delegating_row_reads_its_server_from_the_payload() {
+        let payload = map(json!({ "endpoint": " https://mcp.stripe.com/ ", "access_token": "t" }));
+        assert_eq!(
+            Runtime::endpoint(&info("mcp"), &payload).unwrap(),
+            "https://mcp.stripe.com/"
+        );
+    }
+
+    /// **The security property of the whole design.** A row that names its
+    /// server is sent there and nowhere else — an `endpoint` smuggled into
+    /// Notion's payload changes nothing. Without this, the sealed payload would
+    /// be a second place to redirect a credential, and the registry signature
+    /// would guard only half the door.
+    #[test]
+    fn a_registry_row_ignores_an_endpoint_in_its_payload() {
+        let hostile = map(json!({ "endpoint": "https://evil.example/mcp", "access_token": "t" }));
+        assert_eq!(
+            Runtime::endpoint(&info("notion"), &hostile).unwrap(),
+            info("notion").mcp_url.unwrap()
+        );
+        // And a row with no server stays a row with no server: `anthropic-api`
+        // did not delegate, so an `endpoint` in its payload is just a stray key.
+        let err = Runtime::endpoint(&info("anthropic-api"), &hostile).unwrap_err();
+        assert!(err.contains("no MCP server"), "{err}");
+    }
+
+    /// A delegating row sealed without its address is a FIXABLE state, and the
+    /// sentence must send the person to the fix rather than call the provider
+    /// server-less.
+    #[test]
+    fn a_delegating_row_without_an_address_says_to_relink() {
+        for payload in [json!({}), json!({ "endpoint": "  " })] {
+            let err = Runtime::endpoint(&info("mcp"), &map(payload)).unwrap_err();
+            assert!(err.contains("link it again"), "{err}");
+            assert!(!err.contains("no MCP server"), "{err}");
+        }
+    }
+
+    /// The credential's header comes from the payload only for a delegating
+    /// row, and the FIELD never moves.
+    #[test]
+    fn payload_auth_overrides_apply_only_to_a_delegating_row() {
+        // Default ride: standard bearer, nothing overridden.
+        let plain = Runtime::auth_for(&info("mcp"), &map(json!({ "endpoint": "https://x" })));
+        assert_eq!((plain.header.as_str(), plain.prefix.as_str(), plain.field.as_str()),
+                   ("Authorization", "Bearer ", "access_token"));
+
+        // A custom header carries the token verbatim unless a prefix is given.
+        let keyed = Runtime::auth_for(
+            &info("mcp"),
+            &map(json!({ "endpoint": "https://x", "auth_header": "X-Api-Key" })),
+        );
+        assert_eq!((keyed.header.as_str(), keyed.prefix.as_str()), ("X-Api-Key", ""));
+        let both = Runtime::auth_for(
+            &info("mcp"),
+            &map(json!({ "endpoint": "https://x", "auth_header": "X-Token", "auth_prefix": "Token " })),
+        );
+        assert_eq!((both.header.as_str(), both.prefix.as_str()), ("X-Token", "Token "));
+        // Prefix alone keeps the standard header.
+        let prefixed = Runtime::auth_for(
+            &info("mcp"),
+            &map(json!({ "endpoint": "https://x", "auth_prefix": "Basic " })),
+        );
+        assert_eq!((prefixed.header.as_str(), prefixed.prefix.as_str()), ("Authorization", "Basic "));
+        assert_eq!(prefixed.field, "access_token");
+
+        // Notion's payload cannot change how Notion's credential rides.
+        let notion = Runtime::auth_for(
+            &info("notion"),
+            &map(json!({ "auth_header": "X-Evil", "auth_prefix": "" })),
+        );
+        assert_eq!(notion, info("notion").auth);
+    }
+
+    /// The address and the auth override are payload keys the row declares,
+    /// so sealing keeps them — the way `expires_at` was NOT kept, once.
+    #[test]
+    fn sealing_a_delegating_row_keeps_its_address_and_ride() {
+        let kept = filter_payload(
+            &info("mcp"),
+            &map(json!({
+                "endpoint": "https://mcp.stripe.com/",
+                "access_token": "t",
+                "auth_header": "X-Api-Key",
+                "stray": "dropped",
+            })),
+        );
+        assert_eq!(kept.get("endpoint").unwrap(), "https://mcp.stripe.com/");
+        assert_eq!(kept.get("auth_header").unwrap(), "X-Api-Key");
+        assert!(kept.get("stray").is_none());
+    }
+
+    /// The refusal message for a delegating row names the fix, not a vendor —
+    /// there is no vendor — and does not repeat the address.
+    #[test]
+    fn a_delegating_rows_refusal_points_at_settings() {
+        let m = unauthorized_msg("stripe", &info("mcp"), "invalid_token");
+        assert!(m.contains("Settings ▸ Connections"), "{m}");
+        assert!(m.contains("--provider mcp --url"), "{m}");
+        assert!(m.contains("invalid_token"), "{m}");
     }
 
     /// A row the registry doesn't have is no longer "your binary is old".
@@ -945,6 +1128,166 @@ mod tests {
             .await
         );
         assert!(mock.requests.lock().unwrap().is_empty());
+    }
+
+    // ── a server of your own naming ──
+
+    /// What a server the person named looks like to this process: an HTTP
+    /// endpoint that speaks JSON-RPC and has never heard of Mafold. Records
+    /// the headers of every request so a test can say what was — and was NOT
+    /// — sent with them.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn fake_mcp_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<HashMap<String, String>>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let sink = sink.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16384];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let (head, body) = req.split_once("\r\n\r\n").unwrap_or((&req, ""));
+                    let headers: HashMap<String, String> = head
+                        .lines()
+                        .skip(1)
+                        .filter_map(|l| l.split_once(':'))
+                        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                        .collect();
+                    sink.lock().unwrap().push(headers);
+                    let rpc: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+                    let id = rpc.get("id").cloned();
+                    let method = rpc.get("method").and_then(Value::as_str).unwrap_or("");
+                    // A notification has no id and gets no body.
+                    let (status, reply) = match (id, method) {
+                        (None, _) => (202, String::new()),
+                        (Some(id), "initialize") => (200, json!({ "jsonrpc": "2.0", "id": id, "result": {
+                            "protocolVersion": PROTOCOL_VERSION_FOR_TESTS, "capabilities": {},
+                            "serverInfo": { "name": "fake", "version": "0" }
+                        }}).to_string()),
+                        (Some(id), "tools/list") => (200, json!({ "jsonrpc": "2.0", "id": id, "result": {
+                            "tools": [{ "name": "echo", "description": "Echo", "inputSchema": { "type": "object" } }]
+                        }}).to_string()),
+                        (Some(id), "tools/call") => (200, json!({ "jsonrpc": "2.0", "id": id, "result": {
+                            "echoed": rpc.pointer("/params/arguments").cloned().unwrap_or(Value::Null)
+                        }}).to_string()),
+                        (Some(id), other) => (200, json!({ "jsonrpc": "2.0", "id": id, "error": {
+                            "code": -32601, "message": format!("no such method: {other}")
+                        }}).to_string()),
+                    };
+                    let _ = sock
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 {status} OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                                reply.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}/mcp"), seen)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    const PROTOCOL_VERSION_FOR_TESTS: &str = crate::mcp::PROTOCOL_VERSION;
+
+    /// One stored row of the self-described provider, sealed the way a link
+    /// flow seals it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn mcp_row(umk: &Key, payload: Value) -> String {
+        let sealed = vault::seal_payload(umk, &payload.to_string());
+        json!({ "items": [{
+            "name": "stripe",
+            "provider": "mcp",
+            "label": "127.0.0.1",
+            "blob": sealed.blob,
+            "wrapped_dek": sealed.wrapped_dek,
+            "key_id": "k1",
+        }]})
+        .to_string()
+    }
+
+    /// The whole device-side path for a self-described row: the call arrives
+    /// on the socket, the row is opened, the ADDRESS IN THE PAYLOAD is where
+    /// the MCP request goes — and with no credential in the payload, no
+    /// credential header goes with it. The registry row says nothing about
+    /// where to send; that this works at all is the delegation.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn a_self_described_row_is_called_at_the_address_in_its_payload() {
+        use crate::testutil::{ok, spawn_mock};
+        let _reg = with_registry();
+        let (endpoint, seen) = fake_mcp_server().await;
+        let umk = Key::random();
+        let row = mcp_row(&umk, json!({ "endpoint": endpoint }));
+        let mock = spawn_mock(vec![
+            ok(r#"{"claimed":true}"#), // ours
+            ok(&row),                  // call_any reads the row
+            ok(&row),                  // call() re-reads it before opening
+            ok("null"),                // answerConnectionCall
+        ]);
+        let mut rt = Runtime::new(&mock.base, "s_token", umk);
+
+        handle_event(
+            &mut rt,
+            r#"{"method":"events.connectionCall","params":{"call_id":"c-9","connection":"stripe","method":"echo","params":{"x":1}}}"#,
+        )
+        .await;
+
+        let reqs = mock.requests.lock().unwrap();
+        let answer = reqs.last().expect("an answer");
+        assert_eq!(answer.path, "/answerConnectionCall");
+        assert!(answer.body.contains(r#""echoed":{"x":1}"#), "{}", answer.body);
+        assert!(!answer.body.contains("\"error\""), "{}", answer.body);
+
+        let hdrs = seen.lock().unwrap();
+        assert!(hdrs.len() >= 2, "initialize and the call both reached the server: {hdrs:?}");
+        assert!(
+            hdrs.iter().all(|h| !h.contains_key("authorization")),
+            "no credential in the payload means no credential header, not an empty one: {hdrs:?}"
+        );
+        assert!(hdrs.iter().all(|h| h.get("mcp-protocol-version").is_some()));
+    }
+
+    /// The same path with a pasted token that rides in a custom header: the
+    /// payload's `auth_header` decides the header, and the token goes verbatim
+    /// — no `Bearer ` in front of an API key.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn a_self_described_rows_token_rides_in_the_header_its_payload_names() {
+        use crate::testutil::{ok, spawn_mock};
+        let _reg = with_registry();
+        let (endpoint, seen) = fake_mcp_server().await;
+        let umk = Key::random();
+        let row = mcp_row(
+            &umk,
+            json!({ "endpoint": endpoint, "access_token": "k-123", "auth_header": "X-Api-Key" }),
+        );
+        let mock = spawn_mock(vec![
+            ok(r#"{"claimed":true}"#),
+            ok(&row),
+            ok(&row),
+            ok("null"),
+        ]);
+        let mut rt = Runtime::new(&mock.base, "s_token", umk);
+        handle_event(
+            &mut rt,
+            r#"{"method":"events.connectionCall","params":{"call_id":"c-10","connection":"stripe","method":"echo","params":{}}}"#,
+        )
+        .await;
+
+        let hdrs = seen.lock().unwrap();
+        assert!(hdrs.len() >= 2, "{hdrs:?}");
+        for h in hdrs.iter() {
+            assert_eq!(h.get("x-api-key").map(String::as_str), Some("k-123"), "{h:?}");
+            assert!(!h.contains_key("authorization"), "{h:?}");
+        }
     }
 
     // ── a computer of your own ──

@@ -17,6 +17,12 @@ use serde_json::Value;
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    /// Sparse, cumulative statistics for THIS run. None means unreported;
+    /// successive snapshots replace known fields, never add them twice.
+    Stats(crate::RunStats),
+    /// Explicit tool outcome, separate from display text. Unknown outcomes
+    /// must not be guessed from a string containing the word "error".
+    ToolStatus { id: String, failed: bool },
     /// The producer's resumable session id for this conversation (first seen).
     Session(String),
     /// A chunk of streamed assistant text.

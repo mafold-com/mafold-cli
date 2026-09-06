@@ -6,4 +6,5 @@ description = "The agent→chat transcript layer: one event vocabulary, one card
 license = "MIT"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"

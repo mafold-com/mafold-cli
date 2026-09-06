@@ -6,8 +6,7 @@ use serde_json::{json, Value};
 
 /// Tries for an idempotent write before giving up (400ms → 800ms → 1.6s → 3.2s:
 /// ~6s of cover). Sized for the failure actually observed — a short uplink blip
-/// / proxy TLS reset — not for a long outage, where the server-side stale-draft
-/// reaper (`mafold-api`'s presence sweep) is the backstop instead.
+/// / proxy TLS reset. The daemon's durable completion outbox covers longer outages.
 const RETRY_ATTEMPTS: u32 = 5;
 
 /// Tries for fetching a media attachment (600ms → 1.2s of cover). Small on
@@ -70,6 +69,7 @@ pub struct Client {
     pub http: reqwest::Client,
     pub base: String,
     pub token: String,
+    pub drafts: Option<std::sync::Arc<crate::drafts::Outbox>>,
 }
 
 impl Client {
@@ -82,7 +82,7 @@ impl Client {
             .connect_timeout(std::time::Duration::from_secs(15))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { http, base, token }
+        Self { http, base, token, drafts: None }
     }
 
     /// The core's typed API handle for this base+token (base gains the `/api`
@@ -576,7 +576,13 @@ impl Client {
             }
             return Err(anyhow::Error::new(err).context("botCreateDraft failed"));
         };
-        Ok(draft.id.to_string())
+        let id = draft.id.to_string();
+        if let Some(outbox) = &self.drafts {
+            if let Err(e) = outbox.track(&id) {
+                eprintln!("could not journal draft {id} for restart recovery: {e:#}");
+            }
+        }
+        Ok(id)
     }
 
     /// A turn died BEFORE it had a bubble to die in — say so where it was asked.
@@ -708,6 +714,21 @@ impl Client {
         Ok(())
     }
 
+    /// Persist the final snapshot before attempting either write. A periodic
+    /// daemon task retries pending entries, including after process restart.
+    pub async fn finish_draft(&self, message_id: &str, content: &str) -> Result<bool> {
+        if let Some(outbox) = &self.drafts {
+            if let Err(e) = outbox.complete(message_id, content) {
+                eprintln!("draft {message_id} completion journal failed: {e:#}");
+            }
+            outbox.deliver(self, message_id).await
+        } else {
+            self.edit_draft(message_id, content).await?;
+            self.finalize(message_id).await?;
+            Ok(true)
+        }
+    }
+
     /// Throw away one of our own UNFINALIZED drafts — the row goes, with no
     /// tombstone. The server refuses anything already finalized, so this can
     /// never be used to erase a real message.
@@ -718,6 +739,7 @@ impl Client {
     pub async fn discard_draft(&self, message_id: &str) -> Result<()> {
         self.post_idempotent("discardDraft", json!({ "message_id": message_id }))
             .await?;
+        if let Some(outbox) = &self.drafts { outbox.forget(message_id)?; }
         Ok(())
     }
 

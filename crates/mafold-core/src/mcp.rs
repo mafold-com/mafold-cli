@@ -89,22 +89,27 @@ type Result<T> = std::result::Result<T, McpError>;
 /// One conversation with one MCP server.
 pub struct McpClient {
     url: String,
-    /// Built once from the registry's [`AuthInfo`], so no code path anywhere
-    /// decides where a provider's credential goes.
-    auth: (String, String),
+    /// Built once from the [`AuthInfo`] the caller resolved, so no code path
+    /// anywhere decides where a provider's credential goes. `None` when there
+    /// is no credential to send.
+    auth: Option<(String, String)>,
     session_id: Option<String>,
     next_id: u64,
 }
 
 impl McpClient {
     /// `token` is the plaintext credential, already opened from the vault.
+    ///
+    /// An EMPTY token sends no credential header at all. A server that needs
+    /// none (DeepWiki, a user's own open server) is a real shape now that a
+    /// connection can name its own endpoint, and `Authorization: Bearer ` with
+    /// nothing after it is not "no credential" to such a server — it is a
+    /// malformed one, refused with a 401 that reads as a wrong token.
     pub fn new(url: &str, auth: &AuthInfo, token: &str) -> Self {
         Self {
             url: url.to_string(),
-            auth: (
-                auth.header.to_string(),
-                format!("{}{}", auth.prefix, token),
-            ),
+            auth: (!token.is_empty())
+                .then(|| (auth.header.to_string(), format!("{}{}", auth.prefix, token))),
             session_id: None,
             next_id: 0,
         }
@@ -120,8 +125,10 @@ impl McpClient {
                 "application/json, text/event-stream".into(),
             ),
             ("mcp-protocol-version".into(), PROTOCOL_VERSION.into()),
-            self.auth.clone(),
         ];
+        if let Some(auth) = &self.auth {
+            h.push(auth.clone());
+        }
         if let Some(s) = &self.session_id {
             h.push(("mcp-session-id".into(), s.clone()));
         }
@@ -366,13 +373,30 @@ mod tests {
     #[test]
     fn the_credential_lands_where_the_registry_says() {
         let notion = McpClient::new("https://mcp.notion.com/mcp", &BEARER.into(), "ntn_abc");
-        assert_eq!(notion.auth, ("Authorization".into(), "Bearer ntn_abc".into()));
+        assert_eq!(notion.auth, Some(("Authorization".into(), "Bearer ntn_abc".into())));
 
         let figma = McpClient::new("https://mcp.figma.com/mcp", &FIGMA_TOKEN_HEADER.into(), "figd_xyz");
-        assert_eq!(figma.auth, ("X-Figma-Token".into(), "figd_xyz".into()));
+        assert_eq!(figma.auth, Some(("X-Figma-Token".into(), "figd_xyz".into())));
         // No prefix means no stray space — a header value of " figd_xyz" is
         // the kind of thing that fails as a plain 401 with nothing to read.
-        assert!(!figma.auth.1.starts_with(' '));
+        assert!(!figma.auth.as_ref().unwrap().1.starts_with(' '));
+    }
+
+    /// A server that wants no credential must not be sent a malformed one.
+    /// `Authorization: Bearer ` (empty) is refused by real servers as a bad
+    /// token, which reads as "your credential is wrong" for a connection that
+    /// has none — the self-described row made this a shape that exists.
+    #[test]
+    fn an_empty_credential_sends_no_header_at_all() {
+        let open = McpClient::new("https://mcp.deepwiki.com/mcp", &BEARER.into(), "");
+        assert_eq!(open.auth, None);
+        assert!(
+            !open.headers().iter().any(|(k, _)| k.eq_ignore_ascii_case("authorization")),
+            "{:?}",
+            open.headers()
+        );
+        // And the rest of the binding's headers are untouched by that choice.
+        assert!(open.headers().iter().any(|(k, _)| k == "mcp-protocol-version"));
     }
 
     #[test]

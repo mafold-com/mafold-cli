@@ -1,6 +1,6 @@
 [package]
 name = "mafold-cli"
-version = "0.9.107"
+version = "0.9.108"
 edition = "2021"
 description = "Mafold from your terminal — a CLI client (chats / send) + a Claude Code agent daemon."
 license = "MIT"
@@ -38,6 +38,7 @@ sha2 = "0.10"
 # (compact_room_log), so change blobs interop with web's @automerge/automerge.
 automerge = "0.5"
 base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 # Process/session control (detach via setsid, liveness + stop via signals) — Unix only.
 [target.'cfg(unix)'.dependencies]

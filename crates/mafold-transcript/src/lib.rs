@@ -21,8 +21,11 @@
 
 pub mod event;
 pub mod lint;
+pub mod prose;
 pub mod render;
 pub mod transcript;
+pub mod stats;
 
 pub use event::AgentEvent;
+pub use stats::RunStats;
 pub use transcript::{Advance, Boundary, Qualify, Transcript};

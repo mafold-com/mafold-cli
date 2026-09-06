@@ -83,6 +83,18 @@ pub enum ConnectionCmd {
         /// client is a published public client (Codex).
         #[arg(long)]
         oauth: bool,
+        /// The MCP server to link, for `--provider mcp` — any server this
+        /// registry doesn't name yet (`https://mcp.stripe.com/`). It is probed
+        /// first: a server with OAuth opens its consent screen here, one that
+        /// needs no credential is linked as-is, and only one that wants a
+        /// token asks for it.
+        #[arg(long)]
+        url: Option<String>,
+        /// The header a pasted token rides in, when the server wants something
+        /// other than `Authorization: Bearer …` (`X-Api-Key`). Only meaningful
+        /// with `--url`, and only when the server turns out to want a token.
+        #[arg(long)]
+        auth_header: Option<String>,
         /// A human tag for the linked identity. Stored in CLEARTEXT so the list
         /// is readable; defaults to a masked tail of the secret.
         #[arg(long)]
@@ -270,7 +282,7 @@ async fn auto_approve_pending(client: &Client, umk: &Key, key_id: &str) {
     }
 }
 
-async fn unlock(client: &Client, sess: &session::Session) -> Result<(Key, String, DeviceKey)> {
+pub(crate) async fn unlock(client: &Client, sess: &session::Session) -> Result<(Key, String, DeviceKey)> {
     let dev = vault::device_key()?;
     let reg = register(client, sess, &dev).await?;
 
@@ -361,7 +373,7 @@ fn open_payload(umk: &Key, key_id: &str, conn: &Value) -> Result<serde_json::Map
 }
 
 /// Seal a payload under a fresh DEK wrapped by the master key.
-fn seal_payload(umk: &Key, fields: &serde_json::Map<String, Value>) -> Result<(String, String)> {
+pub(crate) fn seal_payload(umk: &Key, fields: &serde_json::Map<String, Value>) -> Result<(String, String)> {
     let sealed = vault::seal_payload(umk, &serde_json::to_string(fields)?);
     Ok((sealed.blob, sealed.wrapped_dek))
 }
@@ -381,8 +393,9 @@ pub async fn run(base: &str, cmd: ConnectionCmd) -> Result<()> {
     match cmd {
         ConnectionCmd::Providers => providers(&client).await,
         ConnectionCmd::List => list(&client).await,
-        ConnectionCmd::Add { name, provider, import, from_env, oauth, label } => {
-            add(&client, &sess, &name, &provider, import, from_env, oauth, label).await
+        ConnectionCmd::Add { name, provider, import, from_env, oauth, url, auth_header, label } => {
+            add(&client, &sess, &name, &provider, import, from_env, oauth, url, auth_header, label)
+                .await
         }
         ConnectionCmd::Show { name, reveal } => show(&client, &sess, &name, reveal).await,
         ConnectionCmd::Env { name } => env(&client, &sess, &name).await,
@@ -427,6 +440,9 @@ async fn providers(client: &Client) -> Result<()> {
             // is not "paste" — saying so sent people looking for a token page
             // that no longer exists for that provider.
             (None, None) if p.oauth => "sign in (browser)".to_string(),
+            // The server is named by the user; what it wants is found out by
+            // asking it, so no single word here would be true of all of them.
+            (None, None) if p.delegates_endpoint() => "--url <server>  (probed)".to_string(),
             (None, None) => "paste".to_string(),
         };
         // Printed from what the row IS, not from `kind`: a machine binding
@@ -718,35 +734,63 @@ async fn wait_for_callback(
 /// actually looking at opens it. Everything that must survive between them —
 /// the bound listener above all — travels in here rather than in a global, so
 /// two flows can never share a port by accident.
-struct OauthLeg {
+pub(crate) struct OauthLeg {
     listener: tokio::net::TcpListener,
     verifier: String,
     state: String,
     redirect: url_parts::Parts,
-    authorize_url: String,
-    port: u16,
+    pub(crate) authorize_url: String,
+    pub(crate) port: u16,
+}
+
+/// The public half of the OAuth client a dance runs as.
+///
+/// Two ways one comes to exist, and the dance must not care which: the
+/// registry's FIXED client (Codex — a vendor CLI's published constants) or a
+/// client this machine REGISTERED a moment ago (an MCP server the user named,
+/// RFC 7591). Everything after "we have a client id" is the same PKCE, the
+/// same loopback listener, the same exchange — so it is one struct and one
+/// pair of legs, not two flows that agree today and drift tomorrow.
+pub(crate) struct OauthClient {
+    pub client_id: String,
+    pub authorize_url: String,
+    pub token_endpoint: String,
+    pub redirect_uri: String,
+    pub scopes: String,
+    pub extra_params: Vec<(String, String)>,
+    /// RFC 8707: the server the token is FOR. Sent on both legs when set, so
+    /// an authorization server that guards several resources scopes the token
+    /// to this one rather than to its default. Dynamic clients always set it;
+    /// a fixed vendor client never does (its scope is implied by the client).
+    pub resource: Option<String>,
+}
+
+impl From<&mafold_core::mafold_types::connections::FixedClientInfo> for OauthClient {
+    fn from(oc: &mafold_core::mafold_types::connections::FixedClientInfo) -> Self {
+        Self {
+            client_id: oc.client_id.clone(),
+            authorize_url: oc.authorize_url.clone(),
+            token_endpoint: oc.token_endpoint.clone(),
+            redirect_uri: oc.redirect_uri.clone(),
+            scopes: oc.scopes.clone(),
+            extra_params: oc.extra_params.clone(),
+            resource: None,
+        }
+    }
 }
 
 /// Bind the vendor's registered redirect and build its consent URL.
-async fn oauth_begin(
-    spec: &ProviderInfo,
-) -> Result<OauthLeg> {
-    use sha2::{Digest, Sha256};
-    let oc = spec.oauth_fixed.clone().ok_or_else(|| {
-        anyhow!(
-            "{} has no OAuth client this cli can drive — link it with --import or --from-env",
-            spec.id
-        )
-    })?;
-
-    // PKCE. The verifier is HEX (the shape the vendor's own CLI sends), the
-    // challenge standard base64url-nopad S256.
-    let verifier = format!("{}{}", hex_bytes(&Key::random().0), hex_bytes(&Key::random().0));
-    let challenge = {
-        use base64::Engine;
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
-    };
-    let state = hex_bytes(&Key::random().0);
+async fn oauth_begin(spec: &ProviderInfo) -> Result<OauthLeg> {
+    let oc: OauthClient = spec
+        .oauth_fixed
+        .as_ref()
+        .ok_or_else(|| {
+            anyhow!(
+                "{} has no OAuth client this cli can drive — link it with --import or --from-env",
+                spec.id
+            )
+        })?
+        .into();
 
     // Bind BEFORE the browser opens: if the port is taken (the vendor's own
     // CLI mid-login, an earlier attempt wedged), fail now with a sentence —
@@ -761,16 +805,43 @@ async fn oauth_begin(
                 redirect.port, spec.display
             )
         })?;
+    oauth_leg(&oc, listener)
+}
+
+/// The first leg for an already-bound listener: PKCE, state, the consent URL.
+///
+/// Takes the listener rather than binding one so a caller that had to know
+/// its port BEFORE it had a client (dynamic registration puts the redirect
+/// URI in the registration request) can bind first and register second.
+pub(crate) fn oauth_leg(oc: &OauthClient, listener: tokio::net::TcpListener) -> Result<OauthLeg> {
+    use sha2::{Digest, Sha256};
+    // PKCE. The verifier is HEX (the shape the vendor's own CLI sends), the
+    // challenge standard base64url-nopad S256.
+    let verifier = format!("{}{}", hex_bytes(&Key::random().0), hex_bytes(&Key::random().0));
+    let challenge = {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+    };
+    let state = hex_bytes(&Key::random().0);
+    let redirect: url_parts::Parts = url_parts::split(&oc.redirect_uri)?;
 
     let mut auth_url = format!(
-        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+        "{}?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
         oc.authorize_url,
         q_encode(&oc.client_id),
         q_encode(&oc.redirect_uri),
-        q_encode(&oc.scopes),
         state,
         challenge,
     );
+    // An empty scope is NOT sent as `scope=`: a dynamically registered client
+    // asks for the server's default, which is what the browser flow does too,
+    // and an explicit empty scope is refused by some authorization servers.
+    if !oc.scopes.is_empty() {
+        auth_url.push_str(&format!("&scope={}", q_encode(&oc.scopes)));
+    }
+    if let Some(r) = &oc.resource {
+        auth_url.push_str(&format!("&resource={}", q_encode(r)));
+    }
     for (k, v) in &oc.extra_params {
         auth_url.push('&');
         auth_url.push_str(&format!("{}={}", q_encode(k), q_encode(v)));
@@ -794,10 +865,22 @@ async fn oauth_finish(
     spec: &ProviderInfo,
     leg: OauthLeg,
 ) -> Result<(serde_json::Map<String, Value>, Option<String>)> {
-    let oc = spec
+    let oc: OauthClient = spec
         .oauth_fixed
-        .clone()
-        .ok_or_else(|| anyhow!("{} has no OAuth client this cli can drive", spec.id))?;
+        .as_ref()
+        .ok_or_else(|| anyhow!("{} has no OAuth client this cli can drive", spec.id))?
+        .into();
+    oauth_exchange(&oc, leg).await
+}
+
+/// The second leg for any client: wait, then exchange. Carries `client_id`
+/// and `token_endpoint` into the bag so a DIFFERENT device can renew the
+/// grant later — for a dynamically registered client those two values exist
+/// nowhere else in the world.
+pub(crate) async fn oauth_exchange(
+    oc: &OauthClient,
+    leg: OauthLeg,
+) -> Result<(serde_json::Map<String, Value>, Option<String>)> {
     let OauthLeg { listener, verifier, state, redirect, .. } = leg;
 
     let code = tokio::time::timeout(
@@ -807,15 +890,18 @@ async fn oauth_finish(
     .await
     .map_err(|_| anyhow!("no sign-in came back within 5 minutes — start it again to retry"))??;
 
-    let form = [
-        ("grant_type", "authorization_code"),
-        ("client_id", oc.client_id.as_str()),
-        ("code", code.as_str()),
-        ("redirect_uri", oc.redirect_uri.as_str()),
-        ("code_verifier", verifier.as_str()),
+    let mut form = vec![
+        ("grant_type", "authorization_code".to_string()),
+        ("client_id", oc.client_id.clone()),
+        ("code", code),
+        ("redirect_uri", oc.redirect_uri.clone()),
+        ("code_verifier", verifier),
     ];
+    if let Some(r) = &oc.resource {
+        form.push(("resource", r.clone()));
+    }
     let resp = reqwest::Client::new()
-        .post(oc.token_endpoint)
+        .post(&oc.token_endpoint)
         .form(&form)
         .send()
         .await
@@ -847,6 +933,11 @@ async fn oauth_finish(
             .unwrap_or(0);
         fields.insert("expires_at".into(), Value::String((now_ms + secs * 1000).to_string()));
     }
+    // What a renewal needs, from the client that just obtained the grant.
+    // `enrich_oauth_payload` fills these for a FIXED client from the registry;
+    // a dynamic client is not in any registry, so they are recorded here.
+    fields.insert("client_id".into(), Value::String(oc.client_id.clone()));
+    fields.insert("token_endpoint".into(), Value::String(oc.token_endpoint.clone()));
 
     // Label: the human identity of the grant, from the id_token.
     let label = fields
@@ -927,11 +1018,32 @@ async fn add(
     import: bool,
     from_env: bool,
     oauth: bool,
+    url: Option<String>,
+    auth_header: Option<String>,
     label: Option<String>,
 ) -> Result<()> {
     let spec = &descriptor(client, provider).await?;
     if is_device_binding(spec) {
         return bind_machine(client, sess, name, spec, label).await;
+    }
+    // A server the USER names: the address goes into the sealed payload, and
+    // what to collect is decided by asking the server, not by this table.
+    if spec.delegates_endpoint() {
+        let endpoint = url.ok_or_else(|| {
+            anyhow!(
+                "{} links a server you name — pass it:  mafold connection add {name} \
+                 --provider {} --url https://…",
+                spec.display, spec.id
+            )
+        })?;
+        return crate::mcp_link::add_server(client, sess, name, spec, &endpoint, auth_header, label)
+            .await;
+    }
+    if url.is_some() || auth_header.is_some() {
+        bail!(
+            "--url / --auth-header are for `--provider mcp` — {} knows its own server",
+            spec.display
+        );
     }
     let (mut fields, suggested_label) = if oauth {
         oauth_dance(spec).await?
@@ -1173,6 +1285,12 @@ async fn free_name(client: &Client, provider_id: &str) -> String {
         .trim_end_matches("-api")
         .trim_end_matches("-oauth")
         .to_string();
+    free_name_from(client, &base).await
+}
+
+/// `base`, or `base-2`, `base-3`… — the first name the account isn't using.
+pub(crate) async fn free_name_from(client: &Client, base: &str) -> String {
+    let base = base.to_string();
     let taken: Vec<String> = client
         .call("listConnections", json!({}))
         .await
@@ -1236,6 +1354,28 @@ pub async fn handle_link_event(
     };
 
     let spec = match descriptor(client, &provider).await.ok() {
+        // A server the person NAMED. This machine talks to it and answers with
+        // whichever of three endings it turns out to have — a consent screen to
+        // open, a connection already stored (no credential needed), or "it
+        // wants a token typed" — and the asking surface never has to reach the
+        // server itself, which is the case this branch exists for.
+        Some(sp) if sp.delegates_endpoint() => {
+            let endpoint = s(&p, "endpoint");
+            let typed = |k: &str| Some(s(&p, k)).filter(|v| !v.is_empty());
+            crate::mcp_link::serve_link(
+                client,
+                sess,
+                umk,
+                key_id,
+                &sp,
+                &endpoint,
+                &link_id,
+                typed("name"),
+                typed("label"),
+            )
+            .await;
+            return true;
+        }
         // A machine binding finishes right here: no port to bind, no consent
         // screen, nothing for the asking surface to open. It answers with the
         // connection instead of a URL, and `startConnectionLink` reads that as

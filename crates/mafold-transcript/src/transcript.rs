@@ -20,7 +20,7 @@
 //!
 //! Neither is a special case of the other, and neither gets its own renderer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::event::AgentEvent;
 use crate::render::{self, GroupItem, ToolStep};
@@ -90,6 +90,12 @@ fn verbatim(full: &str) -> String {
 }
 
 pub struct Transcript {
+    stats: Option<crate::RunStats>,
+    stats_started: std::time::Instant,
+    first_text_ms: Option<u64>,
+    stat_calls: HashSet<String>,
+    stat_outcomes: HashMap<String, bool>,
+    compactions: u64,
     /// Content committed to the reply so far.
     full: String,
     /// Narration the model has produced but that isn't committed yet.
@@ -128,6 +134,47 @@ impl Default for Transcript {
     }
 }
 
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+    use crate::RunStats;
+    use serde_json::{json, Value};
+
+    fn details(tx: &mut Transcript) -> Value {
+        tx.push(&AgentEvent::Done { duration_ms: Some(1234.0), cost_usd: None, tokens: None });
+        let md = tx.snapshot();
+        let result = &md[md.rfind("{% mafold/result").unwrap()..];
+        let body = result.split_once("%}").unwrap().1.split("{% /mafold/result %}").next().unwrap();
+        serde_json::from_str(body).unwrap()
+    }
+    #[test]
+    fn stats_are_quiet_and_the_result_keeps_exact_numbers_and_known_failures() {
+        let mut tx = Transcript::new();
+        let stats = RunStats { run_id: Some("run-1".into()), total_tokens: Some(12345), ..Default::default() };
+        assert_eq!(tx.push(&AgentEvent::Stats(stats.clone())), Advance::Quiet);
+        tx.push(&AgentEvent::ToolCall { id: "t1".into(), name: "bash".into(), input: json!({"command":"false"}) });
+        let before = tx.snapshot();
+        tx.push(&AgentEvent::Stats(stats));
+        assert_eq!(tx.snapshot(), before);
+        tx.push(&AgentEvent::ToolStatus { id: "t1".into(), failed: true });
+        let data = details(&mut tx);
+        assert_eq!(data["total_tokens"], 12345);
+        assert_eq!(data["duration_ms"], 1234.0);
+        assert_eq!(data["tool_calls"], 1);
+        assert_eq!(data["tool_errors"], 1);
+        assert!(data["input_tokens"].is_null());
+        assert!(data["captured_at_ms"].as_u64().unwrap() > 0);
+    }
+    #[test]
+    fn unknown_tool_outcome_does_not_claim_zero_failures() {
+        let mut tx = Transcript::new();
+        tx.push(&AgentEvent::Stats(RunStats::default()));
+        tx.push(&AgentEvent::ToolCall { id: "t1".into(), name: "tool".into(), input: json!({}) });
+        tx.push(&AgentEvent::ToolResult { id: "t1".into(), text: "error is just text".into() });
+        assert!(details(&mut tx)["tool_errors"].is_null());
+    }
+}
+
 impl Transcript {
     /// A transcript whose text is committed verbatim — right for any producer
     /// that doesn't emit card tags in its narration.
@@ -141,6 +188,12 @@ impl Transcript {
     /// already has them as free functions.
     pub fn with_text_policy(boundary: Boundary, qualify: Qualify) -> Self {
         Self {
+            stats: None,
+            stats_started: std::time::Instant::now(),
+            first_text_ms: None,
+            stat_calls: HashSet::new(),
+            stat_outcomes: HashMap::new(),
+            compactions: 0,
             full: String::new(),
             buf: String::new(),
             group: Vec::new(),
@@ -277,6 +330,22 @@ impl Transcript {
     /// Feed one event.
     pub fn push(&mut self, ev: &AgentEvent) -> Advance {
         match ev {
+            AgentEvent::Text(t) if !t.is_empty() && self.first_text_ms.is_none() => {
+                self.first_text_ms = Some(self.stats_started.elapsed().as_millis() as u64);
+            }
+            AgentEvent::ToolCall { id, .. } => { self.stat_calls.insert(id.clone()); }
+            AgentEvent::Compacted { .. } => { self.compactions += 1; }
+            _ => {}
+        }
+        match ev {
+            AgentEvent::Stats(patch) => {
+                self.stats.get_or_insert_with(Default::default).merge(patch);
+                Advance::Quiet
+            }
+            AgentEvent::ToolStatus { id, failed } => {
+                self.stat_outcomes.insert(id.clone(), *failed);
+                Advance::Quiet
+            }
             AgentEvent::Text(t) => {
                 // Tools so far → one run card, BEFORE this narration: the
                 // transcript is a time series, and text that arrived after a
@@ -326,9 +395,29 @@ impl Transcript {
                 Advance::Immediate
             }
             AgentEvent::Steered(_) => Advance::Quiet,
-            AgentEvent::Done { .. } => {
+            AgentEvent::Done { duration_ms, cost_usd, tokens } => {
                 self.seal();
-                if let Some(s) = render::render(ev, &mut self.names) {
+                let rendered = if let Some(stats) = self.stats.as_mut() {
+                    stats.duration_ms = duration_ms.or(stats.duration_ms)
+                        .or(Some(self.stats_started.elapsed().as_secs_f64() * 1000.0));
+                    stats.cost_usd = cost_usd.or(stats.cost_usd);
+                    if stats.cost_usd.is_some() && stats.cost_kind.is_none() {
+                        stats.cost_kind = Some("reported".into());
+                    }
+                    stats.total_tokens = stats.total_tokens.or(*tokens);
+                    stats.first_text_ms = stats.first_text_ms.or(self.first_text_ms);
+                    stats.captured_at_ms = Some(crate::stats::now_ms());
+                    stats.tool_calls = stats.tool_calls.or(Some(self.stat_calls.len() as u64));
+                    // Report a failure total only if every observed call has an
+                    // explicit outcome. Missing status is not success.
+                    if stats.tool_errors.is_none() && stats.tool_calls == Some(self.stat_calls.len() as u64)
+                        && self.stat_calls.iter().all(|id| self.stat_outcomes.contains_key(id)) {
+                        stats.tool_errors = Some(self.stat_calls.iter().filter(|id| self.stat_outcomes.get(*id) == Some(&true)).count() as u64);
+                    }
+                    stats.compactions = stats.compactions.or(Some(self.compactions));
+                    Some(render::result_with_stats(stats))
+                } else { render::render(ev, &mut self.names) };
+                if let Some(s) = rendered {
                     self.full.push_str(&s); // {% mafold/result %}
                 }
                 Advance::Done

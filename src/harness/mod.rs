@@ -11,6 +11,7 @@
 
 pub mod claude_code;
 pub mod codex;
+mod codex_stats;
 // Codex uses this transport for native control data, the live thread/turn path,
 // and reply-scoped server-request approvals.
 #[allow(dead_code)]
